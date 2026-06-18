@@ -1,0 +1,377 @@
+rules_version = '2';
+
+// OpenBuildOS workspace-project security rules.
+//
+// Membership source of truth lives on the top-level /projects/{pid} document:
+//   { workspaceId: string, memberIds: string[], roles: { [uid]: viewer|editor|admin } }
+// Workspace-level admins live on /workspaces/{wid}: { ownerId, adminIds }.
+// Invites are bearer tokens under /workspaces/{wid}/invites/{inviteId} and are
+// redeemed atomically (invite claim + members doc + project membership arrays
+// in a single batch enforced via getAfter()).
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------------
+    // Shared helpers
+    // ---------------------------------------------------------------------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isRealUser() {
+      return isSignedIn()
+        && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    // Stabilní federovaný subjekt napříč per-firma Firebase projekty.
+    // Firebase přiděluje JINÉ request.auth.uid v každém projektu pro téhož
+    // OIDC uživatele, takže membership/autorizace musí klíčovat federovaným
+    // subjektem, ne uid. Pokud token nese identitu z provideru
+    // 'oidc.openbuildos' (neprázdný list), vrátíme její první prvek; jinak
+    // (dev e-mail/heslo, anonymous, … žádné identities) fallback na uid.
+    // Pozn.: rules nemají snadné `in` na klíče mapy, proto čteme přes
+    // .get('identities', {}).get('oidc.openbuildos', []) a kontrolujeme size().
+    function principal() {
+      return request.auth.token.firebase
+          .get('identities', {})
+          .get('oidc.openbuildos', []).size() > 0
+        ? request.auth.token.firebase.identities['oidc.openbuildos'][0]
+        : request.auth.uid;
+    }
+
+    function wsPath(wid) {
+      return /databases/$(database)/documents/workspaces/$(wid);
+    }
+
+    function wsData(wid) {
+      return get(wsPath(wid)).data;
+    }
+
+    function isWsOwner(wid) {
+      return isRealUser()
+        && exists(wsPath(wid))
+        && wsData(wid).get('ownerId', '') == principal();
+    }
+
+    function isWsAdmin(wid) {
+      return isRealUser()
+        && exists(wsPath(wid))
+        && (wsData(wid).get('ownerId', '') == principal()
+            || principal() in wsData(wid).get('adminIds', []));
+    }
+
+    function projectPath(pid) {
+      return /databases/$(database)/documents/projects/$(pid);
+    }
+
+    function projectData(pid) {
+      return get(projectPath(pid)).data;
+    }
+
+    function projectInWorkspace(wid, pid) {
+      return exists(projectPath(pid))
+        && projectData(pid).get('workspaceId', '') == wid;
+    }
+
+    function projectRole(pid) {
+      return projectData(pid).get('roles', {}).get(principal(), '');
+    }
+
+    function isProjectMember(wid, pid) {
+      return isRealUser()
+        && projectInWorkspace(wid, pid)
+        && (principal() in projectData(pid).get('memberIds', [])
+            || isWsAdmin(wid));
+    }
+
+    function canEditContent(wid, pid) {
+      return isRealUser()
+        && projectInWorkspace(wid, pid)
+        && (projectRole(pid) in ['editor', 'admin'] || isWsAdmin(wid));
+    }
+
+    function canManageProject(wid, pid) {
+      return isRealUser()
+        && projectInWorkspace(wid, pid)
+        && (projectRole(pid) == 'admin' || isWsAdmin(wid));
+    }
+
+    // Bootstrap-friendly variant: also lets admins create a project and its
+    // members docs in one atomic batch. The post-state branch only applies
+    // when the project doc did NOT exist before the batch -- in that case the
+    // batched /projects create was itself validated (workspace admin with
+    // roles[uid] == 'admin'). For pre-existing projects only the pre-state
+    // role counts, so an invite redeem cannot escalate itself to admin.
+    function canManageProjectAfter(wid, pid) {
+      return canManageProject(wid, pid)
+        || (isRealUser()
+            && !exists(projectPath(pid))
+            && getAfter(projectPath(pid)).data.get('workspaceId', '') == wid
+            && getAfter(projectPath(pid)).data.get('roles', {}).get(principal(), '') == 'admin');
+    }
+
+    // ---------------------------------------------------------------------
+    // Workspaces
+    // ---------------------------------------------------------------------
+
+    match /workspaces/{wid} {
+      // The id is not secret; the doc only carries owner/admin metadata.
+      allow get: if isRealUser();
+      allow list: if false;
+      // Bootstrap claim: first creator becomes owner (keyed by principal).
+      allow create: if isRealUser()
+        && request.resource.data.ownerId == principal()
+        && request.resource.data.adminIds is list;
+      // Owner can manage admins/name but never transfer/drop ownership here.
+      allow update: if isRealUser()
+        && resource.data.get('ownerId', '') == principal()
+        && request.resource.data.ownerId == resource.data.ownerId;
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Invites (bearer token documents)
+    // ---------------------------------------------------------------------
+
+    function invitePath(wid, inviteId) {
+      return /databases/$(database)/documents/workspaces/$(wid)/invites/$(inviteId);
+    }
+
+    // The members/{uid} self-join create is only valid when the same batch
+    // claims the referenced invite (getAfter forces atomicity).
+    function redeemOk(wid, pid, inviteId, role) {
+      return get(invitePath(wid, inviteId)).data.projectId == pid
+        && get(invitePath(wid, inviteId)).data.usedBy == null
+        && request.time < get(invitePath(wid, inviteId)).data.expiresAt
+        && role == get(invitePath(wid, inviteId)).data.role
+        && getAfter(invitePath(wid, inviteId)).data.usedBy == principal();
+    }
+
+    match /workspaces/{wid}/invites/{inviteId} {
+      // The invite id itself is the secret; any real user holding it may read.
+      allow get: if isRealUser();
+      allow list: if isWsAdmin(wid);
+      allow create: if isRealUser()
+        && canManageProject(wid, request.resource.data.projectId)
+        && request.resource.data.role in ['viewer', 'editor']
+        && request.resource.data.usedBy == null
+        && request.resource.data.expiresAt is timestamp
+        && request.resource.data.createdBy == principal();
+      allow update: if (
+          // Redeem: only claiming an unused, unexpired invite for yourself.
+          isRealUser()
+          && resource.data.usedBy == null
+          && request.time < resource.data.expiresAt
+          && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['usedBy', 'usedAt'])
+          && request.resource.data.usedBy == principal()
+        ) || canManageProject(wid, resource.data.projectId);
+      allow delete: if canManageProject(wid, resource.data.projectId);
+    }
+
+    // ---------------------------------------------------------------------
+    // Project members mirror (UI metadata; rules read /projects instead)
+    // ---------------------------------------------------------------------
+
+    match /workspaces/{wid}/projects/{pid}/members/{memberUid} {
+      allow get, list: if isProjectMember(wid, pid);
+      allow create: if (
+          // Self-join via invite redeemed in the same batch.
+          // members/{id} doc is keyed by principal (federated subject or uid).
+          isRealUser()
+          && memberUid == principal()
+          && request.resource.data.keys()
+              .hasOnly(['role', 'displayName', 'email', 'inviteId', 'joinedAt'])
+          && request.resource.data.role in ['viewer', 'editor']
+          && redeemOk(wid, pid, request.resource.data.inviteId,
+              request.resource.data.role)
+        ) || (
+          canManageProjectAfter(wid, pid)
+          && request.resource.data.role in ['viewer', 'editor', 'admin']
+        );
+      allow update: if canManageProjectAfter(wid, pid)
+        && request.resource.data.role in ['viewer', 'editor', 'admin'];
+      allow delete: if canManageProject(wid, pid);
+    }
+
+    // ---------------------------------------------------------------------
+    // Notification queue (recipient-scoped reads)
+    // ---------------------------------------------------------------------
+
+    match /workspaces/{wid}/projects/{pid}/notificationQueue/{notificationId} {
+      allow create: if isProjectMember(wid, pid)
+        && request.resource.data.workspaceId == wid
+        && request.resource.data.projectId == pid
+        && request.resource.data.recipientIds is list;
+      // Provable for queries shaped
+      // where('recipientIds', 'array-contains', currentPrincipal).
+      allow get, list: if isRealUser()
+        && principal() in resource.data.recipientIds;
+      // Recipients may only append themselves to readBy.
+      allow update: if isRealUser()
+        && principal() in resource.data.recipientIds
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['readBy'])
+        && request.resource.data.readBy.hasAll(resource.data.get('readBy', []))
+        && principal() in request.resource.data.readBy;
+      allow delete: if canManageProject(wid, pid);
+    }
+
+    // ---------------------------------------------------------------------
+    // Project content collections (explicit enumeration -- no catch-all so
+    // members/notificationQueue/invites can never be reached through these).
+    // ---------------------------------------------------------------------
+
+    match /workspaces/{wid}/projects/{pid}/tasks/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if canEditContent(wid, pid);
+    }
+
+    match /workspaces/{wid}/projects/{pid}/files/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if canEditContent(wid, pid);
+    }
+
+    match /workspaces/{wid}/projects/{pid}/photos/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if canEditContent(wid, pid);
+    }
+
+    match /workspaces/{wid}/projects/{pid}/diaryEntries/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if canEditContent(wid, pid);
+    }
+
+    match /workspaces/{wid}/projects/{pid}/plans/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if canEditContent(wid, pid);
+    }
+
+    match /workspaces/{wid}/projects/{pid}/planAnnotations/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if canEditContent(wid, pid);
+    }
+
+    match /workspaces/{wid}/projects/{pid}/documents/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if canEditContent(wid, pid);
+    }
+
+    match /workspaces/{wid}/projects/{pid}/documentVersions/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if canEditContent(wid, pid);
+    }
+
+    match /workspaces/{wid}/projects/{pid}/documentComments/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if canEditContent(wid, pid);
+    }
+
+    match /workspaces/{wid}/projects/{pid}/transmittals/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if canEditContent(wid, pid);
+    }
+
+    match /workspaces/{wid}/projects/{pid}/documentEvents/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if canEditContent(wid, pid);
+    }
+
+    // ---------------------------------------------------------------------
+    // Share links (bearer token documents -- public read-out of a single item)
+    //
+    // The token (doc id) is the secret, so `get` is public: an unauthenticated
+    // recipient holding the link reads exactly that one record (title + a
+    // already-public file URL -- never sensitive metadata). Listing requires
+    // membership (managing share links), and only editors+ may create/revoke.
+    // ---------------------------------------------------------------------
+
+    match /workspaces/{wid}/projects/{pid}/shareLinks/{token} {
+      allow get: if true;
+      allow list: if isProjectMember(wid, pid);
+      allow create, update, delete: if canEditContent(wid, pid);
+    }
+
+    // ---------------------------------------------------------------------
+    // Top-level projects (source of truth for membership)
+    // ---------------------------------------------------------------------
+
+    // Invite self-join on the project doc: only adds the caller to
+    // memberIds/roles, with the role copied from the members doc created in
+    // the same batch (which itself requires a valid invite claim).
+    function inviteSelfJoin(pid) {
+      return isRealUser()
+        && !(principal() in resource.data.get('memberIds', []))
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['memberIds', 'roles', 'updatedAt'])
+        && request.resource.data.memberIds is list
+        && request.resource.data.memberIds.hasAll(resource.data.get('memberIds', []))
+        && request.resource.data.memberIds.size()
+            == resource.data.get('memberIds', []).size() + 1
+        && principal() in request.resource.data.memberIds
+        && request.resource.data.roles.diff(resource.data.get('roles', {}))
+            .affectedKeys().hasOnly([principal()])
+        && request.resource.data.roles[principal()]
+            == getAfter(/databases/$(database)/documents/workspaces/$(resource.data.workspaceId)/projects/$(pid)/members/$(principal())).data.role;
+    }
+
+    match /projects/{pid} {
+      // Direct field access keeps the rule provable for both query shapes:
+      // where('memberIds','array-contains', principal) and
+      // where('workspaceId','==', wid) issued by workspace admins.
+      allow get, list: if isRealUser()
+        && (principal() in resource.data.memberIds
+            || isWsAdmin(resource.data.workspaceId));
+      allow create: if isRealUser()
+        && isWsAdmin(request.resource.data.workspaceId)
+        && principal() in request.resource.data.memberIds
+        && request.resource.data.roles.get(principal(), '') == 'admin';
+      // Workspace owner/admin: full project doc control incl. membership.
+      // Project admin: may edit project content but MUST NOT touch
+      // memberIds/roles (membership changes only via wsAdmin or invite flow),
+      // preventing one admin from demoting/removing other admins or the owner.
+      allow update: if (
+          isRealUser()
+          && isWsAdmin(resource.data.get('workspaceId', ''))
+          && request.resource.data.workspaceId == resource.data.workspaceId
+        ) || (
+          isRealUser()
+          && resource.data.get('roles', {}).get(principal(), '') == 'admin'
+          && request.resource.data.workspaceId == resource.data.workspaceId
+          && !request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['memberIds', 'roles'])
+        ) || inviteSelfJoin(pid);
+      allow delete: if isRealUser()
+        && (resource.data.get('roles', {}).get(principal(), '') == 'admin'
+            || isWsAdmin(resource.data.get('workspaceId', '')));
+    }
+
+    // Immutable per-project audit log.
+    match /projects/{pid}/task_audit/{entryId} {
+      allow read: if isProjectMember(projectData(pid).get('workspaceId', ''), pid);
+      allow create: if canEditContent(projectData(pid).get('workspaceId', ''), pid);
+      allow update, delete: if false;
+    }
+
+    // Legacy annotation blobs -- superseded by
+    // workspaces/{wid}/projects/{pid}/planAnnotations.
+    match /plan_annotations/{docId} {
+      allow read, write: if false;
+    }
+
+    // User registry (workspace connections) — used when this project also
+    // serves as the central/login project (single-project deployment).
+    // Owner-only: each user reads/writes only their own registry doc.
+    match /users/{userId} {
+      allow read, write: if isSignedIn() && request.auth.uid == userId;
+    }
+
+    // No catch-all: everything else is denied by default.
+  }
+}

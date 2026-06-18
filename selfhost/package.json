@@ -1,0 +1,14 @@
+{
+  "name": "openbuildos-selfhost",
+  "version": "1.0.0",
+  "description": "OpenBuildOS self-host deploy kit — nasazení federačního backendu (authExchange + Firestore/Storage pravidla) do firemního Firebase projektu.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "setup:company": "node scripts/openbuildos-setup.mjs",
+    "setup": "node scripts/openbuildos-setup.mjs"
+  }
+}

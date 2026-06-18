@@ -1,0 +1,67 @@
+rules_version = '2';
+
+// Storage objects live under workspaces/{wid}/projects/{pid}/... only.
+// Membership is resolved from Firestore: /projects/{pid} (memberIds, roles,
+// workspaceId) and /workspaces/{wid} (ownerId, adminIds).
+// Legacy top-level projects/** paths are intentionally denied.
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isRealUser() {
+      return request.auth != null
+        && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+
+    // Stabilní federovaný subjekt napříč per-firma Firebase projekty (viz
+    // firestore.rules). OIDC identita 'oidc.openbuildos' → subjekt; jinak uid.
+    function principal() {
+      return request.auth.token.firebase
+          .get('identities', {})
+          .get('oidc.openbuildos', []).size() > 0
+        ? request.auth.token.firebase.identities['oidc.openbuildos'][0]
+        : request.auth.uid;
+    }
+
+    function projectData(pid) {
+      return firestore.get(/databases/(default)/documents/projects/$(pid)).data;
+    }
+
+    function wsData(wid) {
+      return firestore.get(/databases/(default)/documents/workspaces/$(wid)).data;
+    }
+
+    function isWsAdmin(wid) {
+      return wsData(wid).get('ownerId', '') == principal()
+        || principal() in wsData(wid).get('adminIds', []);
+    }
+
+    function isMember(wid, pid) {
+      return isRealUser()
+        && projectData(pid).get('workspaceId', '') == wid
+        // Short-circuit on memberIds first to avoid the workspace lookup.
+        && (principal() in projectData(pid).get('memberIds', [])
+            || isWsAdmin(wid));
+    }
+
+    function canEdit(wid, pid) {
+      return isRealUser()
+        && projectData(pid).get('workspaceId', '') == wid
+        && (projectData(pid).get('roles', {}).get(principal(), '')
+              in ['editor', 'admin']
+            || isWsAdmin(wid));
+    }
+
+    match /workspaces/{wid}/projects/{pid}/{rest=**} {
+      allow read: if isMember(wid, pid);
+      allow write: if canEdit(wid, pid)
+        && (request.resource == null
+            || request.resource.size < 200 * 1024 * 1024);
+    }
+
+    // Everything else -- including legacy /projects/** -- is denied.
+    match /{path=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -78,6 +78,20 @@ function resolveGcloud() {
   return null;
 }
 
+/**
+ * Najde firebase CLI. V prostředích jako Google Cloud Shell je `firebase`
+ * GLOBÁLNÍ binárka na PATH (a `npx firebase` selže s „could not determine
+ * executable"). Lokálně bývá dostupná přes `npx firebase`. Vrací { cmd, prefix }
+ * pro spouštění: globální → { cmd:"firebase", prefix:[] }, jinak fallback na npx.
+ */
+function resolveFirebase() {
+  const onPath = spawnSync("firebase", ["--version"], { stdio: "ignore" });
+  if (onPath.status === 0) {
+    return { cmd: "firebase", prefix: [] };
+  }
+  return { cmd: "npx", prefix: ["firebase"] };
+}
+
 // ---------------------------------------------------------------------------
 // Spouštění příkazů s retry/backoffem
 // ---------------------------------------------------------------------------
@@ -226,22 +240,19 @@ function parseCliArgs() {
 // ---------------------------------------------------------------------------
 
 /** KROK 1: Preflight — nástroje a aktivní gcloud účet. */
-function preflight(gcloud) {
+function preflight(gcloud, fb) {
   step("Krok 1/8 — Preflight (kontrola nástrojů a přihlášení)");
 
-  // firebase-tools přes npx
+  // firebase-tools — globální `firebase` (Cloud Shell) nebo `npx firebase`.
   try {
-    const { stdout } = run("npx", ["--no-install", "firebase", "--version"]);
-    ok(`firebase-tools ${stdout.trim().split("\n").pop()}`);
-  } catch {
-    // npx --no-install selhal → zkus normální (může stáhnout); když i to selže, chyba.
-    try {
-      const { stdout } = run("npx", ["firebase", "--version"]);
-      ok(`firebase-tools ${stdout.trim().split("\n").pop()}`);
-    } catch (err) {
-      fail("firebase-tools nedostupné přes `npx firebase`.");
-      throw new Error(`Nainstaluj firebase-tools (npm i -D firebase-tools).\n${errOutput(err)}`);
-    }
+    const { stdout } = run(fb.cmd, [...fb.prefix, "--version"]);
+    const how = fb.cmd === "firebase" ? "globální" : "npx";
+    ok(`firebase-tools ${stdout.trim().split("\n").pop()} (${how})`);
+  } catch (err) {
+    fail("firebase-tools nedostupné (ani globální `firebase`, ani `npx firebase`).");
+    throw new Error(
+      `Nainstaluj firebase-tools (npm i -g firebase-tools) nebo se ujisti, že je na PATH.\n${errOutput(err)}`
+    );
   }
 
   // gcloud
@@ -291,21 +302,21 @@ function npmInstallFunctions(repoRoot) {
   }
 }
 
-/** Sestaví společné firebase argumenty (--project, --account). */
-function firebaseBaseArgs(project, account) {
-  const args = ["firebase"];
+/** Sestaví firebase invokaci: { cmd, args } včetně případného --account. */
+function firebaseInvocation(fb, account) {
+  const args = [...fb.prefix];
   if (account) {
     args.push("--account", account);
   }
-  return { args, project };
+  return { cmd: fb.cmd, args };
 }
 
 /** KROK 3: Deploy firestore rules s retry. */
-function deployRules(project, account) {
+function deployRules(project, account, fb) {
   step("Krok 3/8 — Deploy Firestore pravidel");
-  const { args } = firebaseBaseArgs(project, account);
+  const { cmd, args } = firebaseInvocation(fb, account);
   try {
-    run("npx", [...args, "deploy", "--only", "firestore:rules", "--project", project], {
+    run(cmd, [...args, "deploy", "--only", "firestore:rules", "--project", project], {
       retries: 2,
     });
     ok("firestore.rules nasazena");
@@ -316,13 +327,13 @@ function deployRules(project, account) {
 }
 
 /** KROK 4: Deploy funkce s --force a retry; vrátí vyparsovanou URL nebo null. */
-function deployFunctions(project, account) {
+function deployFunctions(project, account, fb) {
   step("Krok 4/8 — Deploy funkce authExchange");
   info("  (čerstvý Blaze projekt: 1. pokus může selhat na build service account — retry to vyřeší)");
-  const { args } = firebaseBaseArgs(project, account);
+  const { cmd, args } = firebaseInvocation(fb, account);
   try {
     const { stdout } = run(
-      "npx",
+      cmd,
       [...args, "deploy", "--only", "functions", "--project", project, "--force"],
       { retries: 2, baseDelayMs: 8000 }
     );
@@ -533,6 +544,7 @@ async function main() {
   }
 
   const gcloud = resolveGcloud();
+  const fb = resolveFirebase();
 
   // Potvrzení (pokud není --yes).
   if (!args.yes) {
@@ -548,10 +560,10 @@ async function main() {
 
   let url = null;
   try {
-    preflight(gcloud); // krok 1 (gcloud null se zde řeší)
+    preflight(gcloud, fb); // krok 1 (gcloud null se zde řeší)
     npmInstallFunctions(repoRoot); // krok 2
-    deployRules(project, account); // krok 3
-    url = deployFunctions(project, account); // krok 4
+    deployRules(project, account, fb); // krok 3
+    url = deployFunctions(project, account, fb); // krok 4
 
     if (!url) {
       url = describeRunUrl(gcloud, project, region);

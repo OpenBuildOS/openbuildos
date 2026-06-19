@@ -30,21 +30,31 @@ následující (stačí jednou):
 
 ## Krok 2 — Spusťte instalaci
 
-Cloud Shell vás otevře rovnou ve složce `selfhost`, takže nikam nemusíte
-přepínat. V terminálu (otevře se vpravo nebo dole) spusťte:
+V terminálu (otevře se vpravo nebo dole) se nejdřív **jednou** přihlaste do
+Firebase — vypíše odkaz, který otevřete a potvrdíte:
 
 ```bash
 firebase login --no-localhost
-node scripts/openbuildos-setup.mjs
 ```
+
+Pak spusťte **hlavní příkaz**. Jedním vložením stáhne čerstvou kopii nástroje
+do `~/ob` a rovnou nasadí backend:
+
+```bash
+rm -rf ~/ob && git clone https://github.com/OpenBuildOS/openbuildos.git ~/ob && cd ~/ob/selfhost && node scripts/openbuildos-setup.mjs
+```
+
+**Proč čerstvý klon (`rm -rf ~/ob`):** Cloud Shell má trvalý domovský adresář,
+takže stará kopie nástroje by tam zůstala a vy byste pracovali s neaktuální
+verzí skriptu. `rm -rf ~/ob` zajistí, že se vždy stáhne aktuální verze.
 
 Skript se na **Project ID** vašeho Firebase projektu (z kroku 1) sám zeptá.
 
-Volitelně ho můžete předat rovnou — `PROJECT_ID` nahraďte svým skutečným ID
-(`gcloud projects list` vám ID vypíše):
+Volitelně ho můžete předat rovnou na konci příkazu — `PROJECT_ID` nahraďte
+svým skutečným ID (`gcloud projects list` vám ID vypíše):
 
 ```bash
-node scripts/openbuildos-setup.mjs --project PROJECT_ID
+rm -rf ~/ob && git clone https://github.com/OpenBuildOS/openbuildos.git ~/ob && cd ~/ob/selfhost && node scripts/openbuildos-setup.mjs --project PROJECT_ID
 ```
 
 Skript je možné spustit i opakovaně — když něco selže, jen ho pusťte znovu.

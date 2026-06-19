@@ -30,6 +30,23 @@ s připraveným průvodcem:
 
 [![Open in Cloud Shell](https://gstatic.com/cloudssh/images/open-btn.svg)](https://shell.cloud.google.com/cloudshell/open?cloudshell_git_repo=https://github.com/OpenBuildOS/openbuildos.git&cloudshell_git_branch=main&cloudshell_workspace=selfhost&cloudshell_tutorial=docs/cloudshell-tutorial.md)
 
+V Cloud Shell se nejdřív **jednou** přihlaste do Firebase:
+
+```bash
+firebase login --no-localhost
+```
+
+Pak spusťte **hlavní příkaz** — jedním vložením stáhne čerstvou kopii nástroje
+do `~/ob` a rovnou nasadí backend:
+
+```bash
+rm -rf ~/ob && git clone https://github.com/OpenBuildOS/openbuildos.git ~/ob && cd ~/ob/selfhost && node scripts/openbuildos-setup.mjs
+```
+
+Cloud Shell má trvalý domovský adresář, proto `rm -rf ~/ob` — zajistí čerstvý
+klon, abyste nepracovali se starou verzí skriptu. Skript se na Project ID sám
+zeptá; volitelně ho přidejte na konec (`… node scripts/openbuildos-setup.mjs --project PROJECT_ID`).
+
 Průvodce vás provede předpoklady ve Firebase konzoli a samotným nasazením. Viz
 [`selfhost/docs/cloudshell-tutorial.md`](selfhost/docs/cloudshell-tutorial.md).
 

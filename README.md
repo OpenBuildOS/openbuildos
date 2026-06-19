@@ -39,8 +39,11 @@ Pokud máte lokálně nainstalované `node`, `firebase-tools` a `gcloud`:
 
 ```bash
 cd selfhost
-npm run setup:company -- --project <TVUJ-PROJECT-ID>
+npm run setup:company -- --project PROJECT_ID
 ```
+
+`PROJECT_ID` nahraďte Project ID svého Firebase projektu (`gcloud projects list`
+vám ID vypíše).
 
 Podrobnosti k companion CLI najdete v
 [`selfhost/docs/COMPANION_CLI.md`](selfhost/docs/COMPANION_CLI.md).

@@ -30,13 +30,22 @@ následující (stačí jednou):
 
 ## Krok 2 — Spusťte instalaci
 
-V terminálu Cloud Shellu (otevře se vpravo nebo dole) spusťte:
+Cloud Shell vás otevře rovnou ve složce `selfhost`, takže nikam nemusíte
+přepínat. V terminálu (otevře se vpravo nebo dole) spusťte:
 
 ```bash
-cd selfhost && node scripts/openbuildos-setup.mjs --project <TVUJ-PROJECT-ID>
+firebase login --no-localhost
+node scripts/openbuildos-setup.mjs
 ```
 
-`<TVUJ-PROJECT-ID>` nahraďte Project ID vašeho Firebase projektu z kroku 1.
+Skript se na **Project ID** vašeho Firebase projektu (z kroku 1) sám zeptá.
+
+Volitelně ho můžete předat rovnou — `PROJECT_ID` nahraďte svým skutečným ID
+(`gcloud projects list` vám ID vypíše):
+
+```bash
+node scripts/openbuildos-setup.mjs --project PROJECT_ID
+```
 
 Skript je možné spustit i opakovaně — když něco selže, jen ho pusťte znovu.
 

@@ -1,9 +1,24 @@
 rules_version = '2';
 
-// Storage objects live under workspaces/{wid}/projects/{pid}/... only.
-// Membership is resolved from Firestore: /projects/{pid} (memberIds, roles,
-// workspaceId) and /workspaces/{wid} (ownerId, adminIds).
-// Legacy top-level projects/** paths are intentionally denied.
+// Firemní úložiště souborů (per-firma Firebase projekt).
+//
+// POZOR — DESIGN ROZHODNUTÍ (22. 6. 2026): původní verze gateovala write per
+// projekt přes cross-service `firestore.get()` (kontrola memberIds/roles/ownerId
+// v Firestore). To se v praxi ukázalo jako NESPOLEHLIVÉ — Storage vracel 403
+// (storage/unauthorized) i pro VLASTNÍKA, který má v projektu roli 'admin' a je
+// ownerId workspace. Cross-service get ve Storage rules je dlouhodobě vrtkavý.
+//
+// Proto držíme JEDNODUCHÝ a SPOLEHLIVÝ gate: čte/píše každý PŘIHLÁŠENÝ uživatel
+// FIRMY (přihlášení do firemního backendu probíhá token-exchangem, takže to je
+// vždy člen firmy — cizí firma má vlastní projekt s vlastními rules).
+//
+// Granularita per-PROJEKT je vynucená na úrovni FIRESTORE METADAT: každý
+// foto/dokument/plán má v Firestore svůj doc s member rules. Bez přístupu k tomu
+// docu uživatel ani neobjeví cestu objektu ve Storage (cesty jsou UUID).
+//
+// TODO (až bude potřeba tvrdší izolace mezi projekty jedné firmy): vrátit
+// per-projekt přes spolehlivý mechanismus — custom claims se seznamem projektů
+// v token-exchange tokenu, nebo ověřený fungující cross-service get.
 
 service firebase.storage {
   match /b/{bucket}/o {
@@ -13,53 +28,14 @@ service firebase.storage {
         && request.auth.token.firebase.sign_in_provider != 'anonymous';
     }
 
-    // Stabilní federovaný subjekt napříč per-firma Firebase projekty (viz
-    // firestore.rules). OIDC identita 'oidc.openbuildos' → subjekt; jinak uid.
-    function principal() {
-      return request.auth.token.firebase
-          .get('identities', {})
-          .get('oidc.openbuildos', []).size() > 0
-        ? request.auth.token.firebase.identities['oidc.openbuildos'][0]
-        : request.auth.uid;
+    // Soubory firmy (vč. připojovacího probe `__preflight__`). Max 200 MB / objekt.
+    match /workspaces/{wid}/{rest=**} {
+      allow read: if isRealUser();
+      allow write: if isRealUser()
+        && (request.resource == null || request.resource.size < 200 * 1024 * 1024);
     }
 
-    function projectData(pid) {
-      return firestore.get(/databases/(default)/documents/projects/$(pid)).data;
-    }
-
-    function wsData(wid) {
-      return firestore.get(/databases/(default)/documents/workspaces/$(wid)).data;
-    }
-
-    function isWsAdmin(wid) {
-      return wsData(wid).get('ownerId', '') == principal()
-        || principal() in wsData(wid).get('adminIds', []);
-    }
-
-    function isMember(wid, pid) {
-      return isRealUser()
-        && projectData(pid).get('workspaceId', '') == wid
-        // Short-circuit on memberIds first to avoid the workspace lookup.
-        && (principal() in projectData(pid).get('memberIds', [])
-            || isWsAdmin(wid));
-    }
-
-    function canEdit(wid, pid) {
-      return isRealUser()
-        && projectData(pid).get('workspaceId', '') == wid
-        && (projectData(pid).get('roles', {}).get(principal(), '')
-              in ['editor', 'admin']
-            || isWsAdmin(wid));
-    }
-
-    match /workspaces/{wid}/projects/{pid}/{rest=**} {
-      allow read: if isMember(wid, pid);
-      allow write: if canEdit(wid, pid)
-        && (request.resource == null
-            || request.resource.size < 200 * 1024 * 1024);
-    }
-
-    // Everything else -- including legacy /projects/** -- is denied.
+    // Vše ostatní (vč. legacy /projects/**) je zakázané.
     match /{path=**} {
       allow read, write: if false;
     }

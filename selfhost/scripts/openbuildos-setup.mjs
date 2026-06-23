@@ -472,19 +472,70 @@ function grantTokenCreator(gcloud, project, sa) {
   }
 }
 
-/** KROK 8: Závěr — vypíše URL a návod. */
+/**
+ * KROK 7b: Zapíše federační URL do VEŘEJNÉHO `config/public` docu firemního
+ * Firestore (přes REST + access token vlastníka). Appka si ji odtud při
+ * připojení firmy načte SAMA (auto-discovery) — uživatel ji nikam neopisuje.
+ * Nefatální: když selže, federace půjde dopojit ručně (Upravit připojení).
+ */
+function writeFederationConfig(gcloud, project, url) {
+  step("Krok 7b — Zápis federační URL do config/public (auto-discovery v appce)");
+  if (!url) {
+    warn("Bez URL přeskakuji — appka si federaci nedoplní automaticky.");
+    return;
+  }
+  try {
+    const token = run(gcloud, ["auth", "print-access-token"]).stdout.trim();
+    if (!token) {
+      throw new Error("prázdný access token");
+    }
+    const docUrl =
+      `https://firestore.googleapis.com/v1/projects/${project}` +
+      `/databases/(default)/documents/config/public`;
+    const body = JSON.stringify({
+      fields: {
+        authExchangeUrl: { stringValue: url },
+        updatedAt: { timestampValue: new Date().toISOString() },
+      },
+    });
+    const { stdout } = run("curl", [
+      "-s",
+      "-X",
+      "PATCH",
+      "-H",
+      `Authorization: Bearer ${token}`,
+      "-H",
+      "Content-Type: application/json",
+      "-d",
+      body,
+      docUrl,
+    ]);
+    if (/"error"/.test(stdout)) {
+      throw new Error(stdout.split("\n").slice(0, 3).join(" "));
+    }
+    ok("config/public zapsán — appka si federační URL doplní sama při připojení firmy");
+  } catch (err) {
+    warn(
+      `Zápis config/public selhal (nefatální): ${
+        (err.combinedOutput || err.message || "").split("\n")[0]
+      }`
+    );
+  }
+}
+
+/** KROK 8: Závěr — federace je auto-discovery, URL jen pro kontrolu/fallback. */
 function printConclusion(url) {
   step("Krok 8/8 — Hotovo");
   console.log("");
   console.log("  ┌──────────────────────────────────────────────────────────────┐");
-  console.log("  │  FUNKCE URL (ověřovací endpoint federace):                     │");
+  console.log("  │  FEDERAČNÍ BACKEND PŘIPRAVEN — appka si URL doplní sama         │");
   console.log("  └──────────────────────────────────────────────────────────────┘");
   console.log("");
-  console.log(`      ${url || "(URL se nepodařilo zjistit — viz varování výše)"}`);
+  console.log(`      authExchange URL: ${url || "(nezjištěno — viz varování výše)"}`);
   console.log("");
-  info("  Vlož tuto URL v appce do připojení firmy:");
-  info("    Upravit připojení → „URL ověřovací funkce“ → vlož URL výše,");
-  info("    a přihlas se přes OpenBuildOS účet.");
+  info("  V appce stačí připojit firmu vložením firebaseConfigu — federační URL");
+  info("  se načte automaticky z config/public. Ručně ji zadávat NEMUSÍŠ.");
+  info("  (Kdyby auto-discovery selhalo: Upravit připojení → „Zadat ručně“ → URL výše.)");
 }
 
 /** Závěrečné shrnutí. */
@@ -577,6 +628,7 @@ async function main() {
     const sa = resolveRuntimeServiceAccount(gcloud, project, region); // krok 5
     grantPublicInvoker(gcloud, project, region); // krok 6 (org policy se řeší uvnitř)
     grantTokenCreator(gcloud, project, sa); // krok 7
+    writeFederationConfig(gcloud, project, url); // krok 7b — auto-discovery
 
     printConclusion(url); // krok 8
     printSummary({ project, region, url, success: true });

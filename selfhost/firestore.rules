@@ -117,6 +117,46 @@ service cloud.firestore {
     }
 
     // ---------------------------------------------------------------------
+    // Company / role model (per-project company assignment)
+    //
+    // A project doc may carry a `companies` map { [principal]: companyId }.
+    // The `company_editor` role lets a member edit content authored by other
+    // members of the SAME company on that project (in addition to their own).
+    // ---------------------------------------------------------------------
+
+    // The company a given member is assigned to on a project (or '' if none).
+    function memberCompany(pid, who) {
+      return projectData(pid).get('companies', {}).get(who, '');
+    }
+
+    // Content is authored by the caller (createdBy == principal).
+    function authoredBySelf() {
+      return resource.data.get('createdBy', '') == principal();
+    }
+
+    // May modify (update/delete) an existing user-generated content doc.
+    function canModifyContent(wid, pid) {
+      return isProjectMember(wid, pid) && (
+        projectRole(pid) in ['editor', 'admin'] || isWsAdmin(wid)
+        || authoredBySelf()
+        || (projectRole(pid) == 'company_editor'
+            && memberCompany(pid, principal()) != ''
+            && memberCompany(pid, resource.data.get('createdBy', '')) == memberCompany(pid, principal()))
+      );
+    }
+
+    // May create a user-generated content doc. Author (createdBy) musí být buď
+    // PRÁZDNÝ (obsah ještě nezadrátovaný na authorship → editovatelný jen
+    // editor/admin, bezpečné), nebo SÁM volající (principal) — nikdy NĚKDO JINÝ
+    // (zákaz spoofingu autorství). Tím se žádný create nerozbije, i kdyby daná
+    // kolekce createdBy nestampovala.
+    function canCreateContent(wid, pid) {
+      return isProjectMember(wid, pid)
+        && (request.resource.data.get('createdBy', '') == ''
+            || request.resource.data.get('createdBy', '') == principal());
+    }
+
+    // ---------------------------------------------------------------------
     // Workspaces
     // ---------------------------------------------------------------------
 
@@ -133,6 +173,32 @@ service cloud.firestore {
         && resource.data.get('ownerId', '') == principal()
         && request.resource.data.ownerId == resource.data.ownerId;
       allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Companies (firm-level company directory)
+    //
+    // Any real user (firm member) may read the company list; only workspace
+    // admins manage entries.
+    // ---------------------------------------------------------------------
+
+    match /workspaces/{wid}/companies/{companyId} {
+      allow read: if isRealUser();
+      allow create, update, delete: if isWsAdmin(wid);
+    }
+
+    // ---------------------------------------------------------------------
+    // Firm member directory (workspace-level, keyed by principal)
+    //
+    // Any real user (firm member) may read the directory; workspace admins
+    // manage entries, and a user may upsert ONLY their own entry (e.g. on
+    // invite redeem to record their displayName/companyId).
+    // ---------------------------------------------------------------------
+
+    match /workspaces/{wid}/members/{memberPrincipal} {
+      allow read: if isRealUser();
+      allow create, update: if isWsAdmin(wid) || principal() == memberPrincipal;
+      allow delete: if isWsAdmin(wid);
     }
 
     // ---------------------------------------------------------------------
@@ -187,7 +253,7 @@ service cloud.firestore {
           isRealUser()
           && memberUid == principal()
           && request.resource.data.keys()
-              .hasOnly(['role', 'displayName', 'email', 'inviteId', 'joinedAt'])
+              .hasOnly(['role', 'displayName', 'email', 'inviteId', 'joinedAt', 'companyId'])
           && request.resource.data.role in ['viewer', 'editor']
           && redeemOk(wid, pid, request.resource.data.inviteId,
               request.resource.data.role)
@@ -230,22 +296,34 @@ service cloud.firestore {
 
     match /workspaces/{wid}/projects/{pid}/tasks/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEditContent(wid, pid);
+      allow create: if canCreateContent(wid, pid);
+      allow update: if canModifyContent(wid, pid)
+        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
+      allow delete: if canModifyContent(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/files/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEditContent(wid, pid);
+      allow create: if canCreateContent(wid, pid);
+      allow update: if canModifyContent(wid, pid)
+        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
+      allow delete: if canModifyContent(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/photos/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEditContent(wid, pid);
+      allow create: if canCreateContent(wid, pid);
+      allow update: if canModifyContent(wid, pid)
+        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
+      allow delete: if canModifyContent(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/diaryEntries/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEditContent(wid, pid);
+      allow create: if canCreateContent(wid, pid);
+      allow update: if canModifyContent(wid, pid)
+        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
+      allow delete: if canModifyContent(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/plans/{docId} {
@@ -260,17 +338,26 @@ service cloud.firestore {
 
     match /workspaces/{wid}/projects/{pid}/documents/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEditContent(wid, pid);
+      allow create: if canCreateContent(wid, pid);
+      allow update: if canModifyContent(wid, pid)
+        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
+      allow delete: if canModifyContent(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documentVersions/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEditContent(wid, pid);
+      allow create: if canCreateContent(wid, pid);
+      allow update: if canModifyContent(wid, pid)
+        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
+      allow delete: if canModifyContent(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documentComments/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEditContent(wid, pid);
+      allow create: if canCreateContent(wid, pid);
+      allow update: if canModifyContent(wid, pid)
+        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
+      allow delete: if canModifyContent(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/transmittals/{docId} {
@@ -309,7 +396,7 @@ service cloud.firestore {
       return isRealUser()
         && !(principal() in resource.data.get('memberIds', []))
         && request.resource.data.diff(resource.data).affectedKeys()
-            .hasOnly(['memberIds', 'roles', 'updatedAt'])
+            .hasOnly(['memberIds', 'roles', 'updatedAt', 'companies'])
         && request.resource.data.memberIds is list
         && request.resource.data.memberIds.hasAll(resource.data.get('memberIds', []))
         && request.resource.data.memberIds.size()
@@ -370,6 +457,50 @@ service cloud.firestore {
     // Owner-only: each user reads/writes only their own registry doc.
     match /users/{userId} {
       allow read, write: if isSignedIn() && request.auth.uid == userId;
+    }
+
+    // ---------------------------------------------------------------------
+    // Pending invites registry (CENTRÁLNÍ projekt openbuildos)
+    //
+    // Mirror firemní pozvánky, aby ji pozvaný NAŠEL po přihlášení i bez linku
+    // (firemní invite žije jen ve workspaces/{wid}/invites/{token}, kam nemá
+    // přístup). Doc id = token = bearer tajemství (náhodný UUID).
+    //
+    // Čte JEN adresát (match jeho ověřeného e-mailu), publikuje libovolný reálný
+    // uživatel (zvoucí admin firmy), status flipne JEN adresát. Pole nesou
+    // veřejné klientské identifikátory firmy (apiKey ap.) pro sestavení
+    // WorkspaceConnection při přijetí — nic tajného.
+    // Query příjemce: where('inviteeEmail','==', mojeEmail) & where('status','==','pending').
+    // ---------------------------------------------------------------------
+    match /pendingInvites/{token} {
+      allow get, list: if isRealUser()
+        && resource.data.get('inviteeEmail', '') == request.auth.token.get('email', '');
+      allow create: if isRealUser()
+        && request.resource.data.get('status', '') == 'pending'
+        && request.resource.data.get('inviteeEmail', '') is string
+        && request.resource.data.get('inviteeEmail', '') != ''
+        && request.resource.data.get('role', '') in ['viewer', 'editor'];
+      // Adresát smí jen překlopit status (přijmout/odmítnout), nic jiného.
+      allow update: if isRealUser()
+        && resource.data.get('inviteeEmail', '') == request.auth.token.get('email', '')
+        && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['status', 'resolvedAt'])
+        && request.resource.data.status in ['accepted', 'declined'];
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Veřejná konfigurace firmy (federační URL pro auto-discovery)
+    //
+    // `config/public` = { authExchangeUrl }. Zapisuje setup CLI (admin SDK /
+    // REST s tokenem vlastníka, mimo rules). Čte se VEŘEJNĚ (i bez přihlášení),
+    // aby si appka při připojení firmy doplnila URL token-exchange funkce sama —
+    // bez ručního opisování z výstupu CLI. URL endpointu NENÍ tajná (autorizaci
+    // dělá samotná funkce ověřením centrálního ID tokenu).
+    // ---------------------------------------------------------------------
+    match /config/{docId} {
+      allow read: if true;
+      allow write: if false;
     }
 
     // No catch-all: everything else is denied by default.

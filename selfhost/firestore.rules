@@ -156,6 +156,17 @@ service cloud.firestore {
             || request.resource.data.get('createdBy', '') == principal());
     }
 
+    // Member designated as a document approver on this project (admin / workspace
+    // admin always count; others need `canApprove == true` on their member doc).
+    // Gate for review decisions on document versions (approve/reject/issue) — WP1.
+    function isApprover(wid, pid) {
+      return isProjectMember(wid, pid)
+        && (projectRole(pid) == 'admin'
+            || isWsAdmin(wid)
+            || get(/databases/$(database)/documents/workspaces/$(wid)/projects/$(pid)/members/$(principal()))
+                 .data.get('canApprove', false) == true);
+    }
+
     // ---------------------------------------------------------------------
     // Workspaces
     // ---------------------------------------------------------------------
@@ -332,23 +343,44 @@ service cloud.firestore {
     }
 
     match /workspaces/{wid}/projects/{pid}/planAnnotations/{docId} {
-      allow read: if isProjectMember(wid, pid);
+      // Soukromý markup (isPrivate) vidí JEN jeho autor (ownerPrincipal == principal);
+      // veřejné vidí každý člen. Klient čte dvěma dotazy (veřejné + vlastní soukromé).
+      allow read: if isProjectMember(wid, pid)
+        && (resource.data.get('isPrivate', false) == false
+            || resource.data.get('ownerPrincipal', '') == principal());
       allow create, update, delete: if canEditContent(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documents/{docId} {
       allow read: if isProjectMember(wid, pid);
       allow create: if canCreateContent(wid, pid);
-      allow update: if canModifyContent(wid, pid)
-        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
+      // Author immutable. Editovat smí běžná práva k obsahu; schvalovatel navíc
+      // smí jako vedlejší efekt approve transakce přepnout jen platnou revizi
+      // (currentVersionId/updatedAt) — i když není editor/autor dokumentu (WP1).
+      allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
+        && (
+          canModifyContent(wid, pid)
+          || (isApprover(wid, pid)
+              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['currentVersionId', 'updatedAt']))
+        );
       allow delete: if canModifyContent(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documentVersions/{docId} {
       allow read: if isProjectMember(wid, pid);
       allow create: if canCreateContent(wid, pid);
-      allow update: if canModifyContent(wid, pid)
-        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
+      // Schvalovatel (isApprover) smí verzi aktualizovat plně — zapsat svoje
+      // rozhodnutí do `approvals` mapy, odvozený status i supersede (i když u
+      // policy „all" status zatím zůstává under_review). Ostatní (uploader/
+      // editor/autor) smí běžné editace, ale NE přechod do rozhodnutí (zákaz
+      // self-approve). Audit se v rules nevynucuje.
+      allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')  // author immutable
+        && (
+          isApprover(wid, pid)
+          || (canModifyContent(wid, pid)
+              && !(request.resource.data.status != resource.data.status
+                   && request.resource.data.status in ['approved', 'approved_with_comments', 'rejected', 'superseded', 'for_construction']))
+        );
       allow delete: if canModifyContent(wid, pid);
     }
 
@@ -358,6 +390,14 @@ service cloud.firestore {
       allow update: if canModifyContent(wid, pid)
         && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
       allow delete: if canModifyContent(wid, pid);
+    }
+
+    // Registr složek projektu (Fáze 1, bez per-složkových práv). Člen smí číst
+    // a zakládat složky; mazat/měnit editor/admin/autor (canModifyContent).
+    match /workspaces/{wid}/projects/{pid}/folders/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create: if canCreateContent(wid, pid);
+      allow update, delete: if canModifyContent(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/transmittals/{docId} {

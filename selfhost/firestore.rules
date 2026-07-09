@@ -329,6 +329,16 @@ service cloud.firestore {
       allow delete: if canModifyContent(wid, pid);
     }
 
+    // Připnutí fotky do kontextu (task/plán) + anotace té varianty. Fotka samotná
+    // zůstává jeden záznam v /photos; pin ji jen referencuje (photoId).
+    match /workspaces/{wid}/projects/{pid}/photoPins/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create: if canCreateContent(wid, pid);
+      allow update: if canModifyContent(wid, pid)
+        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
+      allow delete: if canModifyContent(wid, pid);
+    }
+
     match /workspaces/{wid}/projects/{pid}/diaryEntries/{docId} {
       allow read: if isProjectMember(wid, pid);
       allow create: if canCreateContent(wid, pid);

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { remapPath, rewriteStrings } from "./projectTransfer";
+import { remapPath, rewriteStrings, validateManifest } from "./projectTransfer";
 
 const manifest = {
   format: "openbuildos-project-backup" as const,
@@ -28,4 +28,11 @@ test("přepíše raw i URL-encoded Storage cestu a bucket", () => {
     storagePath: "workspaces/target-workspace/projects/target-project/files/a.pdf",
     url: `https://firebasestorage.googleapis.com/v0/b/target.appspot.com/o/${encodeURIComponent("workspaces/target-workspace/projects/target-project/files/a.pdf")}?alt=media`,
   });
+});
+
+test("odmítne soubor mimo projektový prefix", () => {
+  assert.throws(() => validateManifest({
+    ...manifest,
+    files: [{ entry: "storage/stolen.pdf", sourcePath: "workspaces/other/projects/p/files/stolen.pdf", size: 1, sha256: "a".repeat(64) }],
+  }));
 });

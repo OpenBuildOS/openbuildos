@@ -20,6 +20,10 @@ const REGION = "europe-west1";
 const BACKUP_VERSION = 1;
 const BACKUP_PREFIX = "openbuildos-backups";
 const IMPORT_PREFIX = "openbuildos-imports";
+const MAX_BACKUP_BYTES = 750 * 1024 * 1024;
+const MAX_FILE_BYTES = 200 * 1024 * 1024;
+const MAX_DOCUMENTS = 100_000;
+const MAX_FILES = 20_000;
 
 type Encoded = null | boolean | number | string | Encoded[] | { [key: string]: Encoded };
 
@@ -46,6 +50,43 @@ interface BackupManifest {
   sourceBucket: string;
   documents: BackupDocument[];
   files: BackupFile[];
+}
+
+export function validateManifest(manifest: BackupManifest): void {
+  if (
+    manifest.format !== "openbuildos-project-backup" ||
+    manifest.version !== BACKUP_VERSION ||
+    !manifest.sourceWorkspaceId ||
+    !manifest.sourceProjectId ||
+    !manifest.sourceBucket ||
+    !Array.isArray(manifest.documents) ||
+    !Array.isArray(manifest.files)
+  ) {
+    throw new HttpsError("invalid-argument", "Neplatný manifest OpenBuildOS zálohy.");
+  }
+  if (manifest.documents.length > MAX_DOCUMENTS || manifest.files.length > MAX_FILES) {
+    throw new HttpsError("resource-exhausted", "Záloha překračuje podporovaný počet záznamů nebo souborů.");
+  }
+  const prefix = `workspaces/${manifest.sourceWorkspaceId}/projects/${manifest.sourceProjectId}/`;
+  let total = 0;
+  for (const file of manifest.files) {
+    const relative = file.sourcePath.startsWith(prefix) ? file.sourcePath.slice(prefix.length) : "";
+    if (
+      !relative ||
+      relative.split("/").includes("..") ||
+      file.entry !== `storage/${relative}` ||
+      !Number.isSafeInteger(file.size) ||
+      file.size < 0 ||
+      file.size > MAX_FILE_BYTES ||
+      !/^[a-f0-9]{64}$/.test(file.sha256)
+    ) {
+      throw new HttpsError("invalid-argument", `Neplatná položka souboru ${file.entry || file.sourcePath}.`);
+    }
+    total += file.size;
+  }
+  if (total > MAX_BACKUP_BYTES) {
+    throw new HttpsError("resource-exhausted", "Projekt je větší než současný limit zálohy 750 MB.");
+  }
 }
 
 function app() {
@@ -131,7 +172,9 @@ async function buildManifest(workspaceId: string, projectId: string): Promise<Ba
         : {}),
     });
   }
-  return { format: "openbuildos-project-backup", version: BACKUP_VERSION, createdAt: new Date().toISOString(), sourceWorkspaceId: workspaceId, sourceProjectId: projectId, sourceBucket: bucket.name, documents, files };
+  const manifest: BackupManifest = { format: "openbuildos-project-backup", version: BACKUP_VERSION, createdAt: new Date().toISOString(), sourceWorkspaceId: workspaceId, sourceProjectId: projectId, sourceBucket: bucket.name, documents, files };
+  validateManifest(manifest);
+  return manifest;
 }
 
 async function createArchive(manifest: BackupManifest, destination: string): Promise<void> {
@@ -175,6 +218,27 @@ export const exportProjectBackup = onCall<{ workspaceId?: string; projectId?: st
   }
 );
 
+export const prepareProjectBackupImport = onCall<{ workspaceId?: string; fileName?: string }>(
+  { region: REGION },
+  async (request) => {
+    if (!request.auth) throw new HttpsError("unauthenticated", "Chybí přihlášení.");
+    const workspaceId = request.data.workspaceId?.trim() ?? "";
+    const who = principal(request.auth);
+    if (!workspaceId) throw new HttpsError("invalid-argument", "Chybí workspaceId.");
+    await requireWorkspaceAdmin(workspaceId, who);
+    const safeName = (request.data.fileName || "project.obosbackup").replace(/[^a-zA-Z0-9._-]/g, "-");
+    const objectPath = `workspaces/${workspaceId}/${IMPORT_PREFIX}/${who}/${randomUUID()}-${safeName}`;
+    const expiresAt = Date.now() + 15 * 60 * 1000;
+    const [uploadUrl] = await getStorage(app()).bucket().file(objectPath).getSignedUrl({
+      version: "v4",
+      action: "write",
+      expires: expiresAt,
+      contentType: "application/zip",
+    });
+    return { objectPath, uploadUrl, expiresAt: new Date(expiresAt).toISOString() };
+  }
+);
+
 export function remapPath(path: string, manifest: BackupManifest, workspaceId: string, projectId: string): string {
   if (path === `projects/${manifest.sourceProjectId}` || path.startsWith(`projects/${manifest.sourceProjectId}/`)) {
     return path.replace(`projects/${manifest.sourceProjectId}`, `projects/${projectId}`);
@@ -198,7 +262,7 @@ export function rewriteStrings(value: unknown, manifest: BackupManifest, workspa
   return value;
 }
 
-async function commitDocuments(manifest: BackupManifest, workspaceId: string, projectId: string, who: string): Promise<void> {
+async function commitDocuments(manifest: BackupManifest, workspaceId: string, projectId: string, who: string, importOperationId: string): Promise<void> {
   const db = getFirestore(app());
   const targetBucket = getStorage(app()).bucket().name;
   const remap = (path: string) => remapPath(path, manifest, workspaceId, projectId);
@@ -209,7 +273,7 @@ async function commitDocuments(manifest: BackupManifest, workspaceId: string, pr
     .map((item) => ({ path: remap(item.path), data: rewriteStrings(decode(item.data, remap), manifest, workspaceId, projectId, targetBucket) as DocumentData }));
   const root = documents.find((item) => item.path === `projects/${projectId}`);
   if (!root) throw new HttpsError("invalid-argument", "Záloha neobsahuje kořenový projekt.");
-  root.data = { ...root.data, workspaceId, memberIds: [who], roles: { [who]: "admin" }, archived: false, restoredAt: new Date().toISOString() };
+  root.data = { ...root.data, workspaceId, memberIds: [who], roles: { [who]: "admin" }, archived: false, restoredAt: new Date().toISOString(), importOperationId };
   const memberPath = `workspaces/${workspaceId}/projects/${projectId}/members/${who}`;
   documents.push({ path: memberPath, data: { role: "admin", displayName: "Nový vlastník", joinedAt: new Date().toISOString() } });
 
@@ -227,7 +291,7 @@ async function restoreFiles(directory: unzipper.CentralDirectory, manifest: Back
     const entry = byEntry.get(item.entry);
     if (!entry) throw new HttpsError("invalid-argument", `V záloze chybí ${item.entry}.`);
     const content = await entry.buffer();
-    if (createHash("sha256").update(content).digest("hex") !== item.sha256) throw new HttpsError("data-loss", `Kontrolní součet nesedí pro ${item.entry}.`);
+    if (content.byteLength !== item.size || createHash("sha256").update(content).digest("hex") !== item.sha256) throw new HttpsError("data-loss", `Velikost nebo kontrolní součet nesedí pro ${item.entry}.`);
     const relative = item.sourcePath.split(`/projects/${manifest.sourceProjectId}/`)[1];
     if (!relative) throw new HttpsError("invalid-argument", `Neplatná cesta souboru ${item.sourcePath}.`);
     await bucket.file(`workspaces/${workspaceId}/projects/${projectId}/${relative}`).save(content, {
@@ -249,20 +313,50 @@ export const importProjectBackup = onCall<{ workspaceId?: string; objectPath?: s
     await requireWorkspaceAdmin(workspaceId, who);
     const localPath = join("/tmp", `${randomUUID()}.obosbackup`);
     const bucket = getStorage(app()).bucket();
+    const importOperationId = randomUUID();
+    const targetPrefix = `workspaces/${workspaceId}/projects/${projectId}/`;
+    let reserved = false;
     try {
       await bucket.file(objectPath).download({ destination: localPath });
       const directory = await unzipper.Open.file(localPath);
       const manifestEntry = directory.files.find((entry) => entry.path === "manifest.json");
       if (!manifestEntry) throw new HttpsError("invalid-argument", "Soubor není OpenBuildOS záloha.");
       const manifest = JSON.parse((await manifestEntry.buffer()).toString("utf8")) as BackupManifest;
-      if (manifest.format !== "openbuildos-project-backup" || manifest.version !== BACKUP_VERSION) throw new HttpsError("invalid-argument", "Nepodporovaná verze zálohy.");
-      if ((await getFirestore(app()).doc(`projects/${projectId}`).get()).exists) throw new HttpsError("already-exists", "Cílové ID projektu už existuje.");
+      validateManifest(manifest);
+      try {
+        await getFirestore(app()).doc(`projects/${projectId}`).create({
+          workspaceId,
+          memberIds: [who],
+          roles: { [who]: "admin" },
+          name: "Probíhá obnova projektu",
+          archived: true,
+          importOperationId,
+          createdAt: new Date().toISOString(),
+        });
+        reserved = true;
+      } catch (error) {
+        const code = typeof error === "object" && error && "code" in error ? String(error.code) : "";
+        if (code === "6" || code === "already-exists") throw new HttpsError("already-exists", "Cílové ID projektu už existuje.");
+        throw error;
+      }
       await restoreFiles(directory, manifest, workspaceId, projectId);
-      await commitDocuments(manifest, workspaceId, projectId, who);
+      await commitDocuments(manifest, workspaceId, projectId, who, importOperationId);
       await bucket.file(objectPath).delete({ ignoreNotFound: true });
       logger.info("Project backup restored", { workspaceId, projectId, sourceProjectId: manifest.sourceProjectId, who });
       return { projectId, documentCount: manifest.documents.length, fileCount: manifest.files.length };
+    } catch (error) {
+      if (reserved) {
+        const reservation = await getFirestore(app()).doc(`projects/${projectId}`).get().catch(() => null);
+        if (reservation?.data()?.importOperationId === importOperationId) {
+          const [partialFiles] = await bucket.getFiles({ prefix: targetPrefix });
+          await Promise.all(partialFiles.map((file) => file.delete({ ignoreNotFound: true })));
+          await deleteTree(`workspaces/${workspaceId}/projects/${projectId}`);
+          await deleteTree(`projects/${projectId}`);
+        }
+      }
+      throw error;
     } finally {
+      await bucket.file(objectPath).delete({ ignoreNotFound: true }).catch(() => undefined);
       await rm(localPath, { force: true });
     }
   }
@@ -291,6 +385,13 @@ export const deleteProjectPermanently = onCall<{ workspaceId?: string; projectId
     const who = principal(request.auth);
     if (!workspaceId || !projectId || request.data.confirmation !== projectId) throw new HttpsError("invalid-argument", "Potvrzení neodpovídá ID projektu.");
     await requireWorkspaceAdmin(workspaceId, who);
+    const projectSnapshot = await getFirestore(app()).doc(`projects/${projectId}`).get();
+    if (!projectSnapshot.exists || projectSnapshot.data()?.workspaceId !== workspaceId) {
+      throw new HttpsError("not-found", "Projekt neexistuje v tomto workspace.");
+    }
+    if (projectSnapshot.data()?.archived !== true) {
+      throw new HttpsError("failed-precondition", "Před trvalým smazáním musí být projekt archivovaný.");
+    }
     const bucket = getStorage(app()).bucket();
     const backupObjectPath = request.data.backupObjectPath?.trim() ?? "";
     if (!backupObjectPath.startsWith(`${BACKUP_PREFIX}/${who}/`)) throw new HttpsError("failed-precondition", "Před smazáním je povinná ověřená záloha projektu.");

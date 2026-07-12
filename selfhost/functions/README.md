@@ -62,14 +62,16 @@ Balíček nasazuje také callable funkce:
 
 - `exportProjectBackup` vytvoří přenositelný `.obosbackup` ZIP s verzovaným manifestem,
   Firestore daty, Storage objekty a SHA-256 kontrolními součty. Odkaz platí jednu hodinu.
-- `importProjectBackup` obnoví balíček nahraný pod
-  `workspaces/{wid}/openbuildos-imports/{principal}/`, přemapuje workspace/project ID a nastaví
+- `prepareProjectBackupImport` vydá ownerovi/adminovi krátkodobou podepsanou upload URL, takže
+  balíček není omezený běžným 200MB limitem klientských Storage rules.
+- `importProjectBackup` obnoví takto nahraný balíček, přemapuje workspace/project ID a nastaví
   volajícího jako nového vlastníka projektu. Staré členství a share linky se neaktivují.
 - `deleteProjectPermanently` kaskádově odstraní Firestore i Storage až po typed confirmation a
   ověření, že existuje záloha stejného projektu.
 
-Všechny tři operace smí spustit pouze vlastník nebo správce workspace. Funkce mají limit 2 GiB
-paměti a timeout 60 minut; extrémně velké projekty budou v další verzi potřebovat Cloud Run job.
+Operace smí spustit pouze vlastník nebo správce workspace. Aktuální bezpečný limit jednoho balíčku
+je 750 MB, 100 000 Firestore dokumentů a 20 000 souborů (nejvýše 200 MB na soubor). Větší projekty
+budou v další verzi potřebovat streamovaný Cloud Run job místo jedné Cloud Function.
 
 ## Konfigurace
 

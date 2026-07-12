@@ -1,4 +1,4 @@
-# OpenBuildOS — `authExchange` (token-exchange federace)
+# OpenBuildOS — Cloud Functions
 
 Tato Cloud Function zajišťuje **jedno přihlášení napříč samostatnými firemními
 Firebase backendy** bez OIDC, Zitadelu nebo Identity Platform.
@@ -55,6 +55,21 @@ endpoint)"** při připojování workspace (modal *Připojit workspace*).
 Funkce je **součástí open-source repozitáře** OpenBuildOS. Při aktualizaci stačí
 znovu spustit `firebase deploy --only functions --project <firma>` — nasadí se
 nová verze.
+
+## Životní cyklus projektu
+
+Balíček nasazuje také callable funkce:
+
+- `exportProjectBackup` vytvoří přenositelný `.obosbackup` ZIP s verzovaným manifestem,
+  Firestore daty, Storage objekty a SHA-256 kontrolními součty. Odkaz platí jednu hodinu.
+- `importProjectBackup` obnoví balíček nahraný pod
+  `workspaces/{wid}/openbuildos-imports/{principal}/`, přemapuje workspace/project ID a nastaví
+  volajícího jako nového vlastníka projektu. Staré členství a share linky se neaktivují.
+- `deleteProjectPermanently` kaskádově odstraní Firestore i Storage až po typed confirmation a
+  ověření, že existuje záloha stejného projektu.
+
+Všechny tři operace smí spustit pouze vlastník nebo správce workspace. Funkce mají limit 2 GiB
+paměti a timeout 60 minut; extrémně velké projekty budou v další verzi potřebovat Cloud Run job.
 
 ## Konfigurace
 

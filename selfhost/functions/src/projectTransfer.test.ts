@@ -36,3 +36,7 @@ test("odmítne soubor mimo projektový prefix", () => {
     files: [{ entry: "storage/stolen.pdf", sourcePath: "workspaces/other/projects/p/files/stolen.pdf", size: 1, sha256: "a".repeat(64) }],
   }));
 });
+
+test("odmítne manifest s ID obsahujícím cestu", () => {
+  assert.throws(() => validateManifest({ ...manifest, sourceProjectId: "project/foreign" }));
+});

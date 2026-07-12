@@ -52,6 +52,13 @@ interface BackupManifest {
   files: BackupFile[];
 }
 
+function requireResourceId(value: string, label: string): string {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    throw new HttpsError("invalid-argument", `${label} má neplatný formát.`);
+  }
+  return value;
+}
+
 export function validateManifest(manifest: BackupManifest): void {
   if (
     manifest.format !== "openbuildos-project-backup" ||
@@ -64,6 +71,8 @@ export function validateManifest(manifest: BackupManifest): void {
   ) {
     throw new HttpsError("invalid-argument", "Neplatný manifest OpenBuildOS zálohy.");
   }
+  requireResourceId(manifest.sourceWorkspaceId, "sourceWorkspaceId");
+  requireResourceId(manifest.sourceProjectId, "sourceProjectId");
   if (manifest.documents.length > MAX_DOCUMENTS || manifest.files.length > MAX_FILES) {
     throw new HttpsError("resource-exhausted", "Záloha překračuje podporovaný počet záznamů nebo souborů.");
   }
@@ -105,6 +114,15 @@ async function requireWorkspaceAdmin(workspaceId: string, who: string): Promise<
   if (!snapshot.exists || (data?.ownerId !== who && !data?.adminIds?.includes(who))) {
     throw new HttpsError("permission-denied", "Operaci smí provést pouze vlastník nebo správce workspace.");
   }
+}
+
+async function requireProjectInWorkspace(workspaceId: string, projectId: string): Promise<DocumentData> {
+  const snapshot = await getFirestore(app()).doc(`projects/${projectId}`).get();
+  const data = snapshot.data();
+  if (!snapshot.exists || data?.workspaceId !== workspaceId) {
+    throw new HttpsError("not-found", "Projekt neexistuje v tomto workspace.");
+  }
+  return data;
 }
 
 function encode(value: unknown): Encoded {
@@ -197,11 +215,12 @@ export const exportProjectBackup = onCall<{ workspaceId?: string; projectId?: st
   { region: REGION, timeoutSeconds: 3600, memory: "2GiB" },
   async (request) => {
     if (!request.auth) throw new HttpsError("unauthenticated", "Chybí přihlášení.");
-    const workspaceId = request.data.workspaceId?.trim() ?? "";
-    const projectId = request.data.projectId?.trim() ?? "";
+    const workspaceId = requireResourceId(request.data.workspaceId?.trim() ?? "", "workspaceId");
+    const projectId = requireResourceId(request.data.projectId?.trim() ?? "", "projectId");
     if (!workspaceId || !projectId) throw new HttpsError("invalid-argument", "Chybí workspaceId nebo projectId.");
     const who = principal(request.auth);
     await requireWorkspaceAdmin(workspaceId, who);
+    await requireProjectInWorkspace(workspaceId, projectId);
     const manifest = await buildManifest(workspaceId, projectId);
     const localPath = join("/tmp", `${projectId}-${randomUUID()}.obosbackup`);
     try {
@@ -222,9 +241,8 @@ export const prepareProjectBackupImport = onCall<{ workspaceId?: string; fileNam
   { region: REGION },
   async (request) => {
     if (!request.auth) throw new HttpsError("unauthenticated", "Chybí přihlášení.");
-    const workspaceId = request.data.workspaceId?.trim() ?? "";
+    const workspaceId = requireResourceId(request.data.workspaceId?.trim() ?? "", "workspaceId");
     const who = principal(request.auth);
-    if (!workspaceId) throw new HttpsError("invalid-argument", "Chybí workspaceId.");
     await requireWorkspaceAdmin(workspaceId, who);
     const safeName = (request.data.fileName || "project.obosbackup").replace(/[^a-zA-Z0-9._-]/g, "-");
     const objectPath = `workspaces/${workspaceId}/${IMPORT_PREFIX}/${who}/${randomUUID()}-${safeName}`;
@@ -305,9 +323,9 @@ export const importProjectBackup = onCall<{ workspaceId?: string; objectPath?: s
   { region: REGION, timeoutSeconds: 3600, memory: "2GiB" },
   async (request) => {
     if (!request.auth) throw new HttpsError("unauthenticated", "Chybí přihlášení.");
-    const workspaceId = request.data.workspaceId?.trim() ?? "";
+    const workspaceId = requireResourceId(request.data.workspaceId?.trim() ?? "", "workspaceId");
     const objectPath = request.data.objectPath?.trim() ?? "";
-    const projectId = request.data.projectId?.trim() || `proj-${Date.now()}`;
+    const projectId = requireResourceId(request.data.projectId?.trim() || `proj-${Date.now()}`, "projectId");
     const who = principal(request.auth);
     if (!workspaceId || !objectPath.startsWith(`workspaces/${workspaceId}/${IMPORT_PREFIX}/${who}/`)) throw new HttpsError("invalid-argument", "Neplatná cesta importu.");
     await requireWorkspaceAdmin(workspaceId, who);
@@ -380,16 +398,13 @@ export const deleteProjectPermanently = onCall<{ workspaceId?: string; projectId
   { region: REGION, timeoutSeconds: 3600, memory: "1GiB" },
   async (request) => {
     if (!request.auth) throw new HttpsError("unauthenticated", "Chybí přihlášení.");
-    const workspaceId = request.data.workspaceId?.trim() ?? "";
-    const projectId = request.data.projectId?.trim() ?? "";
+    const workspaceId = requireResourceId(request.data.workspaceId?.trim() ?? "", "workspaceId");
+    const projectId = requireResourceId(request.data.projectId?.trim() ?? "", "projectId");
     const who = principal(request.auth);
     if (!workspaceId || !projectId || request.data.confirmation !== projectId) throw new HttpsError("invalid-argument", "Potvrzení neodpovídá ID projektu.");
     await requireWorkspaceAdmin(workspaceId, who);
-    const projectSnapshot = await getFirestore(app()).doc(`projects/${projectId}`).get();
-    if (!projectSnapshot.exists || projectSnapshot.data()?.workspaceId !== workspaceId) {
-      throw new HttpsError("not-found", "Projekt neexistuje v tomto workspace.");
-    }
-    if (projectSnapshot.data()?.archived !== true) {
+    const projectData = await requireProjectInWorkspace(workspaceId, projectId);
+    if (projectData.archived !== true) {
       throw new HttpsError("failed-precondition", "Před trvalým smazáním musí být projekt archivovaný.");
     }
     const bucket = getStorage(app()).bucket();

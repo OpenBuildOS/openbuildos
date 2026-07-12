@@ -65,7 +65,9 @@ Balíček nasazuje také callable funkce:
 - `prepareProjectBackupImport` vydá ownerovi/adminovi krátkodobou podepsanou upload URL, takže
   balíček není omezený běžným 200MB limitem klientských Storage rules.
 - `importProjectBackup` obnoví takto nahraný balíček, přemapuje workspace/project ID a nastaví
-  volajícího jako nového vlastníka projektu. Staré členství a share linky se neaktivují.
+  volajícího jako nového vlastníka projektu. Pro wizard předání umí stáhnout také hodinovou signed
+  URL přímo ze zdrojového workspace (server-to-server, bez velkého blobu v prohlížeči). Staré
+  členství a share linky se neaktivují.
 - `deleteProjectPermanently` kaskádově odstraní Firestore i Storage až po typed confirmation a
   ověření, že existuje záloha stejného projektu.
 

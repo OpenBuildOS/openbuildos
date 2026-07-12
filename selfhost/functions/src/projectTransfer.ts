@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
+import { get as httpsGet } from "node:https";
 import { rm } from "node:fs/promises";
 import { basename, join } from "node:path";
 import archiver from "archiver";
@@ -96,6 +97,53 @@ export function validateManifest(manifest: BackupManifest): void {
   if (total > MAX_BACKUP_BYTES) {
     throw new HttpsError("resource-exhausted", "Projekt je větší než současný limit zálohy 750 MB.");
   }
+}
+
+export function validateBackupSourceUrl(value: string): URL {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new HttpsError("invalid-argument", "Zdrojová URL zálohy není platná.");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.hostname !== "storage.googleapis.com" ||
+    !url.searchParams.has("X-Goog-Signature")
+  ) {
+    throw new HttpsError("invalid-argument", "Povolená je pouze podepsaná Google Storage URL zálohy.");
+  }
+  return url;
+}
+
+async function downloadBackupUrl(value: string, destination: string): Promise<void> {
+  const url = validateBackupSourceUrl(value);
+  await new Promise<void>((resolve, reject) => {
+    const request = httpsGet(url, (response) => {
+      if (response.statusCode !== 200) {
+        response.resume();
+        reject(new HttpsError("unavailable", `Stažení zdrojové zálohy selhalo (${response.statusCode ?? 0}).`));
+        return;
+      }
+      const declaredSize = Number(response.headers["content-length"] ?? 0);
+      if (declaredSize > MAX_BACKUP_BYTES) {
+        response.resume();
+        reject(new HttpsError("resource-exhausted", "Zdrojová záloha překračuje limit 750 MB."));
+        return;
+      }
+      let received = 0;
+      const output = createWriteStream(destination);
+      response.on("data", (chunk: Buffer) => {
+        received += chunk.byteLength;
+        if (received > MAX_BACKUP_BYTES) request.destroy(new Error("Backup size limit exceeded"));
+      });
+      response.on("error", reject);
+      output.on("error", reject);
+      output.on("finish", resolve);
+      response.pipe(output);
+    });
+    request.on("error", reject);
+  });
 }
 
 function app() {
@@ -319,15 +367,20 @@ async function restoreFiles(directory: unzipper.CentralDirectory, manifest: Back
   }
 }
 
-export const importProjectBackup = onCall<{ workspaceId?: string; objectPath?: string; projectId?: string }>(
+export const importProjectBackup = onCall<{ workspaceId?: string; objectPath?: string; sourceUrl?: string; projectId?: string }>(
   { region: REGION, timeoutSeconds: 3600, memory: "2GiB" },
   async (request) => {
     if (!request.auth) throw new HttpsError("unauthenticated", "Chybí přihlášení.");
     const workspaceId = requireResourceId(request.data.workspaceId?.trim() ?? "", "workspaceId");
     const objectPath = request.data.objectPath?.trim() ?? "";
+    const sourceUrl = request.data.sourceUrl?.trim() ?? "";
     const projectId = requireResourceId(request.data.projectId?.trim() || `proj-${Date.now()}`, "projectId");
     const who = principal(request.auth);
-    if (!workspaceId || !objectPath.startsWith(`workspaces/${workspaceId}/${IMPORT_PREFIX}/${who}/`)) throw new HttpsError("invalid-argument", "Neplatná cesta importu.");
+    const validObjectPath = objectPath.startsWith(`workspaces/${workspaceId}/${IMPORT_PREFIX}/${who}/`);
+    if (validObjectPath === Boolean(sourceUrl)) {
+      throw new HttpsError("invalid-argument", "Zadejte právě jeden zdroj importu.");
+    }
+    if (sourceUrl) validateBackupSourceUrl(sourceUrl);
     await requireWorkspaceAdmin(workspaceId, who);
     const localPath = join("/tmp", `${randomUUID()}.obosbackup`);
     const bucket = getStorage(app()).bucket();
@@ -335,7 +388,8 @@ export const importProjectBackup = onCall<{ workspaceId?: string; objectPath?: s
     const targetPrefix = `workspaces/${workspaceId}/projects/${projectId}/`;
     let reserved = false;
     try {
-      await bucket.file(objectPath).download({ destination: localPath });
+      if (sourceUrl) await downloadBackupUrl(sourceUrl, localPath);
+      else await bucket.file(objectPath).download({ destination: localPath });
       const directory = await unzipper.Open.file(localPath);
       const manifestEntry = directory.files.find((entry) => entry.path === "manifest.json");
       if (!manifestEntry) throw new HttpsError("invalid-argument", "Soubor není OpenBuildOS záloha.");
@@ -359,7 +413,7 @@ export const importProjectBackup = onCall<{ workspaceId?: string; objectPath?: s
       }
       await restoreFiles(directory, manifest, workspaceId, projectId);
       await commitDocuments(manifest, workspaceId, projectId, who, importOperationId);
-      await bucket.file(objectPath).delete({ ignoreNotFound: true });
+      if (objectPath) await bucket.file(objectPath).delete({ ignoreNotFound: true });
       logger.info("Project backup restored", { workspaceId, projectId, sourceProjectId: manifest.sourceProjectId, who });
       return { projectId, documentCount: manifest.documents.length, fileCount: manifest.files.length };
     } catch (error) {
@@ -374,7 +428,7 @@ export const importProjectBackup = onCall<{ workspaceId?: string; objectPath?: s
       }
       throw error;
     } finally {
-      await bucket.file(objectPath).delete({ ignoreNotFound: true }).catch(() => undefined);
+      if (objectPath) await bucket.file(objectPath).delete({ ignoreNotFound: true }).catch(() => undefined);
       await rm(localPath, { force: true });
     }
   }

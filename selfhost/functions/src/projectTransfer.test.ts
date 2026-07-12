@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { remapPath, rewriteStrings, validateManifest } from "./projectTransfer";
+import { remapPath, rewriteStrings, validateBackupSourceUrl, validateManifest } from "./projectTransfer";
 
 const manifest = {
   format: "openbuildos-project-backup" as const,
@@ -39,4 +39,10 @@ test("odmítne soubor mimo projektový prefix", () => {
 
 test("odmítne manifest s ID obsahujícím cestu", () => {
   assert.throws(() => validateManifest({ ...manifest, sourceProjectId: "project/foreign" }));
+});
+
+test("povolí pouze podepsanou URL Google Storage", () => {
+  assert.equal(validateBackupSourceUrl("https://storage.googleapis.com/bucket/file?X-Goog-Signature=abc").hostname, "storage.googleapis.com");
+  assert.throws(() => validateBackupSourceUrl("https://example.com/backup?X-Goog-Signature=abc"));
+  assert.throws(() => validateBackupSourceUrl("https://storage.googleapis.com/bucket/file"));
 });

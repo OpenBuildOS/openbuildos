@@ -2,6 +2,12 @@ import { initializeApp, getApps, getApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { onRequest } from "firebase-functions/v2/https";
 import * as logger from "firebase-functions/logger";
+export {
+  deleteProjectPermanently,
+  exportProjectBackup,
+  importProjectBackup,
+  prepareProjectBackupImport,
+} from "./projectTransfer";
 
 /**
  * Token-exchange Cloud Function `authExchange` pro OpenBuildOS federaci.

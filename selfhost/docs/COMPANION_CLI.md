@@ -9,7 +9,8 @@ federačního backendu OpenBuildOS. Nahrazuje ruční postup z
 Do firemního Firebase projektu (na plánu Blaze) nasadí:
 
 1. **Firestore pravidla** (`firestore.rules`) — s retry/backoffem.
-2. **Token-exchange funkci `authExchange`** (`functions/`) — `--force` deploy
+2. **Cloud Functions** (`functions/`) — federaci a privilegované operace životního cyklu projektu
+   (`exportProjectBackup`, `importProjectBackup`, `deleteProjectPermanently`) — `--force` deploy
    (1. pokus čerstvého Blaze projektu typicky selže na *build service account*,
    retry to vyřeší; `--force` zároveň nastaví **artifact cleanup policy**).
 

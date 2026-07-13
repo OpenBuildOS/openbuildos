@@ -49,6 +49,62 @@
           "order": "ASCENDING"
         }
       ]
+    },
+    {
+      "collectionGroup": "folders",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "accessMode",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "allowedPrincipalIds",
+          "arrayConfig": "CONTAINS"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "documents",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "accessMode",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "allowedPrincipalIds",
+          "arrayConfig": "CONTAINS"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "documentVersions",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "accessMode",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "allowedPrincipalIds",
+          "arrayConfig": "CONTAINS"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "plans",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "accessMode",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "allowedPrincipalIds",
+          "arrayConfig": "CONTAINS"
+        }
+      ]
     }
   ],
   "fieldOverrides": []

@@ -1,7 +1,10 @@
 import { initializeApp, getApps, getApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
-import { onRequest } from "firebase-functions/v2/https";
+import { getFirestore } from "firebase-admin/firestore";
+import { getStorage } from "firebase-admin/storage";
+import { onRequest, type Request } from "firebase-functions/v2/https";
 import * as logger from "firebase-functions/logger";
+import type { Response } from "express";
 
 /**
  * Token-exchange Cloud Function `authExchange` pro OpenBuildOS federaci.
@@ -65,13 +68,22 @@ function resolveCorsOrigin(origin: string | undefined): string {
   return "https://openbuildos.web.app";
 }
 
-export const authExchange = onRequest({ region: "europe-west1" }, async (req, res) => {
+function setCors(
+  req: Request,
+  res: Response,
+  methods: string
+) {
   const origin = req.headers.origin as string | undefined;
   res.set("Access-Control-Allow-Origin", resolveCorsOrigin(origin));
   res.set("Vary", "Origin");
-  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.set("Access-Control-Allow-Headers", "Content-Type");
+  res.set("Access-Control-Allow-Methods", `${methods}, OPTIONS`);
+  res.set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range");
+  res.set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Length, Content-Range");
   res.set("Access-Control-Max-Age", "3600");
+}
+
+export const authExchange = onRequest({ region: "europe-west1" }, async (req, res) => {
+  setCors(req, res, "POST");
 
   if (req.method === "OPTIONS") {
     res.status(204).send("");
@@ -106,5 +118,275 @@ export const authExchange = onRequest({ region: "europe-west1" }, async (req, re
   } catch (error) {
     logger.error("authExchange selhalo", error);
     res.status(401).json({ error: "Ověření centrálního tokenu selhalo." });
+  }
+});
+
+type CompanyAccess = {
+  principal: string;
+  role: string;
+  isLead: boolean;
+};
+
+const MAX_COMPANY_FILE_BYTES = 200 * 1024 * 1024;
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function safeFileName(value: string): string {
+  return value.replace(/[\\/\u0000-\u001f\u007f]+/g, "_").slice(0, 180) || "soubor.pdf";
+}
+
+// Firestore/Storage segmenty stavíme z klientských ID — dovol jen bezpečný tvar
+// (UUID/nanoid), ať se do cesty nedostane '/', '..' ani řídicí znak.
+function isSafeId(value: string): boolean {
+  return /^[A-Za-z0-9_-]{1,64}$/.test(value);
+}
+
+// Whitelist content-typů pro upload. Interní soubory jsou PDF, náhledy JPEG;
+// cokoli jiného (např. text/html) by se přes `inline` download mohlo zneužít.
+function safeContentType(kind: "file" | "thumbnail", value: string): string {
+  const allowed = kind === "thumbnail" ? ["image/jpeg"] : ["application/pdf"];
+  return allowed.includes(value) ? value : allowed[0];
+}
+
+async function verifyWorkspaceBearer(req: Request) {
+  const authorization = req.headers.authorization ?? "";
+  if (!authorization.startsWith("Bearer ")) {
+    throw new Error("Chybí workspace autorizační token.");
+  }
+  return getAuth(getLocalApp()).verifyIdToken(authorization.slice("Bearer ".length));
+}
+
+async function authorizeCompany(
+  workspaceId: string,
+  projectId: string,
+  companyId: string,
+  principal: string
+): Promise<CompanyAccess> {
+  const project = await getFirestore(getLocalApp()).doc(`projects/${projectId}`).get();
+  const data = project.data();
+  const companies = (data?.companies ?? {}) as Record<string, unknown>;
+  const roles = (data?.roles ?? {}) as Record<string, unknown>;
+  const memberIds = Array.isArray(data?.memberIds) ? data.memberIds : [];
+
+  if (
+    !project.exists
+    || data?.workspaceId !== workspaceId
+    || !memberIds.includes(principal)
+    || companies[principal] !== companyId
+  ) {
+    throw new Error("Uživatel není členem této firmy na projektu.");
+  }
+
+  // Kill switch: když je beta na projektu explicitně vypnutá, brána odmítne i
+  // přímé volání (feature flag tak není jen UI, ale i bezpečnostní vypínač).
+  if (data?.companySpacesBetaEnabled === false) {
+    throw new Error("Beta firemních prostorů je na tomto projektu vypnutá.");
+  }
+
+  const role = typeof roles[principal] === "string" ? String(roles[principal]) : "viewer";
+  return {
+    principal,
+    role,
+    isLead: ["company_editor", "editor", "admin"].includes(role),
+  };
+}
+
+function canReadAccessRecord(access: CompanyAccess, data: Record<string, unknown>): boolean {
+  if (access.isLead || data.accessMode === "company_all") {
+    return true;
+  }
+  return data.accessMode === "restricted"
+    && Array.isArray(data.allowedPrincipalIds)
+    && data.allowedPrincipalIds.includes(access.principal);
+}
+
+async function assertFolderAccess(
+  workspaceId: string,
+  projectId: string,
+  companyId: string,
+  folderId: string,
+  access: CompanyAccess
+) {
+  if (!folderId) {
+    return { accessMode: "company_all", allowedPrincipalIds: [] as string[] };
+  }
+  const folder = await getFirestore(getLocalApp())
+    .doc(`workspaces/${workspaceId}/projects/${projectId}/companySpaces/${companyId}/folders/${folderId}`)
+    .get();
+  const data = folder.data() as Record<string, unknown> | undefined;
+  if (!folder.exists || !data || !canReadAccessRecord(access, data)) {
+    throw new Error("Ke zvolené složce nemáte přístup.");
+  }
+  return {
+    accessMode: data.accessMode,
+    allowedPrincipalIds: Array.isArray(data.allowedPrincipalIds) ? data.allowedPrincipalIds.map(String) : [],
+  };
+}
+
+function companySpacePrefix(workspaceId: string, projectId: string, companyId: string) {
+  return `workspaces/${workspaceId}/projects/${projectId}/companySpaces/${companyId}/`;
+}
+
+function parseRange(rangeHeader: string | undefined, size: number) {
+  const match = rangeHeader?.match(/^bytes=(\d*)-(\d*)$/);
+  if (!match) {
+    return null;
+  }
+  const start = match[1] ? Number(match[1]) : 0;
+  const end = match[2] ? Number(match[2]) : size - 1;
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || start >= size) {
+    return null;
+  }
+  return { start, end: Math.min(end, size - 1) };
+}
+
+async function handleCompanyUpload(
+  req: Request,
+  res: Response,
+  access: CompanyAccess,
+  workspaceId: string,
+  projectId: string,
+  companyId: string
+) {
+  const documentId = stringValue(req.body?.documentId);
+  const versionId = stringValue(req.body?.versionId);
+  const folderId = stringValue(req.body?.folderId);
+  const requestedName = safeFileName(stringValue(req.body?.fileName));
+  const kind = req.body?.kind === "thumbnail" ? "thumbnail" : "file";
+  const contentType = safeContentType(kind, stringValue(req.body?.contentType));
+  const size = Number(req.body?.size);
+  if (
+    !isSafeId(documentId)
+    || !isSafeId(versionId)
+    || (folderId && !isSafeId(folderId))
+    || !Number.isFinite(size)
+    || size <= 0
+    || size > MAX_COMPANY_FILE_BYTES
+  ) {
+    res.status(400).json({ error: "Neplatná metadata souboru nebo překročený limit 200 MB." });
+    return;
+  }
+
+  await assertFolderAccess(workspaceId, projectId, companyId, folderId, access);
+  const suffix = kind === "thumbnail" ? "thumbnails/preview.jpg" : `files/${requestedName}`;
+  const objectPath = `${companySpacePrefix(workspaceId, projectId, companyId)}documents/${documentId}/${versionId}/${suffix}`;
+  const file = getStorage(getLocalApp()).bucket().file(objectPath);
+  const [uploadUrl] = await file.createResumableUpload({
+    origin: resolveCorsOrigin(req.headers.origin as string | undefined),
+    metadata: {
+      contentType,
+      metadata: { projectId, companyId, documentId, versionId, uploadedBy: access.principal },
+    },
+  });
+  res.status(200).json({ uploadUrl, objectPath });
+}
+
+async function handleCompanyDownload(
+  req: Request,
+  res: Response,
+  access: CompanyAccess,
+  workspaceId: string,
+  projectId: string,
+  companyId: string
+) {
+  const documentId = stringValue(req.query.documentId);
+  const versionId = stringValue(req.query.versionId);
+  const kind = req.query.kind === "thumbnail" ? "thumbnail" : "file";
+  if (!isSafeId(documentId) || !isSafeId(versionId)) {
+    res.status(400).json({ error: "Chybí documentId nebo versionId." });
+    return;
+  }
+
+  const version = await getFirestore(getLocalApp())
+    .doc(`workspaces/${workspaceId}/projects/${projectId}/companySpaces/${companyId}/documentVersions/${versionId}`)
+    .get();
+  const data = version.data() as Record<string, unknown> | undefined;
+  if (!version.exists || !data || data.documentId !== documentId || !canReadAccessRecord(access, data)) {
+    res.status(404).json({ error: "Soubor nebyl nalezen." });
+    return;
+  }
+
+  // ACL zdroj pravdy = složka, ne denormalizované pole na verzi. Klientská
+  // propagace ACL (updateCompanyFolderAccess) není atomická; kdyby doběhla jen
+  // zčásti, verze by mohla nést zastaralé `company_all`. Ověř aktuální ACL
+  // složky, aby odebraný člen nestáhl binárku přes zastaralé pole na verzi.
+  await assertFolderAccess(workspaceId, projectId, companyId, stringValue(data.folderId), access);
+
+  const objectPath = stringValue(kind === "thumbnail" ? data.thumbnailObjectPath : data.fileObjectPath);
+  const prefix = companySpacePrefix(workspaceId, projectId, companyId);
+  if (!objectPath.startsWith(prefix)) {
+    res.status(404).json({ error: "Soubor nebyl nalezen." });
+    return;
+  }
+
+  const file = getStorage(getLocalApp()).bucket().file(objectPath);
+  const [metadata] = await file.getMetadata();
+  const size = Number(metadata.size ?? 0);
+  const range = parseRange(req.headers.range, size);
+  res.set("Cache-Control", "private, no-store");
+  res.set("Accept-Ranges", "bytes");
+  res.set("Content-Type", metadata.contentType || "application/octet-stream");
+  res.set("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(stringValue(data.fileName) || "soubor.pdf")}`);
+
+  if (req.method === "HEAD") {
+    res.set("Content-Length", String(size));
+    res.status(200).end();
+    return;
+  }
+
+  if (range) {
+    res.status(206);
+    res.set("Content-Range", `bytes ${range.start}-${range.end}/${size}`);
+    res.set("Content-Length", String(range.end - range.start + 1));
+  } else {
+    res.status(200);
+    res.set("Content-Length", String(size));
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const stream = file.createReadStream(range ?? undefined);
+    stream.on("error", reject);
+    res.on("finish", resolve);
+    res.on("close", resolve);
+    stream.pipe(res);
+  });
+}
+
+/**
+ * Autorizovaná datová brána firemního prostoru.
+ * POST vytvoří krátkodobou resumable upload session; GET/HEAD streamuje objekt
+ * až po ověření projektu, firmy a ACL uloženého version dokumentu.
+ */
+export const companyFile = onRequest({ region: "europe-west1", timeoutSeconds: 300 }, async (req, res) => {
+  setCors(req, res, "GET, HEAD, POST");
+  if (req.method === "OPTIONS") {
+    res.status(204).send("");
+    return;
+  }
+  if (!["GET", "HEAD", "POST"].includes(req.method)) {
+    res.status(405).json({ error: "Method not allowed" });
+    return;
+  }
+
+  try {
+    const decoded = await verifyWorkspaceBearer(req);
+    const workspaceId = stringValue(req.method === "POST" ? req.body?.workspaceId : req.query.workspaceId);
+    const projectId = stringValue(req.method === "POST" ? req.body?.projectId : req.query.projectId);
+    const companyId = stringValue(req.method === "POST" ? req.body?.companyId : req.query.companyId);
+    if (!workspaceId || !projectId || !companyId) {
+      res.status(400).json({ error: "Chybí workspaceId, projectId nebo companyId." });
+      return;
+    }
+    const access = await authorizeCompany(workspaceId, projectId, companyId, decoded.uid);
+    if (req.method === "POST") {
+      await handleCompanyUpload(req, res, access, workspaceId, projectId, companyId);
+    } else {
+      await handleCompanyDownload(req, res, access, workspaceId, projectId, companyId);
+    }
+  } catch (error) {
+    logger.warn("companyFile zamítl request", error);
+    res.status(403).json({ error: "K firemnímu souboru nemáte přístup." });
   }
 });

@@ -129,6 +129,84 @@ service cloud.firestore {
       return projectData(pid).get('companies', {}).get(who, '');
     }
 
+    function isSameProjectCompany(wid, pid, companyId) {
+      return companyId != ''
+        && isProjectMember(wid, pid)
+        && memberCompany(pid, principal()) == companyId;
+    }
+
+    function isCompanySpaceLead(wid, pid, companyId) {
+      return isSameProjectCompany(wid, pid, companyId)
+        && projectRole(pid) in ['company_editor', 'editor', 'admin'];
+    }
+
+    function hasCompanyResourceAccess(wid, pid, companyId, data) {
+      return isSameProjectCompany(wid, pid, companyId)
+        && (
+          isCompanySpaceLead(wid, pid, companyId)
+          || data.get('accessMode', '') == 'company_all'
+          || (data.get('accessMode', '') == 'restricted'
+              && principal() in data.get('allowedPrincipalIds', []))
+        );
+    }
+
+    function validCompanyResourceIdentity(companyId, data) {
+      return data.get('scope', '') == 'company_internal'
+        && data.get('ownerCompanyId', '') == companyId
+        && data.get('createdBy', '') == principal()
+        && data.get('accessMode', '') in ['company_all', 'restricted']
+        && data.get('allowedPrincipalIds', []) is list;
+    }
+
+    function companyFolderPath(wid, pid, companyId, folderId) {
+      return /databases/$(database)/documents/workspaces/$(wid)/projects/$(pid)/companySpaces/$(companyId)/folders/$(folderId);
+    }
+
+    function companyPlanPath(wid, pid, companyId, planId) {
+      return /databases/$(database)/documents/workspaces/$(wid)/projects/$(pid)/companySpaces/$(companyId)/plans/$(planId);
+    }
+
+    function canUseCompanyPlan(wid, pid, companyId, planId, data) {
+      return planId != ''
+        && exists(companyPlanPath(wid, pid, companyId, planId))
+        && hasCompanyResourceAccess(wid, pid, companyId, get(companyPlanPath(wid, pid, companyId, planId)).data)
+        && data.get('folderId', '') == get(companyPlanPath(wid, pid, companyId, planId)).data.get('folderId', '')
+        && data.get('accessMode', '') == get(companyPlanPath(wid, pid, companyId, planId)).data.get('accessMode', '')
+        && data.get('allowedPrincipalIds', []) == get(companyPlanPath(wid, pid, companyId, planId)).data.get('allowedPrincipalIds', []);
+    }
+
+    function canUseCompanyFolder(wid, pid, companyId, folderId, data) {
+      return (
+          folderId == ''
+          && data.get('accessMode', '') == 'company_all'
+          && data.get('allowedPrincipalIds', []).size() == 0
+        ) || (
+          folderId != ''
+          && exists(companyFolderPath(wid, pid, companyId, folderId))
+          && hasCompanyResourceAccess(wid, pid, companyId, get(companyFolderPath(wid, pid, companyId, folderId)).data)
+          && data.get('accessMode', '') == get(companyFolderPath(wid, pid, companyId, folderId)).data.get('accessMode', '')
+          && data.get('allowedPrincipalIds', []) == get(companyFolderPath(wid, pid, companyId, folderId)).data.get('allowedPrincipalIds', [])
+        );
+    }
+
+    function validChildCompanyAccess(wid, pid, companyId, parentId, data) {
+      return (
+          parentId == ''
+          && data.get('accessMode', '') in ['company_all', 'restricted']
+        ) || (
+          parentId != ''
+          && exists(companyFolderPath(wid, pid, companyId, parentId))
+          && hasCompanyResourceAccess(wid, pid, companyId, get(companyFolderPath(wid, pid, companyId, parentId)).data)
+          && (
+            get(companyFolderPath(wid, pid, companyId, parentId)).data.get('accessMode', '') == 'company_all'
+            || (
+              data.get('accessMode', '') == 'restricted'
+              && get(companyFolderPath(wid, pid, companyId, parentId)).data.get('allowedPrincipalIds', []).hasAll(data.get('allowedPrincipalIds', []))
+            )
+          )
+        );
+    }
+
     // Content is authored by the caller (createdBy == principal).
     function authoredBySelf() {
       return resource.data.get('createdBy', '') == principal();
@@ -275,6 +353,121 @@ service cloud.firestore {
       allow update: if canManageProjectAfter(wid, pid)
         && request.resource.data.role in ['viewer', 'editor', 'admin'];
       allow delete: if canManageProject(wid, pid);
+    }
+
+    // Firemní interní pracovní prostory jsou oddělené od oficiálních kolekcí,
+    // aby legacy list query nikdy nemíchaly obsah s rozdílnou viditelností.
+    match /workspaces/{wid}/projects/{pid}/companySpaces/{companyId} {
+      allow get: if isSameProjectCompany(wid, pid, companyId);
+      allow list: if false;
+      allow create: if (isSameProjectCompany(wid, pid, companyId) || canManageProject(wid, pid))
+        && request.resource.data.get('companyId', '') == companyId
+        && request.resource.data.get('projectId', '') == pid
+        && request.resource.data.get('workspaceId', '') == wid
+        && request.resource.data.get('scope', '') == 'company_internal'
+        && request.resource.data.get('createdBy', '') == principal();
+      allow update: if isCompanySpaceLead(wid, pid, companyId)
+        && request.resource.data.companyId == resource.data.companyId
+        && request.resource.data.projectId == resource.data.projectId
+        && request.resource.data.workspaceId == resource.data.workspaceId
+        && request.resource.data.scope == resource.data.scope;
+      allow delete: if false;
+
+      match /folders/{folderId} {
+        allow get, list: if hasCompanyResourceAccess(wid, pid, companyId, resource.data);
+        allow create: if isCompanySpaceLead(wid, pid, companyId)
+          && validCompanyResourceIdentity(companyId, request.resource.data)
+          && request.resource.data.get('folderId', '') == folderId
+          && request.resource.data.get('parentId', '') != folderId
+          && validChildCompanyAccess(wid, pid, companyId, request.resource.data.get('parentId', ''), request.resource.data);
+        allow update: if isCompanySpaceLead(wid, pid, companyId)
+          && request.resource.data.get('scope', '') == resource.data.get('scope', '')
+          && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
+          && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
+          && request.resource.data.get('folderId', '') == resource.data.get('folderId', '')
+          && request.resource.data.get('parentId', '') != folderId
+          && validChildCompanyAccess(wid, pid, companyId, request.resource.data.get('parentId', ''), request.resource.data);
+        allow delete: if isCompanySpaceLead(wid, pid, companyId);
+      }
+
+      match /documents/{documentId} {
+        allow get, list: if hasCompanyResourceAccess(wid, pid, companyId, resource.data);
+        allow create: if validCompanyResourceIdentity(companyId, request.resource.data)
+          && isSameProjectCompany(wid, pid, companyId)
+          && request.resource.data.get('documentId', '') == documentId
+          && request.resource.data.get('approvalMode', '') == 'none'
+          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
+        allow update: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
+          && (resource.data.get('createdBy', '') == principal() || isCompanySpaceLead(wid, pid, companyId))
+          && request.resource.data.get('scope', '') == resource.data.get('scope', '')
+          && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
+          && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
+          && request.resource.data.get('approvalMode', '') == 'none'
+          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
+        allow delete: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
+          && (resource.data.get('createdBy', '') == principal() || isCompanySpaceLead(wid, pid, companyId));
+      }
+
+      match /documentVersions/{versionId} {
+        allow get, list: if hasCompanyResourceAccess(wid, pid, companyId, resource.data);
+        allow create: if validCompanyResourceIdentity(companyId, request.resource.data)
+          && isSameProjectCompany(wid, pid, companyId)
+          && request.resource.data.get('versionId', '') == versionId
+          && request.resource.data.get('status', '') == 'working'
+          && request.resource.data.get('workflowMode', '') == 'none'
+          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
+        allow update: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
+          && (resource.data.get('createdBy', '') == principal() || isCompanySpaceLead(wid, pid, companyId))
+          && request.resource.data.get('scope', '') == resource.data.get('scope', '')
+          && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
+          && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
+          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
+        allow delete: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
+          && (resource.data.get('createdBy', '') == principal() || isCompanySpaceLead(wid, pid, companyId));
+      }
+
+      match /plans/{planId} {
+        allow get, list: if hasCompanyResourceAccess(wid, pid, companyId, resource.data);
+        allow create: if validCompanyResourceIdentity(companyId, request.resource.data)
+          && isSameProjectCompany(wid, pid, companyId)
+          && request.resource.data.get('planId', '') == planId
+          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
+        allow update: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
+          && (resource.data.get('createdBy', '') == principal() || isCompanySpaceLead(wid, pid, companyId))
+          && request.resource.data.get('scope', '') == resource.data.get('scope', '')
+          && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
+          && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
+          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
+        allow delete: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
+          && (resource.data.get('createdBy', '') == principal() || isCompanySpaceLead(wid, pid, companyId));
+      }
+
+      // Sdílené firemní markupy jednoho planVersion. Task piny sem nepatří a
+      // zůstávají v betě zakázané; dokument obsahuje pouze geometrické anotace.
+      // Pozn.: rules neumí iterovat prvky listu, takže per-item typ nevaliduje —
+      // task piny jsou v appce samostatné Tasky (ne anotace), FE je do `items`
+      // nikdy nezapisuje a nad firemním plánem je i vytvoření pinu vypnuté.
+      // Zde vynucujeme aspoň strop velikosti pole proti zneužití zápisem.
+      match /planAnnotationSets/{versionId} {
+        allow get: if hasCompanyResourceAccess(wid, pid, companyId, resource.data);
+        allow list: if isCompanySpaceLead(wid, pid, companyId);
+        allow create: if isSameProjectCompany(wid, pid, companyId)
+          && validCompanyResourceIdentity(companyId, request.resource.data)
+          && request.resource.data.get('planVersionId', '') == versionId
+          && request.resource.data.get('items', []) is list
+          && request.resource.data.get('items', []).size() <= 2000
+          && canUseCompanyPlan(wid, pid, companyId, request.resource.data.get('planId', ''), request.resource.data);
+        allow update: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
+          && request.resource.data.get('scope', '') == resource.data.get('scope', '')
+          && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
+          && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
+          && request.resource.data.get('planId', '') == resource.data.get('planId', '')
+          && request.resource.data.get('planVersionId', '') == resource.data.get('planVersionId', '')
+          && request.resource.data.get('items', []) is list
+          && request.resource.data.get('items', []).size() <= 2000
+          && canUseCompanyPlan(wid, pid, companyId, request.resource.data.get('planId', ''), request.resource.data);
+        allow delete: if false;
+      }
     }
 
     // ---------------------------------------------------------------------

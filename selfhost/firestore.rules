@@ -162,6 +162,19 @@ service cloud.firestore {
       return /databases/$(database)/documents/workspaces/$(wid)/projects/$(pid)/companySpaces/$(companyId)/folders/$(folderId);
     }
 
+    function companyPlanPath(wid, pid, companyId, planId) {
+      return /databases/$(database)/documents/workspaces/$(wid)/projects/$(pid)/companySpaces/$(companyId)/plans/$(planId);
+    }
+
+    function canUseCompanyPlan(wid, pid, companyId, planId, data) {
+      return planId != ''
+        && exists(companyPlanPath(wid, pid, companyId, planId))
+        && hasCompanyResourceAccess(wid, pid, companyId, get(companyPlanPath(wid, pid, companyId, planId)).data)
+        && data.get('folderId', '') == get(companyPlanPath(wid, pid, companyId, planId)).data.get('folderId', '')
+        && data.get('accessMode', '') == get(companyPlanPath(wid, pid, companyId, planId)).data.get('accessMode', '')
+        && data.get('allowedPrincipalIds', []) == get(companyPlanPath(wid, pid, companyId, planId)).data.get('allowedPrincipalIds', []);
+    }
+
     function canUseCompanyFolder(wid, pid, companyId, folderId, data) {
       return (
           folderId == ''
@@ -427,6 +440,27 @@ service cloud.firestore {
           && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
         allow delete: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
           && (resource.data.get('createdBy', '') == principal() || isCompanySpaceLead(wid, pid, companyId));
+      }
+
+      // Sdílené firemní markupy jednoho planVersion. Task piny sem nepatří a
+      // zůstávají v betě zakázané; dokument obsahuje pouze geometrické anotace.
+      match /planAnnotationSets/{versionId} {
+        allow get: if hasCompanyResourceAccess(wid, pid, companyId, resource.data);
+        allow list: if isCompanySpaceLead(wid, pid, companyId);
+        allow create: if isSameProjectCompany(wid, pid, companyId)
+          && validCompanyResourceIdentity(companyId, request.resource.data)
+          && request.resource.data.get('planVersionId', '') == versionId
+          && request.resource.data.get('items', []) is list
+          && canUseCompanyPlan(wid, pid, companyId, request.resource.data.get('planId', ''), request.resource.data);
+        allow update: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
+          && request.resource.data.get('scope', '') == resource.data.get('scope', '')
+          && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
+          && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
+          && request.resource.data.get('planId', '') == resource.data.get('planId', '')
+          && request.resource.data.get('planVersionId', '') == resource.data.get('planVersionId', '')
+          && request.resource.data.get('items', []) is list
+          && canUseCompanyPlan(wid, pid, companyId, request.resource.data.get('planId', ''), request.resource.data);
+        allow delete: if false;
       }
     }
 

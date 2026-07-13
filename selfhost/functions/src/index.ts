@@ -137,6 +137,19 @@ function safeFileName(value: string): string {
   return value.replace(/[\\/\u0000-\u001f\u007f]+/g, "_").slice(0, 180) || "soubor.pdf";
 }
 
+// Firestore/Storage segmenty stavíme z klientských ID — dovol jen bezpečný tvar
+// (UUID/nanoid), ať se do cesty nedostane '/', '..' ani řídicí znak.
+function isSafeId(value: string): boolean {
+  return /^[A-Za-z0-9_-]{1,64}$/.test(value);
+}
+
+// Whitelist content-typů pro upload. Interní soubory jsou PDF, náhledy JPEG;
+// cokoli jiného (např. text/html) by se přes `inline` download mohlo zneužít.
+function safeContentType(kind: "file" | "thumbnail", value: string): string {
+  const allowed = kind === "thumbnail" ? ["image/jpeg"] : ["application/pdf"];
+  return allowed.includes(value) ? value : allowed[0];
+}
+
 async function verifyWorkspaceBearer(req: Request) {
   const authorization = req.headers.authorization ?? "";
   if (!authorization.startsWith("Bearer ")) {
@@ -164,6 +177,12 @@ async function authorizeCompany(
     || companies[principal] !== companyId
   ) {
     throw new Error("Uživatel není členem této firmy na projektu.");
+  }
+
+  // Kill switch: když je beta na projektu explicitně vypnutá, brána odmítne i
+  // přímé volání (feature flag tak není jen UI, ale i bezpečnostní vypínač).
+  if (data?.companySpacesBetaEnabled === false) {
+    throw new Error("Beta firemních prostorů je na tomto projektu vypnutá.");
   }
 
   const role = typeof roles[principal] === "string" ? String(roles[principal]) : "viewer";
@@ -235,10 +254,17 @@ async function handleCompanyUpload(
   const versionId = stringValue(req.body?.versionId);
   const folderId = stringValue(req.body?.folderId);
   const requestedName = safeFileName(stringValue(req.body?.fileName));
-  const contentType = stringValue(req.body?.contentType) || "application/octet-stream";
   const kind = req.body?.kind === "thumbnail" ? "thumbnail" : "file";
+  const contentType = safeContentType(kind, stringValue(req.body?.contentType));
   const size = Number(req.body?.size);
-  if (!documentId || !versionId || !Number.isFinite(size) || size <= 0 || size > MAX_COMPANY_FILE_BYTES) {
+  if (
+    !isSafeId(documentId)
+    || !isSafeId(versionId)
+    || (folderId && !isSafeId(folderId))
+    || !Number.isFinite(size)
+    || size <= 0
+    || size > MAX_COMPANY_FILE_BYTES
+  ) {
     res.status(400).json({ error: "Neplatná metadata souboru nebo překročený limit 200 MB." });
     return;
   }
@@ -268,7 +294,7 @@ async function handleCompanyDownload(
   const documentId = stringValue(req.query.documentId);
   const versionId = stringValue(req.query.versionId);
   const kind = req.query.kind === "thumbnail" ? "thumbnail" : "file";
-  if (!documentId || !versionId) {
+  if (!isSafeId(documentId) || !isSafeId(versionId)) {
     res.status(400).json({ error: "Chybí documentId nebo versionId." });
     return;
   }
@@ -281,6 +307,12 @@ async function handleCompanyDownload(
     res.status(404).json({ error: "Soubor nebyl nalezen." });
     return;
   }
+
+  // ACL zdroj pravdy = složka, ne denormalizované pole na verzi. Klientská
+  // propagace ACL (updateCompanyFolderAccess) není atomická; kdyby doběhla jen
+  // zčásti, verze by mohla nést zastaralé `company_all`. Ověř aktuální ACL
+  // složky, aby odebraný člen nestáhl binárku přes zastaralé pole na verzi.
+  await assertFolderAccess(workspaceId, projectId, companyId, stringValue(data.folderId), access);
 
   const objectPath = stringValue(kind === "thumbnail" ? data.thumbnailObjectPath : data.fileObjectPath);
   const prefix = companySpacePrefix(workspaceId, projectId, companyId);

@@ -444,6 +444,10 @@ service cloud.firestore {
 
       // Sdílené firemní markupy jednoho planVersion. Task piny sem nepatří a
       // zůstávají v betě zakázané; dokument obsahuje pouze geometrické anotace.
+      // Pozn.: rules neumí iterovat prvky listu, takže per-item typ nevaliduje —
+      // task piny jsou v appce samostatné Tasky (ne anotace), FE je do `items`
+      // nikdy nezapisuje a nad firemním plánem je i vytvoření pinu vypnuté.
+      // Zde vynucujeme aspoň strop velikosti pole proti zneužití zápisem.
       match /planAnnotationSets/{versionId} {
         allow get: if hasCompanyResourceAccess(wid, pid, companyId, resource.data);
         allow list: if isCompanySpaceLead(wid, pid, companyId);
@@ -451,6 +455,7 @@ service cloud.firestore {
           && validCompanyResourceIdentity(companyId, request.resource.data)
           && request.resource.data.get('planVersionId', '') == versionId
           && request.resource.data.get('items', []) is list
+          && request.resource.data.get('items', []).size() <= 2000
           && canUseCompanyPlan(wid, pid, companyId, request.resource.data.get('planId', ''), request.resource.data);
         allow update: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
           && request.resource.data.get('scope', '') == resource.data.get('scope', '')
@@ -459,6 +464,7 @@ service cloud.firestore {
           && request.resource.data.get('planId', '') == resource.data.get('planId', '')
           && request.resource.data.get('planVersionId', '') == resource.data.get('planVersionId', '')
           && request.resource.data.get('items', []) is list
+          && request.resource.data.get('items', []).size() <= 2000
           && canUseCompanyPlan(wid, pid, companyId, request.resource.data.get('planId', ''), request.resource.data);
         allow delete: if false;
       }

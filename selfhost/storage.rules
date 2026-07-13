@@ -28,10 +28,32 @@ service firebase.storage {
         && request.auth.token.firebase.sign_in_provider != 'anonymous';
     }
 
-    // Soubory firmy (vč. připojovacího probe `__preflight__`). Max 200 MB / objekt.
-    match /workspaces/{wid}/{rest=**} {
+    // Přímý Firebase download/upload interních firemních objektů je zakázaný.
+    // Autorizaci i resumable upload zajišťuje companion Function `companyFile`.
+    match /workspaces/{wid}/projects/{pid}/companySpaces/{companyId}/{rest=**} {
+      allow read, write: if false;
+    }
+
+    // Projektové soubory firmy. Kategorie `companySpaces` je vyňatá, aby širší
+    // pravidlo nemohlo přebít bezpečnou Function bránu výše (allow se mezi
+    // souběžnými match bloky skládá pomocí OR).
+    match /workspaces/{wid}/projects/{pid}/{category}/{rest=**} {
+      allow write: if category != 'companySpaces'
+        && isRealUser()
+        && (request.resource == null || request.resource.size < 200 * 1024 * 1024);
+      allow read: if category != 'companySpaces' && isRealUser();
+    }
+
+    // Připojovací probe a případné neprojektové objekty workspace.
+    match /workspaces/{wid}/{objectName} {
       allow read: if isRealUser();
       allow write: if isRealUser()
+        && (request.resource == null || request.resource.size < 200 * 1024 * 1024);
+    }
+    match /workspaces/{wid}/{category}/{rest=**} {
+      allow read: if category != 'projects' && isRealUser();
+      allow write: if category != 'projects'
+        && isRealUser()
         && (request.resource == null || request.resource.size < 200 * 1024 * 1024);
     }
 

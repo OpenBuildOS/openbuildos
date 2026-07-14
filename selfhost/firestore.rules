@@ -120,7 +120,7 @@ service cloud.firestore {
     // Company / role model (per-project company assignment)
     //
     // A project doc may carry a `companies` map { [principal]: companyId }.
-    // The `company_editor` role lets a member edit content authored by other
+    // The `company_lead` role lets a member edit content authored by other
     // members of the SAME company on that project (in addition to their own).
     // ---------------------------------------------------------------------
 
@@ -137,7 +137,7 @@ service cloud.firestore {
 
     function isCompanySpaceLead(wid, pid, companyId) {
       return isSameProjectCompany(wid, pid, companyId)
-        && projectRole(pid) in ['company_editor', 'editor', 'admin'];
+        && projectRole(pid) in ['company_lead', 'editor', 'admin'];
     }
 
     function hasCompanyResourceAccess(wid, pid, companyId, data) {
@@ -217,7 +217,7 @@ service cloud.firestore {
       return isProjectMember(wid, pid) && (
         projectRole(pid) in ['editor', 'admin'] || isWsAdmin(wid)
         || authoredBySelf()
-        || (projectRole(pid) == 'company_editor'
+        || (projectRole(pid) == 'company_lead'
             && memberCompany(pid, principal()) != ''
             && memberCompany(pid, resource.data.get('createdBy', '')) == memberCompany(pid, principal()))
       );
@@ -305,7 +305,19 @@ service cloud.firestore {
         && get(invitePath(wid, inviteId)).data.usedBy == null
         && request.time < get(invitePath(wid, inviteId)).data.expiresAt
         && role == get(invitePath(wid, inviteId)).data.role
+        // Only APPROVED invites are redeemable. Missing field == approved
+        // (backward compat with pre-#367 invites).
+        && get(invitePath(wid, inviteId)).data.get('approvalStatus', 'approved') == 'approved'
         && getAfter(invitePath(wid, inviteId)).data.usedBy == principal();
+    }
+
+    // A company lead on the project (company_lead/editor, NOT an admin) may
+    // PROPOSE an invite; it stays pending_approval until a project admin/ws admin
+    // approves it (issue #367). Direct admins/ws admins bypass approval.
+    function canProposeInvite(wid, pid) {
+      return isRealUser()
+        && projectInWorkspace(wid, pid)
+        && projectRole(pid) in ['company_lead', 'editor'];
     }
 
     match /workspaces/{wid}/invites/{inviteId} {
@@ -313,20 +325,31 @@ service cloud.firestore {
       allow get: if isRealUser();
       allow list: if isWsAdmin(wid);
       allow create: if isRealUser()
-        && canManageProject(wid, request.resource.data.projectId)
         && request.resource.data.role in ['viewer', 'editor']
         && request.resource.data.usedBy == null
         && request.resource.data.expiresAt is timestamp
-        && request.resource.data.createdBy == principal();
+        && request.resource.data.createdBy == principal()
+        && (
+            // Direct: project admin / workspace admin issues a live invite.
+            (canManageProject(wid, request.resource.data.projectId)
+              && request.resource.data.get('approvalStatus', 'approved') == 'approved')
+            // Manager/company lead proposes an invite needing admin approval.
+            || (canProposeInvite(wid, request.resource.data.projectId)
+              && request.resource.data.approvalStatus == 'pending_approval')
+        );
       allow update: if (
-          // Redeem: only claiming an unused, unexpired invite for yourself.
+          // Redeem: only claiming an unused, unexpired, APPROVED invite for yourself.
           isRealUser()
           && resource.data.usedBy == null
+          && resource.data.get('approvalStatus', 'approved') == 'approved'
           && request.time < resource.data.expiresAt
           && request.resource.data.diff(resource.data).affectedKeys()
               .hasOnly(['usedBy', 'usedAt'])
           && request.resource.data.usedBy == principal()
-        ) || canManageProject(wid, resource.data.projectId);
+        )
+        // Approve/reject + revoke: project admin / ws admin may edit the invite
+        // (this also covers flipping approvalStatus pending_approval -> approved).
+        || canManageProject(wid, resource.data.projectId);
       allow delete: if canManageProject(wid, resource.data.projectId);
     }
 
@@ -498,11 +521,55 @@ service cloud.firestore {
     // members/notificationQueue/invites can never be reached through these).
     // ---------------------------------------------------------------------
 
+    // Task status-transition guard (issue #367, docs/TASK_WORKFLOW_USER_STORIES).
+    // 'completed' = Koordinátor+ nebo autor (OQ-4); 'verified' = Schvalovatel
+    // (admin/firma nebo flag canApprove, OQ-5); vrátit verified = Koordinátor+
+    // (OQ-6a). Enforcuje se JEN na změně statusu; nezměněný status projde komukoli,
+    // kdo smí obsah upravit (editace jiných polí u hotového úkolu se nerozbije).
+    function canCompleteTask(wid, pid) {
+      return projectRole(pid) in ['company_lead', 'editor', 'admin'] || isWsAdmin(wid);
+    }
+    // Autor úkolu (createdBy == principal). Funguje pro create i update — createdBy
+    // je u update immutable, takže request.resource nese autora v obou případech.
+    function taskAuthoredBySelf() {
+      return request.resource.data.get('createdBy', '') == principal();
+    }
+    // Kdo smí dostat úkol DO „hotovo" stavu (issue #367, viz TASK_WORKFLOW_USER_STORIES):
+    //  - 'verified'  = Schvalovatel (Správce projektu/firmy NEBO flag canApprove) — OQ-5
+    //  - 'completed' = Koordinátor+ NEBO autor vlastního úkolu — OQ-4
+    function canReachDoneStatus(wid, pid, status) {
+      return status == 'verified' ? isApprover(wid, pid)
+        : status == 'completed' ? (canCompleteTask(wid, pid) || taskAuthoredBySelf())
+        : true;
+    }
+    // Návrat ZPĚT z „hotovo" stavu (reopen). Dopředný postup completed→verified NENÍ
+    // reopen (řeší ho jen canReachDoneStatus = isApprover), proto se sem nepočítá.
+    //  - z 'verified'  = Koordinátor+ (vrací nalezenou vadu; nemusí být admin) — OQ-6a
+    //  - z 'completed' do práce = Koordinátor+ NEBO autor — OQ-6c
+    function reopenOk(wid, pid, oldStatus, newStatus) {
+      return oldStatus == 'verified' ? canCompleteTask(wid, pid)
+        : (oldStatus == 'completed' && newStatus != 'verified')
+            ? (canCompleteTask(wid, pid) || taskAuthoredBySelf())
+        : true;
+    }
+    // Přechod je OK, když se status NEMĚNÍ, nebo když volající smí CÍLOVÝ dosáhnout
+    // A (jde-li o návrat z hotovo) smí i reopen. verified nastaví Schvalovatel,
+    // vrací Koordinátor+.
+    function taskStatusTransitionOk(wid, pid) {
+      return request.resource.data.get('status', '') == resource.data.get('status', '')
+        || (canReachDoneStatus(wid, pid, request.resource.data.get('status', ''))
+            && reopenOk(wid, pid, resource.data.get('status', ''), request.resource.data.get('status', '')));
+    }
+
     match /workspaces/{wid}/projects/{pid}/tasks/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create: if canCreateContent(wid, pid);
+      // Nový úkol nesmí rovnou vzniknout jako completed/verified bez příslušné role
+      // (jinak by šel guard na update obejít vytvořením už-hotového úkolu).
+      allow create: if canCreateContent(wid, pid)
+        && canReachDoneStatus(wid, pid, request.resource.data.get('status', ''));
       allow update: if canModifyContent(wid, pid)
-        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
+        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')  // author immutable
+        && taskStatusTransitionOk(wid, pid);
       allow delete: if canModifyContent(wid, pid);
     }
 

@@ -33,6 +33,8 @@ const ALLOWED_ORIGINS = new Set<string>([
   "https://openbuildos.web.app",
   "https://openbuildos-app.web.app",
   "https://openbuildos.org",
+  "https://www.openbuildos.org",
+  "https://app.openbuildos.org",
   "http://localhost:5173",
 ]);
 

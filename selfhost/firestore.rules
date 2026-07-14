@@ -348,10 +348,10 @@ service cloud.firestore {
               request.resource.data.role)
         ) || (
           canManageProjectAfter(wid, pid)
-          && request.resource.data.role in ['viewer', 'editor', 'admin']
+          && request.resource.data.role in ['viewer', 'editor', 'admin', 'company_editor']
         );
       allow update: if canManageProjectAfter(wid, pid)
-        && request.resource.data.role in ['viewer', 'editor', 'admin'];
+        && request.resource.data.role in ['viewer', 'editor', 'admin', 'company_editor'];
       allow delete: if canManageProject(wid, pid);
     }
 

@@ -25,6 +25,9 @@ následující (stačí jednou):
    zapínat nemusíte — stačí Authentication aktivovat.
 4. **Upgrade na plán Blaze** (*Pay as you go*). Bez něj nelze nasadit
    funkce. Pro malý provoz zůstáváte v rámci bezplatných limitů.
+5. **Storage** → *Get started* → vyberte lokaci **`eur3`** (Evropa). Bez něj
+   nebudou fungovat dokumenty a výkresy (jejich soubory se ukládají sem).
+   Lokaci **nejde** později změnit.
 
 ---
 
@@ -61,7 +64,25 @@ Skript je možné spustit i opakovaně — když něco selže, jen ho pusťte zn
 
 ---
 
-## Krok 3 — Propojte backend s aplikací OpenBuildOS
+## Krok 3 — Úložiště pro dokumenty a výkresy
+
+Tenhle druhý skript nasadí pravidla úložiště a povolí aplikaci nahrávat a
+stahovat soubory (CORS). `PROJECT_ID` opět nahraďte svým ID:
+
+```bash
+cd ~/ob/selfhost && node scripts/openbuildos-storage-setup.mjs --project PROJECT_ID
+```
+
+Předpoklad: **Storage** máte zapnuté (krok 1, bod 5). Kdyby skript hlásil, že
+bucket neexistuje, zapněte Storage ve Firebase konzoli a spusťte ho znovu.
+
+> Vlastní doménu appky (self-host) přidáte navíc přes `--origin`, např.
+> `--origin https://app.mojefirma.cz`. Oficiální domény OpenBuildOS jsou
+> povolené automaticky.
+
+---
+
+## Krok 4 — Propojte backend s aplikací OpenBuildOS
 
 Až instalace doběhne, vypíše na konec **URL ověřovací funkce**. Vypadá zhruba
 takto:

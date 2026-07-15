@@ -33,7 +33,11 @@ import { fileURLToPath } from "node:url";
 const OK = "✓";
 const FAIL = "✗";
 const WARN = "⚠";
-const DEFAULT_ORIGIN = "https://openbuildos-app.web.app";
+// Origins povolené v CORS. Hostovaný OpenBuildOS běží na obou doménách zároveň
+// (výchozí Hosting doména + kanonická custom doména), proto MUSÍ být obě —
+// jinak přechod na app.openbuildos.org tiše rozbije Storage (fetch PDF spadne
+// na CORS). Self-host firma přidá svou doménu přes opakovatelný `--origin`.
+const DEFAULT_ORIGINS = ["https://openbuildos-app.web.app", "https://app.openbuildos.org"];
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const step = (m) => console.log(`\n» ${m}`);
@@ -73,24 +77,32 @@ function run(cmd, args, opts = {}) {
 function parseArgs() {
   const args = process.argv.slice(2);
   let project = "";
-  let origin = DEFAULT_ORIGIN;
+  const extraOrigins = [];
   for (let i = 0; i < args.length; i += 1) {
     if (args[i] === "--project") project = args[i + 1] ?? "";
-    if (args[i] === "--origin") origin = args[i + 1] ?? origin;
+    // `--origin` lze zopakovat i zadat čárkou oddělený seznam; přidává se
+    // k výchozím doménám (nenahrazuje je).
+    if (args[i] === "--origin" && args[i + 1]) {
+      for (const value of args[i + 1].split(",")) {
+        const trimmed = value.trim();
+        if (trimmed) extraOrigins.push(trimmed);
+      }
+    }
   }
-  return { project, origin };
+  const origins = [...new Set([...DEFAULT_ORIGINS, ...extraOrigins])];
+  return { project, origins };
 }
 
 const bucketUrl = (project) => `gs://${project}.firebasestorage.app`;
 
-function setCors(gsutil, project, origin) {
+function setCors(gsutil, project, origins) {
   const file = join(mkdtempSync(join(tmpdir(), "obos-cors-")), "cors.json");
   writeFileSync(
     file,
     JSON.stringify(
       [
         {
-          origin: [origin],
+          origin: origins,
           method: ["GET", "POST", "PUT", "DELETE", "HEAD"],
           responseHeader: ["Content-Type", "Authorization", "Content-Range", "Range", "x-goog-resumable"],
           maxAgeSeconds: 3600,
@@ -109,7 +121,7 @@ function runDriveSetup() {
 }
 
 async function main() {
-  const { project, origin } = parseArgs();
+  const { project, origins } = parseArgs();
   console.log("OpenBuildOS — nastavení úložiště firmy (FÁZE B)\n");
   if (!project) {
     fail("Chybí --project <firma-project-id>.");
@@ -148,13 +160,13 @@ async function main() {
   ok("storage.rules nasazeny (vč. povolení připojovacího probe)");
 
   step("Krok 4/4 — CORS (povolit nahrávání/stahování z appky)");
-  const cors = setCors(gsutil, project, origin);
+  const cors = setCors(gsutil, project, origins);
   if (!cors.ok) {
     fail("Nastavení CORS selhalo:");
     console.log("  " + cors.stdout.trim().split("\n").slice(0, 4).join("\n  "));
     process.exit(4);
   }
-  ok(`CORS nastaveno pro ${origin}`);
+  ok(`CORS nastaveno pro ${origins.join(", ")}`);
   const verify = run(gsutil, ["cors", "get", bucketUrl(project)]);
   if (verify.ok) console.log("  " + verify.stdout.trim());
 

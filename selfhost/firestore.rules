@@ -696,6 +696,24 @@ service cloud.firestore {
     }
 
     // ---------------------------------------------------------------------
+    // Document status pointer (#371 — verifikace revize přes QR)
+    //
+    // Public pointer to a document's CURRENT version so the anonymous
+    // verification page (/share/:wid/:token) can tell whether the scanned
+    // revision is current or superseded. Carries ONLY harmless data
+    // (currentVersionId + label) -- never titles, URLs or member info.
+    // Written best-effort by upload (editors) and approval (approvers may
+    // lack edit rights, hence the isApprover branch).
+    // ---------------------------------------------------------------------
+
+    match /workspaces/{wid}/projects/{pid}/documentStatus/{documentId} {
+      allow get: if true;
+      allow list: if isProjectMember(wid, pid);
+      allow create, update: if canEditContent(wid, pid) || isApprover(wid, pid);
+      allow delete: if canEditContent(wid, pid);
+    }
+
+    // ---------------------------------------------------------------------
     // Top-level projects (source of truth for membership)
     // ---------------------------------------------------------------------
 

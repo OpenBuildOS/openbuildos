@@ -706,10 +706,18 @@ service cloud.firestore {
     // lack edit rights, hence the isApprover branch).
     // ---------------------------------------------------------------------
 
+    function validDocumentStatus(data) {
+      // Veřejně čitelný doc — schema guard: JEN neškodná pole, žádné volné klíče.
+      return data.keys().hasOnly(['currentVersionId', 'currentVersionLabel', 'updatedAt'])
+        && data.currentVersionId is string && data.currentVersionId.size() > 0
+        && data.currentVersionLabel is string;
+    }
+
     match /workspaces/{wid}/projects/{pid}/documentStatus/{documentId} {
       allow get: if true;
       allow list: if isProjectMember(wid, pid);
-      allow create, update: if canEditContent(wid, pid) || isApprover(wid, pid);
+      allow create, update: if (canEditContent(wid, pid) || isApprover(wid, pid))
+        && validDocumentStatus(request.resource.data);
       allow delete: if canEditContent(wid, pid);
     }
 

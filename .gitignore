@@ -3,6 +3,8 @@ node_modules/
 
 # Build output
 functions/lib/
+selfhost/functions/lib/
+selfhost/functions/lib-test/
 
 # Env files
 .env

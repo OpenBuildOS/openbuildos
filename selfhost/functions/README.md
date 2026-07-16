@@ -63,3 +63,51 @@ nová verze.
 | `CENTRAL_PROJECT_ID`  | `openbuildos` | Projekt, jehož tokenům funkce důvěřuje.     |
 
 Region funkce je `europe-west1`.
+
+---
+
+## `pulseReport` — denní agregovaný reporter (OpenBuildOS Pulse, opt-in)
+
+Volitelná scheduled funkce, která **jednou denně** spočítá jen **agregované
+počty** z firemního backendu a pošle je **podepsané** centrálnímu endpointu
+OpenBuildOS. Slouží k inventárním KPI („kolik projektů/úkolů/souborů celkem"),
+které klientská analytika neumí. **Neodesílá** názvy, e-maily, obsah ani
+identifikaci uživatelů — jen čísla.
+
+### Vlastnosti
+- **Opt-in:** bez `PULSE_REPORT_ENABLED=true` je to no-op.
+- **Podepsané:** HMAC-SHA256 instalačním tajemstvím (`PULSE_INSTALL_SECRET`).
+- **Fail-open:** jakákoliv chyba se zaloguje a spolkne, backend není dotčen.
+- **Idempotentní:** report má klíč `{workspaceId}_{YYYY-MM-DD}`, opakování téhož
+  dne přepíše stejný snapshot (žádné duplikáty).
+
+### Konfigurace (Cloud Functions env / Secret Manager)
+
+| Proměnná | Povinná | Význam |
+| --- | --- | --- |
+| `PULSE_REPORT_ENABLED` | ano | `true` zapne odesílání; cokoliv jiného = vypnuto |
+| `PULSE_INGEST_URL` | ano | URL centrálního `pulseIngest` endpointu |
+| `PULSE_INSTALL_SECRET` | ano | **Secret Manager!** Stejné tajemství drží centrální registr |
+| `PULSE_WORKSPACE_ID` | ne | stabilní pseudonym; default = id firemního projektu |
+| `PULSE_KIT_VERSION` | ne | verze self-host kitu do reportu |
+
+> `PULSE_INSTALL_SECRET` **nikdy** necommituj a nedávej do `VITE_*`. Ulož do
+> Secret Manageru a naváž na funkci (`--set-secrets`), viz deploy guide.
+
+### Nasazení
+
+```bash
+cd selfhost/functions
+npm install
+firebase deploy --only functions:pulseReport --project <id-firemního-projektu>
+```
+
+`onSchedule` si automaticky vytvoří Cloud Scheduler job (vyžaduje Blaze).
+Kompletní postup včetně provisioningu tajemství a centrálního registru je v
+hlavním repu: `docs/OPENBUILDOS_PULSE_BACKEND.md`.
+
+### Test
+
+```bash
+cd selfhost/functions && npm test
+```

@@ -32,13 +32,24 @@ import {
  *     jinak by správce (nebo únos jeho session) rozeslal phishing podepsaný
  *     DKIM firmy.
  *
- * Nasazení vyžaduje Blaze + secret RESEND_API_KEY a odesílatele INVITE_MAIL_FROM.
- * Když mail není nakonfigurovaný, funkce vrací `failed-precondition` a FE spadne
- * zpět na dnešní „zkopírovat odkaz".
+ * Nasazení vyžaduje Blaze + nakonfigurovaný mail provider. DEFAULT je SMTP přes
+ * firemní schránku (SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS), alternativa Resend
+ * (RESEND_API_KEY); v obou případech odesílatel INVITE_MAIL_FROM. Když mail není
+ * nakonfigurovaný, funkce vrací `failed-precondition` a FE spadne zpět na dnešní
+ * „zkopírovat odkaz".
  */
 
-const RESEND_API_KEY = defineSecret("RESEND_API_KEY");
+// Mail secrety. Deklarujeme JEN ty pro default (SMTP) cestu — každý secret v
+// `secrets: []` níže musí při deployi existovat v Secret Manageru, jinak deploy
+// prompt­uje/selže. Kdybychom deklarovali i RESEND_API_KEY, byla by SMTP firma
+// nucená nastavit i nepoužitý Resend klíč.
+// Pro Resend variantu: přidej `const RESEND_API_KEY = defineSecret("RESEND_API_KEY");`
+// a dej ho do `secrets: []` níže (mailProvider ho už čte z process.env).
 const INVITE_MAIL_FROM = defineSecret("INVITE_MAIL_FROM");
+const SMTP_HOST = defineSecret("SMTP_HOST");
+const SMTP_PORT = defineSecret("SMTP_PORT");
+const SMTP_USER = defineSecret("SMTP_USER");
+const SMTP_PASS = defineSecret("SMTP_PASS");
 
 /**
  * Povolené originy zvacího odkazu. Zrcadlí ALLOWED_ORIGINS v index.ts (authExchange).
@@ -257,7 +268,10 @@ export const sendProjectInvite = onCall<
   { projectId?: unknown; email?: unknown; token?: unknown; inviteUrl?: unknown },
   Promise<{ ok: true; provider: string }>
 >(
-  { region: "europe-west1", secrets: [RESEND_API_KEY, INVITE_MAIL_FROM] },
+  {
+    region: "europe-west1",
+    secrets: [INVITE_MAIL_FROM, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS],
+  },
   async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Přihlas se do firemního backendu.");

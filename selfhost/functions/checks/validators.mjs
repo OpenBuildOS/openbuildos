@@ -1,4 +1,5 @@
 import { validateInviteUrl, normalizeEmail } from "../lib/sendProjectInvite.js";
+import { resolveMailProvider, MailNotConfiguredError } from "../lib/mailProvider.js";
 
 const TOKEN = "abc-123-token";
 let pass = 0, fail = 0;
@@ -10,6 +11,16 @@ function expectOk(label, fn) {
 function expectReject(label, fn) {
   try { fn(); console.log(`  FAIL ${label} → PROŠLO, mělo být odmítnuto!`); fail++; }
   catch { console.log(`  ok   ${label} (odmítnuto)`); pass++; }
+}
+function expectEq(label, actual, expected) {
+  if (actual === expected) { console.log(`  ok   ${label}`); pass++; }
+  else { console.log(`  FAIL ${label} → čekal '${expected}', dostal '${actual}'`); fail++; }
+}
+
+// Izolace mezi případy — mail config žije v process.env.
+const MAIL_KEYS = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "RESEND_API_KEY", "INVITE_MAIL_FROM"];
+function clearMailEnv() {
+  for (const k of MAIL_KEYS) delete process.env[k];
 }
 
 console.log("\n== inviteUrl: legitimní odkazy ==");
@@ -53,6 +64,39 @@ expectReject("CRLF injektáž hlaviček", () =>
   normalizeEmail("a@b.cz\r\nBcc: victim@x.cz"));
 expectReject("bez zavináče", () => normalizeEmail("neplatny"));
 expectReject("bez domény", () => normalizeEmail("a@b"));
+
+console.log("\n== výběr mail providera ==");
+clearMailEnv();
+expectReject("bez konfigurace → MailNotConfiguredError", () => resolveMailProvider());
+
+clearMailEnv();
+process.env.SMTP_HOST = "smtp.gmail.com";
+process.env.SMTP_USER = "pozvanky@firma.cz";
+process.env.SMTP_PASS = "app-pass";
+expectEq("SMTP nakonfigurováno → provider 'smtp'", resolveMailProvider().name, "smtp");
+
+clearMailEnv();
+process.env.SMTP_HOST = "smtp.gmail.com"; // bez USER/PASS
+expectReject("SMTP_HOST bez USER/PASS → chyba", () => resolveMailProvider());
+
+clearMailEnv();
+process.env.SMTP_HOST = "smtp.gmail.com";
+process.env.SMTP_USER = "u@firma.cz";
+process.env.SMTP_PASS = "p";
+process.env.SMTP_PORT = "nesmysl";
+expectReject("nečíselný SMTP_PORT → chyba", () => resolveMailProvider());
+
+clearMailEnv();
+process.env.RESEND_API_KEY = "re_123";
+expectEq("jen Resend klíč → provider 'resend'", resolveMailProvider().name, "resend");
+
+clearMailEnv();
+process.env.SMTP_HOST = "smtp.gmail.com";
+process.env.SMTP_USER = "u@firma.cz";
+process.env.SMTP_PASS = "p";
+process.env.RESEND_API_KEY = "re_123";
+expectEq("SMTP má přednost před Resendem", resolveMailProvider().name, "smtp");
+clearMailEnv();
 
 console.log(`\n=== ${pass} prošlo, ${fail} selhalo ===`);
 process.exit(fail ? 1 : 0);

@@ -2,7 +2,9 @@
 node_modules/
 
 # Build output
-functions/lib/
+# `**/` je nutné — funkce žijí v `selfhost/functions/`, samotné `functions/lib/`
+# je kotvené na kořen repa a build output tím pádem neignorovalo.
+**/functions/lib/
 
 # Env files
 .env

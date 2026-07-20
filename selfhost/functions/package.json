@@ -9,6 +9,7 @@
   "main": "lib/index.js",
   "scripts": {
     "build": "tsc",
+    "check": "npm run build && node checks/validators.mjs",
     "deploy": "firebase deploy --only functions"
   },
   "dependencies": {

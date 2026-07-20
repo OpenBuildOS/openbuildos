@@ -6,6 +6,9 @@ import { onRequest, type Request } from "firebase-functions/v2/https";
 import * as logger from "firebase-functions/logger";
 import type { Response } from "express";
 
+// Odesílání pozvánek e-mailem (samostatný modul, viz sendProjectInvite.ts).
+export { sendProjectInvite } from "./sendProjectInvite";
+
 /**
  * Token-exchange Cloud Function `authExchange` pro OpenBuildOS federaci.
  *

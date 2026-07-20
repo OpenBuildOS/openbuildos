@@ -594,6 +594,24 @@ service cloud.firestore {
             : true);
     }
 
+    function taskPath(wid, pid, taskId) {
+      return /databases/$(database)/documents/workspaces/$(wid)/projects/$(pid)/tasks/$(taskId);
+    }
+
+    // Fotky/piny mohou referencovat úkol (taskId / context.taskId). Pokud ten
+    // úkol je interní (scope=company_internal), nesmí referenci prozradit
+    // (existenci + evidence photo URL) nikomu mimo vlastnící firmu — jinak by
+    // photos/photoPins gate obcházel tasks gate výše. Bez taskId, s taskId na
+    // neexistující/smazaný dokument, nebo na projektový (ne-interní) úkol se
+    // chování nemění (čte kterýkoli člen projektu). exists()/get() na stejnou
+    // cestu se v rámci jednoho requestu cachují (max +1 čtení navíc).
+    function taskLinkReadOk(wid, pid, taskId) {
+      return taskId == ''
+        || !exists(taskPath(wid, pid, taskId))
+        || !taskIsInternal(get(taskPath(wid, pid, taskId)).data)
+        || taskCompanyMember(pid, get(taskPath(wid, pid, taskId)).data);
+    }
+
     match /workspaces/{wid}/projects/{pid}/tasks/{docId} {
       // Interní úkol (scope=company_internal) čte jen člen vlastnící firmy;
       // projektový úkol kterýkoli člen projektu.
@@ -633,7 +651,11 @@ service cloud.firestore {
     }
 
     match /workspaces/{wid}/projects/{pid}/photos/{docId} {
-      allow read: if isProjectMember(wid, pid);
+      // #358 leak fix: fotka navázaná na interní úkol (Photo.taskId) je čitelná
+      // jen členům firmy vlastnící ten úkol — jinak by prozradila jeho existenci
+      // a evidence URL mimo tasks gate výše.
+      allow read: if isProjectMember(wid, pid)
+        && taskLinkReadOk(wid, pid, resource.data.get('taskId', ''));
       allow create: if canCreateContent(wid, pid);
       allow update: if canModifyContent(wid, pid)
         && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
@@ -643,7 +665,10 @@ service cloud.firestore {
     // Připnutí fotky do kontextu (task/plán) + anotace té varianty. Fotka samotná
     // zůstává jeden záznam v /photos; pin ji jen referencuje (photoId).
     match /workspaces/{wid}/projects/{pid}/photoPins/{docId} {
-      allow read: if isProjectMember(wid, pid);
+      // #358 leak fix: stejná gate jako u /photos, jen taskId čteme z
+      // PhotoPin.context.taskId (vnořené pole).
+      allow read: if isProjectMember(wid, pid)
+        && taskLinkReadOk(wid, pid, resource.data.get('context', {}).get('taskId', ''));
       allow create: if canCreateContent(wid, pid);
       allow update: if canModifyContent(wid, pid)
         && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
@@ -862,10 +887,26 @@ service cloud.firestore {
     match /pendingInvites/{token} {
       allow get, list: if isRealUser()
         && resource.data.get('inviteeEmail', '') == request.auth.token.get('email', '');
+      // POZOR (bezpečnost): tento create dovoluje LIBOVOLNÉMU reálnému uživateli
+      // vytvořit pozvánku s libovolným authExchangeUrl/apiKey mířícím na cizí
+      // backend. hasOnly níže zamezuje injektáži cizích polí a inviterEmail se
+      // váže na skutečného odesílatele (nelze se vydávat za kolegu podle e-mailu),
+      // ale JÁDRO rizika (klient si sám píše authExchangeUrl) tím vyřešené NENÍ —
+      // ten musí ošetřit konzument tokenu na FE (re-derivace z config/public +
+      // potvrzení cíle uživatelem), případně přesun zápisu do Cloud Function.
       allow create: if isRealUser()
+        && request.resource.data.diff({}).affectedKeys().hasOnly([
+             'workspaceId', 'workspaceName', 'apiKey', 'authExchangeUrl',
+             'projectId', 'projectName', 'role', 'inviteeEmail',
+             'inviterName', 'inviterEmail', 'status', 'createdAt', 'expiresAt'
+           ])
         && request.resource.data.get('status', '') == 'pending'
         && request.resource.data.get('inviteeEmail', '') is string
         && request.resource.data.get('inviteeEmail', '') != ''
+        // inviterEmail smí být buď prázdný/null (admin bez e-mailu), nebo se MUSÍ
+        // shodovat s e-mailem odesílatele — nelze se vydávat za konkrétního kolegu.
+        && (request.resource.data.get('inviterEmail', null) == null
+            || request.resource.data.get('inviterEmail', '') == request.auth.token.get('email', ''))
         && request.resource.data.get('role', '') in ['viewer', 'editor'];
       // Adresát smí jen překlopit status (přijmout/odmítnout), nic jiného.
       allow update: if isRealUser()

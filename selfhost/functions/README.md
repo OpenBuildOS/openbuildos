@@ -1,4 +1,4 @@
-# OpenBuildOS — `authExchange` (token-exchange federace)
+# OpenBuildOS — Cloud Functions (`authExchange`, revokace share linků)
 
 Tato Cloud Function zajišťuje **jedno přihlášení napříč samostatnými firemními
 Firebase backendy** bez OIDC, Zitadelu nebo Identity Platform.
@@ -54,7 +54,14 @@ endpoint)"** při připojování workspace (modal *Připojit workspace*).
 
 Funkce je **součástí open-source repozitáře** OpenBuildOS. Při aktualizaci stačí
 znovu spustit `firebase deploy --only functions --project <firma>` — nasadí se
-nová verze.
+nové verze funkcí.
+
+## Funkce v balíčku
+
+- `authExchange` — federace centrální session do firemního backendu.
+- `revokeShareLinkAndRotateToken` — callable funkce pro skutečnou revokaci
+  veřejného share linku: označí Firestore záznam jako `revoked` a zároveň
+  zrotuje Firebase Storage download token souboru.
 
 ## Konfigurace
 

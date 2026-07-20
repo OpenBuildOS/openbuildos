@@ -9,7 +9,8 @@ federačního backendu OpenBuildOS. Nahrazuje ruční postup z
 Do firemního Firebase projektu (na plánu Blaze) nasadí:
 
 1. **Firestore pravidla** (`firestore.rules`) — s retry/backoffem.
-2. **Token-exchange funkci `authExchange`** (`functions/`) — `--force` deploy
+2. **Cloud Functions** (`functions/`) — `authExchange` a `revokeShareLinkAndRotateToken`,
+   nasazené jedním `--force` deployem
    (1. pokus čerstvého Blaze projektu typicky selže na *build service account*,
    retry to vyřeší; `--force` zároveň nastaví **artifact cleanup policy**).
 
@@ -22,6 +23,11 @@ A nastaví **dvě IAM role**, bez kterých federace nefunguje:
 
 Nakonec vypíše **funkce URL** (`https://authexchange-…-ew.a.run.app`) a návod,
 kam ji v appce vložit.
+
+> Pozn.: FE revokace veřejných share linků preferuje callable funkci
+> `revokeShareLinkAndRotateToken`. Pokud firma ještě nemá novou verzi functions
+> nasazenou, aplikace spadne zpět na Firestore-only revokaci bez rotace Storage
+> download tokenu.
 
 Skript je **idempotentní** — lze ho spustit opakovaně.
 

@@ -1,8 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { initializeApp, getApps, getApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { getFirestore } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
-import { onRequest, type Request } from "firebase-functions/v2/https";
+import { HttpsError, onCall, onRequest, type Request } from "firebase-functions/v2/https";
 import * as logger from "firebase-functions/logger";
 import type { Response } from "express";
 
@@ -394,4 +395,126 @@ export const companyFile = onRequest({ region: "europe-west1", timeoutSeconds: 3
     logger.warn("companyFile zamítl request", error);
     res.status(403).json({ error: "K firemnímu souboru nemáte přístup." });
   }
+});
+
+function principalFromAuth(auth: { uid: string; token: Record<string, unknown> }): string {
+  const firebase = auth.token.firebase as { identities?: Record<string, unknown> } | undefined;
+  const identities = firebase?.identities?.["oidc.openbuildos"];
+  if (Array.isArray(identities) && typeof identities[0] === "string" && identities[0]) {
+    return identities[0];
+  }
+  return auth.uid;
+}
+
+async function canEditProjectContent(workspaceId: string, projectId: string, principal: string): Promise<boolean> {
+  const db = getFirestore(getLocalApp());
+  const [workspaceSnap, projectSnap] = await Promise.all([
+    db.doc(`workspaces/${workspaceId}`).get(),
+    db.doc(`projects/${projectId}`).get(),
+  ]);
+
+  if (!workspaceSnap.exists || !projectSnap.exists) {
+    return false;
+  }
+
+  const workspace = workspaceSnap.data() as {
+    ownerId?: string;
+    adminIds?: string[];
+  };
+  const project = projectSnap.data() as {
+    workspaceId?: string;
+    roles?: Record<string, string>;
+  };
+
+  if (project.workspaceId !== workspaceId) {
+    return false;
+  }
+
+  if (workspace.ownerId === principal || workspace.adminIds?.includes(principal)) {
+    return true;
+  }
+
+  const role = project.roles?.[principal] ?? "";
+  return role === "editor" || role === "admin";
+}
+
+function parseStorageObjectFromDownloadUrl(fileUrl: string): { bucket: string; objectPath: string } {
+  const url = new URL(fileUrl);
+  const firebaseApiMatch = url.pathname.match(/^\/v0\/b\/([^/]+)\/o\/(.+)$/);
+  if (firebaseApiMatch) {
+    return {
+      bucket: decodeURIComponent(firebaseApiMatch[1]),
+      objectPath: decodeURIComponent(firebaseApiMatch[2]),
+    };
+  }
+
+  const directMatch = url.pathname.match(/^\/([^/]+)\/(.+)$/);
+  if (url.hostname === "storage.googleapis.com" && directMatch) {
+    return {
+      bucket: decodeURIComponent(directMatch[1]),
+      objectPath: decodeURIComponent(directMatch[2]),
+    };
+  }
+
+  throw new HttpsError(
+    "failed-precondition",
+    "Sdílený soubor nemá podporovaný Firebase Storage download URL."
+  );
+}
+
+async function rotateDownloadToken(fileUrl: string): Promise<void> {
+  const { bucket, objectPath } = parseStorageObjectFromDownloadUrl(fileUrl);
+  const file = getStorage(getLocalApp()).bucket(bucket).file(objectPath);
+  const [metadata] = await file.getMetadata();
+  await file.setMetadata({
+    metadata: {
+      ...(metadata.metadata ?? {}),
+      firebaseStorageDownloadTokens: randomUUID(),
+    },
+  });
+}
+
+export const revokeShareLinkAndRotateToken = onCall<
+  { wid?: string; pid?: string; token?: string }
+>({ region: "europe-west1" }, async (request) => {
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "Chybí přihlášení do workspace.");
+  }
+
+  const workspaceId = typeof request.data?.wid === "string" ? request.data.wid : "";
+  const projectId = typeof request.data?.pid === "string" ? request.data.pid : "";
+  const token = typeof request.data?.token === "string" ? request.data.token : "";
+  if (!workspaceId || !projectId || !token) {
+    throw new HttpsError("invalid-argument", "Chybí wid, pid nebo token.");
+  }
+
+  const principal = principalFromAuth(request.auth);
+  if (!(await canEditProjectContent(workspaceId, projectId, principal))) {
+    throw new HttpsError("permission-denied", "Nemáš oprávnění zneplatnit sdílecí odkaz.");
+  }
+
+  const db = getFirestore(getLocalApp());
+  const shareRef = db.doc(`workspaces/${workspaceId}/projects/${projectId}/shareLinks/${token}`);
+  const shareSnap = await shareRef.get();
+  if (!shareSnap.exists) {
+    throw new HttpsError("not-found", "Sdílecí odkaz neexistuje.");
+  }
+
+  const shareDoc = shareSnap.data() as { fileUrl?: string; revoked?: boolean };
+  if (typeof shareDoc.fileUrl !== "string" || shareDoc.fileUrl.length === 0) {
+    throw new HttpsError("failed-precondition", "Sdílecí odkaz neobsahuje URL souboru.");
+  }
+
+  await rotateDownloadToken(shareDoc.fileUrl);
+  await shareRef.update({ revoked: true });
+
+  logger.info("revokeShareLinkAndRotateToken OK", {
+    workspaceId,
+    projectId,
+    token,
+    principal,
+    wasAlreadyRevoked: Boolean(shareDoc.revoked),
+  });
+
+  return { revoked: true, tokenRotated: true };
 });

@@ -257,10 +257,19 @@ service cloud.firestore {
       allow create: if isRealUser()
         && request.resource.data.ownerId == principal()
         && request.resource.data.adminIds is list;
-      // Owner can manage admins/name but never transfer/drop ownership here.
+      // Owner can manage admins/name and workspace settings (modules,
+      // storageBackend, ...) but never transfer/drop ownership here.
+      // Workspace admins may update settings too, WITHOUT escalation:
+      // ownerId and adminIds must stay unchanged (the admin list is
+      // owner-only).
       allow update: if isRealUser()
-        && resource.data.get('ownerId', '') == principal()
-        && request.resource.data.ownerId == resource.data.ownerId;
+        && (
+          (resource.data.get('ownerId', '') == principal()
+            && request.resource.data.ownerId == resource.data.ownerId)
+          || (isWsAdmin(wid)
+            && request.resource.data.ownerId == resource.data.ownerId
+            && request.resource.data.adminIds == resource.data.adminIds)
+        );
       allow delete: if false;
     }
 

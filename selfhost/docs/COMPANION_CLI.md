@@ -25,6 +25,33 @@ kam ji v appce vložit.
 
 Skript je **idempotentní** — lze ho spustit opakovaně.
 
+## Kapacity a moduly (kroky 8–10)
+
+Po federaci skript navíc:
+
+1. **Zdetekuje kapacity projektu** (best-effort): Blaze (úspěšný deploy
+   functions = jistota), existenci Storage bucketu (REST dotaz na
+   `<projectId>.firebasestorage.app`); AI Logic a App Check přes API
+   detekovat nejdou → „neznámé“.
+2. **Spustí krok Úložiště** — zavolá sdílený `openbuildos-storage-setup.mjs`
+   (storage.rules + CORS) jako child process, jen když Storage existuje nebo
+   to potvrdíš. Selhání je jen varování, ne pád.
+3. **Zapíše `workspaces/{projectId}.modules`** — mapu modulů, kterou čte appka
+   (**Nastavení → Moduly**). Jádro (Úkoly, Plány, Fotky, Deník, Dokumenty) je
+   vždy zapnuté; **Firemní prostory** se zapnou jen při Blaze + Functions +
+   Storage; **Hlasové úkoly** nikdy automaticky (vyžadují AI Logic + App Check
+   + souhlas admina v appce). Existující `modules` se **nepřepisuje** — jen se
+   doplní chybějící moduly.
+
+| Volba | Význam |
+| --- | --- |
+| `--enable-all` | Zapne všechny moduly, na které projekt má kapacity (**výchozí**). |
+| `--minimal` | Zapne jen jádrové moduly; volitelné nechá vypnuté. |
+
+Co zapnout nešlo, skončí v závěrečném **checklistu varování** s přesným ručním
+krokem. Kompletní matice „modul → prerekvizity → jak zapnout → cena“:
+**[CAPABILITIES.md](./CAPABILITIES.md)**.
+
 ## Předpoklady (zajistí člověk předem)
 
 - **Node** + **firebase-tools** (volá se `npx firebase`) + **gcloud SDK**
@@ -54,7 +81,9 @@ před zásahem do projektu.
 | `--project <id>` | ID firemního Firebase projektu (povinné; jinak dotaz). |
 | `--region <r>` | Region funkce. Default `europe-west1`. |
 | `--firebase-account <mail>` | Předá se firebase-tools jako `--account`. |
-| `--yes` | Přeskočí potvrzovací dotaz. |
+| `--yes` | Přeskočí potvrzovací dotazy. |
+| `--enable-all` | Zapne všechny moduly s dostupnými kapacitami (výchozí). |
+| `--minimal` | Zapne jen jádrové moduly (viz [CAPABILITIES.md](./CAPABILITIES.md)). |
 | `--help` | Vypíše nápovědu a skončí. |
 
 ## Robustnost

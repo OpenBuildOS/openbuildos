@@ -14,9 +14,15 @@
  * Skript je IDEMPOTENTNÍ — lze ho spustit opakovaně. Nepoužívá žádné nové npm
  * závislosti; volá lokální `npx firebase` a `gcloud`.
  *
+ * Po federaci navíc (best-effort): zdetekuje kapacity projektu (Blaze, Storage,
+ * AI Logic/App Check), spustí krok Úložiště (openbuildos-storage-setup.mjs jako
+ * child process) a zapíše `workspaces/{projectId}.modules` — mapu zapnutých
+ * modulů, kterou čte appka (Nastavení → Moduly). Viz docs/CAPABILITIES.md.
+ *
  * Použití:
  *   node scripts/openbuildos-setup.mjs --project <companyProjectId> \
- *        [--region europe-west1] [--firebase-account <email>] [--yes]
+ *        [--region europe-west1] [--firebase-account <email>] [--yes] \
+ *        [--enable-all | --minimal]
  *
  * Bez --project se na projekt zeptá interaktivně.
  *
@@ -205,7 +211,11 @@ VOLBY:
   --project <id>            ID firemního Firebase projektu (povinné; jinak dotaz)
   --region <region>         region funkce (default: europe-west1)
   --firebase-account <mail> e-mail účtu pro firebase-tools (--account)
-  --yes                     přeskočí potvrzovací dotaz
+  --yes                     přeskočí potvrzovací dotazy
+  --enable-all              zapne všechny moduly, na které projekt má kapacity
+                            (výchozí chování)
+  --minimal                 zapne jen jádrové moduly; volitelné (Firemní
+                            prostory, Hlasové úkoly) nechá vypnuté
   --help                    vypíše tuto nápovědu
 
 CO DĚLÁ (idempotentně, lze pouštět opakovaně):
@@ -215,10 +225,16 @@ CO DĚLÁ (idempotentně, lze pouštět opakovaně):
   4. Deploy funkce authExchange (--force, retry/backoff) + vyparsuje URL.
   5. Zjistí runtime service account funkce.
   6. allUsers → roles/run.invoker na Cloud Run službě authexchange.
-  7. roles/iam.serviceAccountTokenCreator runtime SA sám na sebe.
-  8. Vypíše funkce URL + návod k vložení do appky.
+  7. roles/iam.serviceAccountTokenCreator runtime SA sám na sebe
+     (+ 7b: zápis federační URL do config/public).
+  8. Detekce kapacit projektu (Blaze / Storage bucket / AI Logic, App Check).
+  9. Úložiště: spustí openbuildos-storage-setup.mjs (rules + CORS), když je
+     Storage zapnuté; při selhání jen varování.
+ 10. Zapíše workspaces/<projectId>.modules (mapa modulů pro appku; existující
+     nastavení se NEpřepisuje, jen se doplní chybějící moduly).
+ 11. Vypíše funkce URL + checklist pro moduly, které zapnout nešly.
 
-Detaily a troubleshooting: docs/COMPANION_CLI.md
+Detaily a troubleshooting: docs/COMPANION_CLI.md, kapacity: docs/CAPABILITIES.md
 `;
 
 function parseCliArgs() {
@@ -228,6 +244,8 @@ function parseCliArgs() {
       region: { type: "string" },
       "firebase-account": { type: "string" },
       yes: { type: "boolean", default: false },
+      "enable-all": { type: "boolean", default: false },
+      minimal: { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -241,7 +259,7 @@ function parseCliArgs() {
 
 /** KROK 1: Preflight — nástroje a aktivní gcloud účet. */
 function preflight(gcloud, fb) {
-  step("Krok 1/8 — Preflight (kontrola nástrojů a přihlášení)");
+  step("Krok 1/11 — Preflight (kontrola nástrojů a přihlášení)");
 
   // firebase-tools — globální `firebase` (Cloud Shell) nebo `npx firebase`.
   try {
@@ -292,7 +310,7 @@ function preflight(gcloud, fb) {
 
 /** KROK 2: npm install ve functions/. */
 function npmInstallFunctions(repoRoot) {
-  step("Krok 2/8 — npm install ve functions/");
+  step("Krok 2/11 — npm install ve functions/");
   try {
     run("npm", ["install", "--prefix", join(repoRoot, "functions")]);
     ok("functions/node_modules připraveny");
@@ -313,7 +331,7 @@ function firebaseInvocation(fb, account) {
 
 /** KROK 3: Deploy firestore rules s retry. */
 function deployRules(project, account, fb) {
-  step("Krok 3/8 — Deploy Firestore pravidel");
+  step("Krok 3/11 — Deploy Firestore pravidel");
   const { cmd, args } = firebaseInvocation(fb, account);
   try {
     run(cmd, [...args, "deploy", "--only", "firestore:rules", "--project", project], {
@@ -328,7 +346,7 @@ function deployRules(project, account, fb) {
 
 /** KROK 4: Deploy funkce s --force a retry; vrátí vyparsovanou URL nebo null. */
 function deployFunctions(project, account, fb) {
-  step("Krok 4/8 — Deploy funkce authExchange");
+  step("Krok 4/11 — Deploy funkce authExchange");
   info("  (čerstvý Blaze projekt: 1. pokus může selhat na build service account — retry to vyřeší)");
   const { cmd, args } = firebaseInvocation(fb, account);
   try {
@@ -372,7 +390,7 @@ function describeRunUrl(gcloud, project, region) {
 
 /** KROK 5: Zjistí runtime SA funkce; fallback na default compute SA. */
 function resolveRuntimeServiceAccount(gcloud, project, region) {
-  step("Krok 5/8 — Zjišťování runtime service accountu funkce");
+  step("Krok 5/11 — Zjišťování runtime service accountu funkce");
   let sa = null;
   try {
     const { stdout } = run(gcloud, [
@@ -419,7 +437,7 @@ function resolveRuntimeServiceAccount(gcloud, project, region) {
 
 /** KROK 6: allUsers → roles/run.invoker na Cloud Run službě authexchange. */
 function grantPublicInvoker(gcloud, project, region) {
-  step("Krok 6/8 — Veřejný invoker (allUsers → roles/run.invoker)");
+  step("Krok 6/11 — Veřejný invoker (allUsers → roles/run.invoker)");
   try {
     run(gcloud, [
       "run",
@@ -452,7 +470,7 @@ function grantPublicInvoker(gcloud, project, region) {
 
 /** KROK 7: roles/iam.serviceAccountTokenCreator runtime SA sám na sebe. */
 function grantTokenCreator(gcloud, project, sa) {
-  step("Krok 7/8 — Token Creator role (createCustomToken / signBlob)");
+  step("Krok 7/11 — Token Creator role (createCustomToken / signBlob)");
   try {
     run(gcloud, [
       "iam",
@@ -523,9 +541,342 @@ function writeFederationConfig(gcloud, project, url) {
   }
 }
 
-/** KROK 8: Závěr — federace je auto-discovery, URL jen pro kontrolu/fallback. */
+// ---------------------------------------------------------------------------
+// Detekce kapacit + moduly workspace (viz docs/CAPABILITIES.md)
+// ---------------------------------------------------------------------------
+
+/** Klíče jádrových modulů — vždy zapnuté (fungují na Sparku, jen Firestore). */
+const CORE_MODULE_KEYS = ["tasks", "plans", "photos", "reports", "documents"];
+
+/** Access token vlastníka pro REST volání (Firestore / Storage API). */
+function ownerAccessToken(gcloud) {
+  const token = run(gcloud, ["auth", "print-access-token"]).stdout.trim();
+  if (!token) {
+    throw new Error("prázdný access token (gcloud auth print-access-token)");
+  }
+  return token;
+}
+
+/** Vrátí HTTP status kód GET požadavku (curl), nebo null při selhání. */
+function httpStatus(url, token) {
+  try {
+    const { stdout } = run("curl", [
+      "-s",
+      "-o",
+      "/dev/null",
+      "-w",
+      "%{http_code}",
+      "-H",
+      `Authorization: Bearer ${token}`,
+      url,
+    ]);
+    const code = stdout.trim();
+    return /^\d{3}$/.test(code) ? Number(code) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * KROK 8: Best-effort detekce kapacit projektu. Nic nezapíná — jen zjišťuje,
+ * co projekt umí. Hodnoty: true / false / null (= neznámé). Co je neznámé,
+ * se NEzapíná a skončí v závěrečném checklistu.
+ */
+function detectCapabilities(gcloud, project, { functionsDeployed = false } = {}) {
+  step("Krok 8/11 — Detekce kapacit projektu (Blaze / Storage / AI Logic)");
+  const caps = {
+    blaze: null,
+    functions: functionsDeployed ? true : null,
+    storage: null,
+    aiLogic: null, // přes API nedetekovatelné
+    appCheck: null, // přes API nedetekovatelné
+  };
+
+  // Blaze — heuristika: úspěšný deploy functions v TOMHLE běhu = Blaze určitě.
+  if (functionsDeployed) {
+    caps.blaze = true;
+    ok("Blaze: ano (deploy functions v tomto běhu prošel)");
+  } else {
+    try {
+      const { stdout } = run(gcloud, [
+        "billing",
+        "projects",
+        "describe",
+        project,
+        "--format=value(billingEnabled)",
+      ]);
+      const value = stdout.trim().toLowerCase();
+      if (value === "true") {
+        caps.blaze = true;
+        ok("Blaze: ano (billingEnabled)");
+      } else if (value === "false") {
+        caps.blaze = false;
+        info("  Blaze: ne (projekt je na Sparku)");
+      } else {
+        info("  Blaze: neznámé (billing API nevrátilo stav)");
+      }
+    } catch {
+      info("  Blaze: neznámé (gcloud billing není dostupný / chybí oprávnění)");
+    }
+  }
+
+  // Storage — existence bucketu <pid>.firebasestorage.app přes REST.
+  // 404 = bucket není (Storage vypnuté); 200/403 = bucket existuje
+  // (403 jen znamená, že token nesmí listovat — bucket ale JE).
+  try {
+    const token = ownerAccessToken(gcloud);
+    const code = httpStatus(
+      `https://firebasestorage.googleapis.com/v0/b/${project}.firebasestorage.app/o?maxResults=1`,
+      token
+    );
+    if (code === 404) {
+      caps.storage = false;
+      info("  Storage: ne (bucket neexistuje — Storage není zapnuté v konzoli)");
+    } else if (code === 200 || code === 403) {
+      caps.storage = true;
+      ok(`Storage: ano (bucket ${project}.firebasestorage.app existuje)`);
+    } else {
+      info(`  Storage: neznámé (HTTP ${code ?? "—"})`);
+    }
+  } catch {
+    info("  Storage: neznámé (dotaz na bucket selhal)");
+  }
+
+  info("  AI Logic / App Check: přes API nedetekovatelné → neznámé (viz checklist na konci)");
+  return caps;
+}
+
+/**
+ * KROK 9: Úložiště — spustí SDÍLENÝ skript openbuildos-storage-setup.mjs jako
+ * child process (rules + CORS). Skript se NEmění (musí zůstat identický s kopií
+ * v hlavním repu). Selhání je jen varování, ne fatal.
+ */
+async function runStorageSetup(project, caps, { yes }, repoRoot) {
+  step("Krok 9/11 — Úložiště (openbuildos-storage-setup: storage.rules + CORS)");
+
+  if (caps.storage === false) {
+    warn(
+      "Úložiště přeskočeno: Storage bucket neexistuje. Zapni Storage v konzoli " +
+        `(https://console.firebase.google.com/project/${project}/storage, lokace EU/eur3, po zapnutí zdarma — Spark limity) ` +
+        `a spusť: node scripts/openbuildos-storage-setup.mjs --project ${project}`
+    );
+    return;
+  }
+  if (caps.storage === null) {
+    let proceed = false;
+    if (!yes) {
+      proceed = await confirm("  Stav Storage se nepodařilo zjistit. Spustit krok Úložiště i tak?");
+    }
+    if (!proceed) {
+      warn(
+        "Úložiště přeskočeno (stav Storage neznámý). Až Storage zapneš/ověříš, spusť: " +
+          `node scripts/openbuildos-storage-setup.mjs --project ${project}`
+      );
+      return;
+    }
+  }
+
+  info("  (spouštím openbuildos-storage-setup.mjs — výstup níže)");
+  const script = join(repoRoot, "scripts", "openbuildos-storage-setup.mjs");
+  const res = spawnSync(process.execPath, [script, "--project", project], {
+    stdio: "inherit",
+    cwd: repoRoot,
+  });
+  if (res.status === 0) {
+    caps.storage = true;
+    ok("úložiště připraveno (bucket + storage.rules + CORS)");
+  } else {
+    if (res.status === 2) {
+      caps.storage = false; // exit 2 = bucket neexistuje
+    }
+    warn(
+      `openbuildos-storage-setup skončil chybou (exit ${res.status ?? "?"}) — nefatální. ` +
+        `Dokonči ručně: node scripts/openbuildos-storage-setup.mjs --project ${project}`
+    );
+  }
+}
+
+/** Převede JS hodnotu na Firestore REST Value (bool/string/number/map). */
+function fsValue(value) {
+  if (typeof value === "boolean") return { booleanValue: value };
+  if (typeof value === "string") return { stringValue: value };
+  if (typeof value === "number") {
+    return Number.isInteger(value) ? { integerValue: String(value) } : { doubleValue: value };
+  }
+  if (value && typeof value === "object") {
+    const fields = {};
+    for (const [key, v] of Object.entries(value)) {
+      fields[key] = fsValue(v);
+    }
+    return { mapValue: { fields } };
+  }
+  return { nullValue: null };
+}
+
+/**
+ * Cílová mapa modulů podle detekovaných kapacit. Tvar MUSÍ sedět s appkou
+ * (workspaces/{wid}.modules; ModuleState = { enabled, config? }):
+ *   - jádro (tasks, plans, photos, reports, documents) vždy enabled:true,
+ *   - companySpaces jen když blaze + functions + storage (a ne --minimal),
+ *   - voiceTaskCapture vždy off (vyžaduje ruční AI Logic + App Check
+ *     + souhlas admina v UI — zapíná se v appce Nastavení → Moduly).
+ */
+function computeDesiredModules(caps, minimal) {
+  const modules = {};
+  for (const key of CORE_MODULE_KEYS) {
+    modules[key] = { enabled: true };
+  }
+  modules.companySpaces = {
+    enabled: !minimal && caps.blaze === true && caps.functions === true && caps.storage === true,
+  };
+  modules.voiceTaskCapture = {
+    enabled: false,
+    config: { provider: "none", consentGiven: false },
+  };
+  return modules;
+}
+
+/**
+ * KROK 10: Zapíše workspaces/{projectId}.modules přes REST (vzor
+ * writeFederationConfig). Idempotentní a NEdestruktivní: když pole `modules`
+ * už existuje, existující klíče NEpřepisuje — jen doplní chybějící přes
+ * updateMask `modules.<key>`. Nefatální (appka má Nastavení → Moduly).
+ */
+function seedWorkspaceModules(gcloud, project, caps, minimal) {
+  step(`Krok 10/11 — Moduly workspace (workspaces/${project}.modules)`);
+  const desired = computeDesiredModules(caps, minimal);
+  if (minimal) {
+    info("  (--minimal: volitelné moduly zůstávají vypnuté i při dostupných kapacitách)");
+  }
+
+  try {
+    const token = ownerAccessToken(gcloud);
+    const docUrl =
+      `https://firestore.googleapis.com/v1/projects/${project}` +
+      `/databases/(default)/documents/workspaces/${project}`;
+
+    // Existující modules — čteme, ať slepě nepřepíšeme volby admina.
+    let existing = null;
+    try {
+      const { stdout } = run("curl", [
+        "-s",
+        "-H",
+        `Authorization: Bearer ${token}`,
+        `${docUrl}?mask.fieldPaths=modules`,
+      ]);
+      const parsed = JSON.parse(stdout);
+      if (parsed?.error && parsed.error.code !== 404) {
+        throw new Error(`čtení workspaces/${project} selhalo: ${parsed.error.message ?? parsed.error.code}`);
+      }
+      existing = parsed?.fields?.modules?.mapValue?.fields ?? null;
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        throw new Error("čtení workspace dokumentu vrátilo neparsovatelnou odpověď");
+      }
+      throw err;
+    }
+
+    let patchUrl;
+    let bodyFields;
+    let writtenKeys;
+    if (!existing) {
+      // Pole modules zatím není → zapíšeme celou mapu naráz.
+      patchUrl = `${docUrl}?updateMask.fieldPaths=modules`;
+      bodyFields = { modules: fsValue(desired) };
+      writtenKeys = Object.keys(desired);
+    } else {
+      // Merge: existující enabled/config zachovat, doplnit JEN chybějící klíče.
+      const missing = Object.keys(desired).filter((key) => !(key in existing));
+      if (missing.length === 0) {
+        ok("modules už existuje a obsahuje všechny moduly — existující nastavení nepřepisuji");
+        reportModuleChecklist(project, existing, desired, caps, minimal);
+        return;
+      }
+      patchUrl =
+        docUrl + "?" + missing.map((key) => `updateMask.fieldPaths=modules.${key}`).join("&");
+      const fields = {};
+      for (const key of missing) {
+        fields[key] = fsValue(desired[key]);
+      }
+      bodyFields = { modules: { mapValue: { fields } } };
+      writtenKeys = missing;
+      info(`  modules už existuje — doplňuji jen chybějící: ${missing.join(", ")}`);
+    }
+
+    const { stdout } = run("curl", [
+      "-s",
+      "-X",
+      "PATCH",
+      "-H",
+      `Authorization: Bearer ${token}`,
+      "-H",
+      "Content-Type: application/json",
+      "-d",
+      JSON.stringify({ fields: bodyFields }),
+      patchUrl,
+    ]);
+    if (/"error"/.test(stdout)) {
+      throw new Error(stdout.split("\n").slice(0, 3).join(" "));
+    }
+    const enabledNow = writtenKeys.filter((key) => desired[key].enabled);
+    ok(
+      `modules zapsáno (${writtenKeys.join(", ")}) — zapnuto: ${
+        enabledNow.length ? enabledNow.join(", ") : "(nic nového)"
+      }`
+    );
+    reportModuleChecklist(project, existing, desired, caps, minimal);
+  } catch (err) {
+    warn(
+      `Zápis workspaces/${project}.modules selhal (nefatální): ${
+        (err.combinedOutput || err.message || String(err)).split("\n")[0]
+      } — moduly zapneš v appce: Nastavení → Moduly.`
+    );
+    reportModuleChecklist(project, null, desired, caps, minimal);
+  }
+}
+
+/**
+ * Per-feature checklist: pro každý NEzapnutý volitelný modul přidá varování
+ * s důvodem a přesným ručním krokem (objeví se v závěrečném shrnutí).
+ */
+function reportModuleChecklist(project, existing, desired, caps, minimal) {
+  const isEnabled = (key) => {
+    const fromExisting = existing?.[key]?.mapValue?.fields?.enabled?.booleanValue;
+    return typeof fromExisting === "boolean" ? fromExisting : desired[key]?.enabled === true;
+  };
+
+  if (!isEnabled("companySpaces")) {
+    if (minimal) {
+      warn(
+        "Firemní prostory: vypnuto kvůli --minimal. Zapni v appce: Nastavení → Moduly."
+      );
+    } else {
+      const missing = [];
+      if (caps.blaze !== true) missing.push("plán Blaze");
+      if (caps.functions !== true) missing.push("nasazené Cloud Functions (krok 4)");
+      if (caps.storage !== true) missing.push("zapnuté Storage (krok 9)");
+      warn(
+        `Firemní prostory: chybí ${missing.length ? missing.join(" + ") : "ověření kapacit"}. ` +
+          `Upgrade na Blaze (https://console.firebase.google.com/project/${project}/usage/details), ` +
+          "zapni Storage a spusť setup znovu, pak v appce Nastavení → Moduly modul zapni."
+      );
+    }
+  }
+
+  if (!isEnabled("voiceTaskCapture")) {
+    warn(
+      "Hlasové úkoly (Gemini): v konzoli zapni Firebase AI Logic " +
+        `(https://console.firebase.google.com/project/${project}/ailogic) a registruj App Check ` +
+        `(https://console.firebase.google.com/project/${project}/appcheck), pak v appce ` +
+        "Nastavení → Moduly modul zapni (vyžaduje souhlas admina). " +
+        "Alternativa self-host: Blaze + deploy funkce aiParse + endpoint Ollama — viz docs/CAPABILITIES.md."
+    );
+  }
+}
+
+/** KROK 11: Závěr — federace je auto-discovery, URL jen pro kontrolu/fallback. */
 function printConclusion(url) {
-  step("Krok 8/8 — Hotovo");
+  step("Krok 11/11 — Hotovo");
   console.log("");
   console.log("  ┌──────────────────────────────────────────────────────────────┐");
   console.log("  │  FEDERAČNÍ BACKEND PŘIPRAVEN — appka si URL doplní sama         │");
@@ -600,7 +951,8 @@ async function main() {
   // Potvrzení (pokud není --yes).
   if (!args.yes) {
     console.log(
-      "\nSkript nasadí pravidla + funkci a nastaví 2 IAM role v tomto projektu."
+      "\nSkript nasadí pravidla + funkci, nastaví 2 IAM role, připraví úložiště" +
+        "\na zapíše mapu modulů (workspaces/<projekt>.modules) v tomto projektu."
     );
     const proceed = await confirm("Pokračovat?");
     if (!proceed) {
@@ -630,7 +982,12 @@ async function main() {
     grantTokenCreator(gcloud, project, sa); // krok 7
     writeFederationConfig(gcloud, project, url); // krok 7b — auto-discovery
 
-    printConclusion(url); // krok 8
+    // krok 8 — detekce kapacit (deploy functions už prošel → Blaze jistý)
+    const caps = detectCapabilities(gcloud, project, { functionsDeployed: true });
+    await runStorageSetup(project, caps, { yes: args.yes }, repoRoot); // krok 9
+    seedWorkspaceModules(gcloud, project, caps, args.minimal === true); // krok 10
+
+    printConclusion(url); // krok 11
     printSummary({ project, region, url, success: true });
     return 0;
   } catch (err) {

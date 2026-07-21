@@ -885,7 +885,16 @@ service cloud.firestore {
     // Query příjemce: where('inviteeEmail','==', mojeEmail) & where('status','==','pending').
     // ---------------------------------------------------------------------
     match /pendingInvites/{token} {
-      allow get, list: if isRealUser()
+      // Adresát čte svoje pozvánky (i výpisem). Zvoucí smí přečíst JEN konkrétní
+      // pozvánku, kterou sám založil (`get`, ne `list`) — potřebuje to relay
+      // zvacích e-mailů, který dokument čte JMÉNEM přihlášeného uživatele, takže
+      // oprávnění vynutí tahle rule. Rozšířit i `list` by dovolilo enumeraci
+      // cizích pozvánek, proto výpis zůstává jen adresátovi.
+      allow get: if isRealUser()
+        && (resource.data.get('inviteeEmail', '') == request.auth.token.get('email', '')
+            || (resource.data.get('inviterEmail', '') != ''
+                && resource.data.get('inviterEmail', '') == request.auth.token.get('email', '')));
+      allow list: if isRealUser()
         && resource.data.get('inviteeEmail', '') == request.auth.token.get('email', '');
       // POZOR (bezpečnost): tento create dovoluje LIBOVOLNÉMU reálnému uživateli
       // vytvořit pozvánku s libovolným authExchangeUrl/apiKey mířícím na cizí

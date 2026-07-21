@@ -737,10 +737,25 @@ function computeDesiredModules(caps, minimal) {
 }
 
 /**
+ * Warning, když workspaces/{wid} doc ještě neexistuje. PATCH ho NESMÍ založit:
+ * appčí `ensureWorkspaceDoc` zakládá doc (ownerId/adminIds/…) jen když
+ * NEEXISTUJE — doc založený CLI jen s polem `modules` by znamenal, že se
+ * vlastník už nikdy nezapíše a firma má rozbitá práva.
+ */
+function warnWorkspaceDocMissing() {
+  warn(
+    "Moduly: workspace dokument ještě neexistuje — otevři appku a aktivuj firmu " +
+      "(založí se automaticky), pak moduly zapni v Nastavení → Moduly (nebo spusť setup znovu)."
+  );
+}
+
+/**
  * KROK 10: Zapíše workspaces/{projectId}.modules přes REST (vzor
  * writeFederationConfig). Idempotentní a NEdestruktivní: když pole `modules`
  * už existuje, existující klíče NEpřepisuje — jen doplní chybějící přes
- * updateMask `modules.<key>`. Nefatální (appka má Nastavení → Moduly).
+ * updateMask `modules.<key>`. Zápis má precondition `currentDocument.exists=true`
+ * — dokument NIKDY nezakládá (viz warnWorkspaceDocMissing). Nefatální
+ * (appka má Nastavení → Moduly).
  */
 function seedWorkspaceModules(gcloud, project, caps, minimal) {
   step(`Krok 10/11 — Moduly workspace (workspaces/${project}.modules)`);
@@ -765,7 +780,12 @@ function seedWorkspaceModules(gcloud, project, caps, minimal) {
         `${docUrl}?mask.fieldPaths=modules`,
       ]);
       const parsed = JSON.parse(stdout);
-      if (parsed?.error && parsed.error.code !== 404) {
+      if (parsed?.error) {
+        if (parsed.error.code === 404) {
+          // Doc neexistuje — NEZAKLÁDAT (viz warnWorkspaceDocMissing), přeskočit.
+          warnWorkspaceDocMissing();
+          return;
+        }
         throw new Error(`čtení workspaces/${project} selhalo: ${parsed.error.message ?? parsed.error.code}`);
       }
       existing = parsed?.fields?.modules?.mapValue?.fields ?? null;
@@ -779,9 +799,11 @@ function seedWorkspaceModules(gcloud, project, caps, minimal) {
     let patchUrl;
     let bodyFields;
     let writtenKeys;
+    // Precondition currentDocument.exists=true: PATCH doc NIKDY nezaloží.
+    const precondition = "currentDocument.exists=true";
     if (!existing) {
       // Pole modules zatím není → zapíšeme celou mapu naráz.
-      patchUrl = `${docUrl}?updateMask.fieldPaths=modules`;
+      patchUrl = `${docUrl}?${precondition}&updateMask.fieldPaths=modules`;
       bodyFields = { modules: fsValue(desired) };
       writtenKeys = Object.keys(desired);
     } else {
@@ -793,7 +815,9 @@ function seedWorkspaceModules(gcloud, project, caps, minimal) {
         return;
       }
       patchUrl =
-        docUrl + "?" + missing.map((key) => `updateMask.fieldPaths=modules.${key}`).join("&");
+        docUrl +
+        `?${precondition}&` +
+        missing.map((key) => `updateMask.fieldPaths=modules.${key}`).join("&");
       const fields = {};
       for (const key of missing) {
         fields[key] = fsValue(desired[key]);
@@ -816,6 +840,17 @@ function seedWorkspaceModules(gcloud, project, caps, minimal) {
       patchUrl,
     ]);
     if (/"error"/.test(stdout)) {
+      let errorCode = null;
+      try {
+        errorCode = JSON.parse(stdout)?.error?.code ?? null;
+      } catch {
+        // neparsovatelná odpověď → obecná chyba níže
+      }
+      if (errorCode === 400 || errorCode === 404) {
+        // Precondition exists=true selhala — doc mezitím zmizel/neexistuje.
+        warnWorkspaceDocMissing();
+        return;
+      }
       throw new Error(stdout.split("\n").slice(0, 3).join(" "));
     }
     const enabledNow = writtenKeys.filter((key) => desired[key].enabled);

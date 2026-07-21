@@ -24,10 +24,13 @@ Odesílání je proto firemní schopnost:
 
 ## Nastavení — SMTP (doporučeno)
 
-1. **Vytvoř „app password"** pro schránku, ze které chceš posílat.
-   - Google Workspace / Gmail: účet → Zabezpečení → Hesla aplikací.
-     Host `smtp.gmail.com`, port `465`.
+1. **Zjisti SMTP údaje schránky a vytvoř „app password"** (ne heslo k účtu).
+   - Google Workspace / Gmail: účet → Zabezpečení → dvoufázové ověření →
+     Hesla aplikací. Host `smtp.gmail.com`, port `465`.
    - Office365: povol SMTP AUTH pro schránku. Host `smtp.office365.com`, port `587`.
+   - Hosting domény (Wedos, Český hosting, Forpsi…): SMTP hostname a port najdeš
+     v jejich nápovědě — ale **napřed si přečti varování o automatickém
+     odesílání** hned pod tímhle postupem.
 
 2. **Ulož secrety** (nikdy je nedávej do repa):
 
@@ -39,8 +42,48 @@ Odesílání je proto firemní schopnost:
    firebase functions:secrets:set INVITE_MAIL_FROM --project <firma>   # OpenBuildOS <pozvanky@firma.cz>
    ```
 
-   `INVITE_MAIL_FROM` je odesílatel; u SMTP se typicky **musí shodovat**
-   se `SMTP_USER` (jinak server zápis odmítne).
+   `SMTP_USER` je účet, kterým se **přihlašuješ** k SMTP; `INVITE_MAIL_FROM` je
+   adresa v hlavičce **Od**. Většinou jsou stejné — ale nemusí, viz „odesílání
+   přes alias" níže.
+
+### ⚠️ Nejdřív ověř, jestli SMTP tvého hostingu automatické odesílání povoluje
+
+Spousta poskytovatelů pošty (typicky ti, co dělají hosting domén, ne transakční
+mail) **zakazuje** posílat přes svůj SMTP z webových aplikací a automatizovaných
+systémů — i když se do limitu vejdeš. Příklad: Český hosting v
+[politikách SMTP serverů](https://www.cesky-hosting.cz/napoveda/e-maily/politiky-smtp-serveru/)
+uvádí limit 300 zpráv/hod, ale zároveň že server *není* pro „odesílání zpráv
+z webových aplikací".
+
+Než nastavíš hosting SMTP, projdi si jeho podmínky. Když aplikační odesílání
+nepovoluje, použij jednu z cest níže (alias přes Google) nebo transakčního
+providera (Resend).
+
+### Odesílání přes alias (Google účet + adresa z jiné domény)
+
+Časté u firem, které mají doménu i schránku u hostingu, ale používají ji
+z Gmailu. Pak se **přihlašuješ Google účtem**, ale posíláš „jako" firemní adresa:
+
+1. V Gmailu musí být adresa přidaná v *Nastavení → Účty → Odesílat pomocí* a
+   **ověřená** (klik na potvrzovací odkaz). Bez ověření Google adresu v hlavičce
+   Od přepíše zpět na přihlášený účet.
+2. Na Google účtu zapni **dvoufázové ověření** a vytvoř **app password**
+   (bez 2FA se app password nedá vygenerovat).
+3. Secrety pak nastav takto — všimni si, že se `SMTP_USER` a `INVITE_MAIL_FROM`
+   **liší**:
+
+   ```
+   SMTP_HOST        = smtp.gmail.com
+   SMTP_PORT        = 465
+   SMTP_USER        = <primární adresa Google účtu>     # NE alias!
+   SMTP_PASS        = <app password>
+   INVITE_MAIL_FROM = Firma <adresa@firma.cz>           # ověřený alias
+   ```
+
+**Doručitelnost:** e-mail poletí z Google IP, ale v hlavičce Od bude tvoje
+doména. Aby ho příjemci nebrali jako podvrh, měla by mít doména **SPF záznam**,
+který Google povoluje (`v=spf1 include:_spf.google.com ~all` — pokud posíláš
+i odjinud, uveď i to). Bez SPF část příjemců e-mail označí nebo zahodí.
 
 3. **Nasaď funkce:**
 

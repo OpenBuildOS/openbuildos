@@ -29,6 +29,17 @@ následující (stačí jednou):
    nebudou fungovat dokumenty a výkresy (jejich soubory se ukládají sem).
    Lokaci **nejde** později změnit.
 
+**Volitelné — jen pokud chcete Hlasové úkoly (diktování s AI):**
+
+6. **AI Logic** → *Get started* → **Gemini Developer API** (zdarma i na
+   Sparku).
+7. **App Check** → registrujte webovou aplikaci (reCAPTCHA). Bez App Check by
+   AI endpoint mohl zneužít kdokoliv.
+
+Samotný modul pak zapne admin v appce (**Nastavení → Moduly**). Kompletní
+přehled, co který modul vyžaduje a kolik stojí, je v
+[CAPABILITIES.md](./CAPABILITIES.md).
+
 ---
 
 ## Krok 2 — Spusťte instalaci

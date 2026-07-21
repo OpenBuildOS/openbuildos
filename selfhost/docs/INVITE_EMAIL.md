@@ -24,15 +24,38 @@ Odesílání je proto firemní schopnost:
 
 ## Nastavení — SMTP (doporučeno)
 
+> ### ⚠️ Nejdřív ověř, jestli SMTP tvého poskytovatele tohle povoluje
+>
+> Spousta poskytovatelů pošty (typicky ti, co dělají hosting domén, ne transakční
+> mail) **zakazuje** posílat přes svůj SMTP z webových aplikací a automatizovaných
+> systémů — i když se do limitu vejdeš. Příklad: Český hosting v
+> [politikách SMTP serverů](https://www.cesky-hosting.cz/napoveda/e-maily/politiky-smtp-serveru/)
+> uvádí limit 300 zpráv/hod, ale zároveň že server *není* pro „odesílání zpráv
+> z webových aplikací".
+>
+> Když aplikační odesílání nepovoluje, použij **alias přes Google** (níže) nebo
+> transakčního providera (Resend).
+
 1. **Zjisti SMTP údaje schránky a vytvoř „app password"** (ne heslo k účtu).
    - Google Workspace / Gmail: účet → Zabezpečení → dvoufázové ověření →
      Hesla aplikací. Host `smtp.gmail.com`, port `465`.
    - Office365: povol SMTP AUTH pro schránku. Host `smtp.office365.com`, port `587`.
-   - Hosting domény (Wedos, Český hosting, Forpsi…): SMTP hostname a port najdeš
-     v jejich nápovědě — ale **napřed si přečti varování o automatickém
-     odesílání** hned pod tímhle postupem.
+   - Hosting domény (Wedos, Český hosting, Forpsi…): hostname a port najdeš
+     v jejich nápovědě — viz varování výše.
 
-2. **Ulož secrety** (nikdy je nedávej do repa):
+2. **Otestuj údaje, než je uložíš jako secrety.** Ušetří to kolo
+   „nastav secrety → nasaď → ono to nejde":
+
+   ```bash
+   cd selfhost/functions && npm install
+   SMTP_HOST=… SMTP_PORT=… SMTP_USER=… SMTP_PASS=… INVITE_MAIL_FROM=… \
+     node checks/smtp-test.mjs muj@email.cz
+   ```
+
+   Skript ověří připojení i přihlášení, pošle testovací zprávu a typické chyby
+   přeloží na příčinu. Bez e-mailu v argumentu jen ověří přihlášení.
+
+3. **Ulož secrety** (nikdy je nedávej do repa):
 
    ```bash
    firebase functions:secrets:set SMTP_HOST        --project <firma>   # smtp.gmail.com
@@ -42,22 +65,18 @@ Odesílání je proto firemní schopnost:
    firebase functions:secrets:set INVITE_MAIL_FROM --project <firma>   # OpenBuildOS <pozvanky@firma.cz>
    ```
 
-   `SMTP_USER` je účet, kterým se **přihlašuješ** k SMTP; `INVITE_MAIL_FROM` je
-   adresa v hlavičce **Od**. Většinou jsou stejné — ale nemusí, viz „odesílání
-   přes alias" níže.
+   `SMTP_USER` je účet, kterým se **přihlašuješ**; `INVITE_MAIL_FROM` je adresa
+   v hlavičce **Od**. Většinou stejné — ale nemusí, viz alias níže.
 
-### ⚠️ Nejdřív ověř, jestli SMTP tvého hostingu automatické odesílání povoluje
+4. **Nasaď funkce:**
 
-Spousta poskytovatelů pošty (typicky ti, co dělají hosting domén, ne transakční
-mail) **zakazuje** posílat přes svůj SMTP z webových aplikací a automatizovaných
-systémů — i když se do limitu vejdeš. Příklad: Český hosting v
-[politikách SMTP serverů](https://www.cesky-hosting.cz/napoveda/e-maily/politiky-smtp-serveru/)
-uvádí limit 300 zpráv/hod, ale zároveň že server *není* pro „odesílání zpráv
-z webových aplikací".
+   ```bash
+   firebase deploy --only functions --project <firma> --account <vlastník firmy>
+   ```
 
-Než nastavíš hosting SMTP, projdi si jeho podmínky. Když aplikační odesílání
-nepovoluje, použij jednu z cest níže (alias přes Google) nebo transakčního
-providera (Resend).
+5. **Vlastní doména appky?** Když si appku hostuješ na jiné adrese než výchozí,
+   přidej ji do `APP_ORIGINS` (čárkou oddělené), jinak funkce odkaz odmítne
+   (env proměnná functions `APP_ORIGINS`).
 
 ### Odesílání přes alias (Google účet + adresa z jiné domény)
 
@@ -69,7 +88,7 @@ z Gmailu. Pak se **přihlašuješ Google účtem**, ale posíláš „jako" fire
    Od přepíše zpět na přihlášený účet.
 2. Na Google účtu zapni **dvoufázové ověření** a vytvoř **app password**
    (bez 2FA se app password nedá vygenerovat).
-3. Secrety pak nastav takto — všimni si, že se `SMTP_USER` a `INVITE_MAIL_FROM`
+3. Secrety nastav takto — všimni si, že se `SMTP_USER` a `INVITE_MAIL_FROM`
    **liší**:
 
    ```
@@ -80,20 +99,15 @@ z Gmailu. Pak se **přihlašuješ Google účtem**, ale posíláš „jako" fire
    INVITE_MAIL_FROM = Firma <adresa@firma.cz>           # ověřený alias
    ```
 
+⚠️ **Pozor na typ Google účtu.** Tohle funguje jen když má účet **skutečnou
+Gmail schránku**. Google účet *založený na* firemní adrese (přihlašuješ se jí,
+ale Gmail schránku k ní nemáš) přes `smtp.gmail.com` posílat neumí — přihlášení
+skončí chybou. Ověříš to skriptem z kroku 2 dřív, než cokoli nasadíš.
+
 **Doručitelnost:** e-mail poletí z Google IP, ale v hlavičce Od bude tvoje
 doména. Aby ho příjemci nebrali jako podvrh, měla by mít doména **SPF záznam**,
 který Google povoluje (`v=spf1 include:_spf.google.com ~all` — pokud posíláš
 i odjinud, uveď i to). Bez SPF část příjemců e-mail označí nebo zahodí.
-
-3. **Nasaď funkce:**
-
-   ```bash
-   firebase deploy --only functions --project <firma> --account <vlastník firmy>
-   ```
-
-4. **Vlastní doména appky?** Když si appku hostuješ na jiné adrese než výchozí,
-   přidej ji do `APP_ORIGINS` (čárkou oddělené), jinak funkce odkaz odmítne
-   (env proměnná functions `APP_ORIGINS`).
 
 ## Nastavení — Resend (alternativa)
 

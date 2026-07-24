@@ -1,8 +1,8 @@
 # Companion CLI — `openbuildos-setup`
 
 Node skript, který za firmu zautomatizuje **asistovaný self-host onboarding**
-federačního backendu OpenBuildOS. Nahrazuje ruční postup z
-[`SELF_HOST_ONBOARDING_LOG.md`](./SELF_HOST_ONBOARDING_LOG.md).
+federačního backendu OpenBuildOS. Krok za krokem pro netechnické uživatele viz
+[`cloudshell-tutorial.md`](./cloudshell-tutorial.md).
 
 ## Co dělá
 

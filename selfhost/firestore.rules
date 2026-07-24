@@ -760,6 +760,15 @@ service cloud.firestore {
       allow create, update, delete: if canEditContent(wid, pid);
     }
 
+    // Zapečený stav dokumentace na hranici fáze — immutable otisk sady verzí.
+    // Číst smí člen; zakládat/mazat editor; UPDATE ZAKÁZÁN (obsah je neměnný).
+    // Bez `allow update` → updaty spadají do default-deny = immutabilita
+    // vynucená rules (stejný vzor jako share pointer, jen tady i list pro člena).
+    match /workspaces/{wid}/projects/{pid}/documentBaselines/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, delete: if canEditContent(wid, pid);
+    }
+
     match /workspaces/{wid}/projects/{pid}/documentEvents/{docId} {
       allow read: if isProjectMember(wid, pid);
       allow create, update, delete: if canEditContent(wid, pid);

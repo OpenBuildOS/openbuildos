@@ -44,6 +44,10 @@ https://europe-west1-<id-firemního-projektu>.cloudfunctions.net/authExchange
 Tuto URL vložte v aplikaci do pole **„URL ověřovací funkce (token-exchange
 endpoint)"** při připojování workspace (modal *Připojit workspace*).
 
+> **Pozn.:** Tohle je RUČNÍ postup. Companion CLI níže navíc zapíše URL do
+> `config/public`, takže si ji aplikace **najde sama** (auto-discovery) a ruční
+> vložení pak není potřeba.
+
 > **Tip — companion CLI:** Místo ručního postupu lze použít skript, který nasadí
 > pravidla i funkci (s retry pro čerstvý Blaze projekt) a nastaví potřebné IAM
 > role (veřejný `run.invoker` + `serviceAccountTokenCreator`):

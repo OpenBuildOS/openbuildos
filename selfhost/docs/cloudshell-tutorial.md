@@ -95,17 +95,19 @@ bucket neexistuje, zapněte Storage ve Firebase konzoli a spusťte ho znovu.
 
 ## Krok 4 — Propojte backend s aplikací OpenBuildOS
 
-Až instalace doběhne, vypíše na konec **URL ověřovací funkce**. Vypadá zhruba
-takto:
+Instalační skript zapsal **URL ověřovací funkce** do veřejné konfigurace vašeho
+projektu (`config/public`), takže si ji aplikace **najde sama** — nikam ji
+neopisujete.
 
-```
-https://authexchange-xxxxxxxxxx-ew.a.run.app
-```
-
-1. Tuto URL **zkopírujte**.
-2. Otevřete aplikaci **OpenBuildOS** → **Připojení firmy** → pole
-   **„URL ověřovací funkce"** a URL sem vložte.
+1. Otevřete aplikaci **OpenBuildOS** → **Připojení firmy**.
+2. Vložte **firebaseConfig** vašeho projektu (Firebase konzole → Nastavení
+   projektu → Vaše aplikace).
 3. **Přihlaste se přes svůj OpenBuildOS účet.**
+
+> **Kdyby auto-discovery selhala** (např. starší projekt bez zapsané config):
+> skript URL ověřovací funkce také **vypíše na konec** — vypadá zhruba jako
+> `https://authexchange-xxxxxxxxxx-ew.a.run.app`. Pak ji ručně vložte do pole
+> **„URL ověřovací funkce"** v modalu Připojení firmy.
 
 Hotovo — vaše firma má teď vlastní backend a všichni se k němu přihlašují
 jediným OpenBuildOS účtem.

@@ -17,7 +17,7 @@ import {
  * Proč tady a ne centrálně: centrální projekt (openbuildos) běží na Sparku a
  * e-maily posílat nemůže. Odesílání je proto **firemní-backendová schopnost** —
  * firma má vlastní Blaze projekt, vlastní doménu a vlastní SPF/DKIM, takže
- * pozvánka dorazí od NÍ, ne od centrálu. Viz docs/INVITE_FEDERATION_REDESIGN §3.4.
+ * pozvánka dorazí od NÍ, ne od centrálu. Nastavení pošty viz docs/INVITE_EMAIL.md.
  *
  * Bezpečnostní model — funkce NEVĚŘÍ NIČEMU od klienta kromě identity:
  *  1. Volající musí být přihlášený do firemního backendu (přes token-exchange

@@ -3,7 +3,7 @@
  * openbuildos-setup — companion CLI pro asistovaný self-host onboarding firmy.
  *
  * Zautomatizuje přesně ten ruční „asistovaný setup" federačního backendu, který
- * je popsán v `docs/SELF_HOST_ONBOARDING_LOG.md`. Nasadí firestore pravidla a
+ * je popsán v `docs/cloudshell-tutorial.md` a `docs/COMPANION_CLI.md`. Nasadí firestore pravidla a
  * token-exchange funkci `authExchange` do firemního Firebase projektu (Blaze) a
  * nastaví dvě IAM role, bez kterých federace nefunguje:
  *   1) allUsers → roles/run.invoker na Cloud Run službě authexchange

@@ -66,6 +66,44 @@ nové verze funkcí.
 - `revokeShareLinkAndRotateToken` — callable funkce pro skutečnou revokaci
   veřejného share linku: označí Firestore záznam jako `revoked` a zároveň
   zrotuje Firebase Storage download token souboru.
+- `sendProjectInvite` — odeslání pozvánky e-mailem (SMTP/Resend).
+- **Přenos projektu (#291)** — `exportProjectBackup`, `prepareProjectBackupImport`,
+  `importProjectBackup`, `deleteProjectPermanently` (viz níže).
+
+## Přenos projektu mezi backendy (#291)
+
+Umožňuje předat celý projekt z jedné firemní Firebase instance do druhé
+(„založím u sebe → předám klientovi"). Vše běží přes **admin SDK** na obou
+stranách (Blaze) → **nevyžaduje žádnou změnu security rules** (rules se obcházejí).
+
+| Funkce | Co dělá |
+| --- | --- |
+| `exportProjectBackup({workspaceId, projectId})` | serializuje celý projekt (Firestore oba stromy `projects/{pid}` + `workspaces/{wid}/projects/{pid}` rekurzivně, referencovaný výřez firemního adresáře, Storage se sha256) do ZIP → signed URL (TTL 1 h) |
+| `prepareProjectBackupImport({workspaceId, fileName})` | v4 signed **write** URL pro nahrání zálohy do cíle (TTL 15 min) |
+| `importProjectBackup({workspaceId, objectPath\|sourceUrl, projectId?})` | rezervace ID → restore Storage (kontrola velikost+sha256) → commit Firestore → cleanup; rollback při chybě |
+| `deleteProjectPermanently({workspaceId, projectId, confirmation, backupObjectPath})` | hard-delete až po archivaci + ověřené záloze |
+
+**Model identity (Scénář A — plné členství, živé autorství):** federovaný
+`principal` je napříč backendy stabilní, takže import **zachová** `memberIds`,
+`roles`, mapu `companies` i všechna autorská pole (`createdBy`, klíče `approvals`,
+`reviewedBy`, …) a importujícího uživatele **jen přidá** jako `admin`. Doc IDs se
+zachovávají 1:1 (ploché joiny jako `documentVersions↔documentId`); cílové
+`projectId` je defaultně shodné se zdrojovým (dva oddělené Firestore).
+
+**Bezpečnost / co se NEpřenáší:**
+- `shareLinks` (bearer tokeny) a `notificationQueue` (přechodná fronta) se zahazují.
+- `verificationTargetUrl`/`verificationShareToken`/`qrOverlay*` a QR-`verified/` PDF
+  se strhnou/nepřenášejí — zapékají **zdrojový apiKey**; ověřovací QR dokumentů se
+  v cíli **musí přegenerovat** po schválení.
+- Autorizace: obě strany vyžadují owner/admin daného workspace (`requireWorkspaceAdmin`),
+  jen podepsané `storage.googleapis.com` URL; limity 750 MB / 200 MB soubor / 100k docs / 20k souborů.
+
+**Známá omezení (první cut):**
+- Rollback neúspěšného importu maže projektové stromy, **ne** merge-nuté firmy
+  (`companies` s merge+zachovanými IDs → re-import je idempotentní).
+- Nefederovaní (dev-uid) členové v cíli nedosednou — degradace na provenance je
+  zatím na re-invite, import je neodlišuje.
+- Přidává runtime deps `archiver` + `unzipper`.
 
 ## Konfigurace
 

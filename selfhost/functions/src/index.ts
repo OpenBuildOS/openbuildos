@@ -10,6 +10,14 @@ import type { Response } from "express";
 // Odesílání pozvánek e-mailem (samostatný modul, viz sendProjectInvite.ts).
 export { sendProjectInvite } from "./sendProjectInvite";
 
+// Přenos projektu mezi Firebase backendy (#291, viz projectTransfer.ts).
+export {
+  exportProjectBackup,
+  prepareProjectBackupImport,
+  importProjectBackup,
+  deleteProjectPermanently,
+} from "./projectTransfer";
+
 /**
  * Token-exchange Cloud Function `authExchange` pro OpenBuildOS federaci.
  *

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   collectReferencedCompanyIds,
+  isTransferableDocumentPath,
   remapPath,
   rewriteStrings,
   sanitizeImportedData,
@@ -59,8 +60,34 @@ test("remapPath přemapuje i workspace-level firemní adresář", () => {
     remapPath("workspaces/source-workspace/companies/c1", manifest, "target-workspace", "target-project"),
     "workspaces/target-workspace/companies/c1",
   );
-  // Cesta mimo zdrojový workspace zůstane beze změny.
-  assert.equal(remapPath("workspaces/other/companies/c1", manifest, "target-workspace", "target-project"), "workspaces/other/companies/c1");
+  // Cesta mimo povolený rozsah = throw (obrana do hloubky).
+  assert.throws(() => remapPath("workspaces/other/companies/c1", manifest, "target-workspace", "target-project"));
+  assert.throws(() => remapPath("projects/foreign-project/tasks/t", manifest, "target-workspace", "target-project"));
+});
+
+test("isTransferableDocumentPath povolí projekt+companies, odmítne cizí cesty", () => {
+  const sw = "source-workspace";
+  const sp = "source-project";
+  assert.ok(isTransferableDocumentPath("projects/source-project", sw, sp));
+  assert.ok(isTransferableDocumentPath("projects/source-project/task_audit/a", sw, sp));
+  assert.ok(isTransferableDocumentPath("workspaces/source-workspace/projects/source-project/tasks/t", sw, sp));
+  assert.ok(isTransferableDocumentPath("workspaces/source-workspace/companies/c1", sw, sp));
+  // odmítnout: cizí projekt, bare workspace doc, pozvánky, hlubší companies, cizí workspace
+  assert.ok(!isTransferableDocumentPath("projects/other", sw, sp));
+  assert.ok(!isTransferableDocumentPath("workspaces/source-workspace", sw, sp));
+  assert.ok(!isTransferableDocumentPath("workspaces/source-workspace/invites/x", sw, sp));
+  assert.ok(!isTransferableDocumentPath("workspaces/source-workspace/companies/c1/sub/y", sw, sp));
+  assert.ok(!isTransferableDocumentPath("workspaces/other/projects/source-project/tasks/t", sw, sp));
+  assert.ok(!isTransferableDocumentPath("projects/source-project/../evil", sw, sp));
+});
+
+test("validateManifest odmítne nepovolenou cestu dokumentu (workspace takeover)", () => {
+  assert.throws(() =>
+    validateManifest({ ...manifest, documents: [{ path: "workspaces/source-workspace", data: { ownerId: "attacker" } }] }),
+  );
+  assert.throws(() =>
+    validateManifest({ ...manifest, documents: [{ path: "projects/victim-project", data: { memberIds: ["attacker"] } }] }),
+  );
 });
 
 test("sanitizeImportedData přepíše skalární workspaceId/projectId a strhne verifikační pole", () => {

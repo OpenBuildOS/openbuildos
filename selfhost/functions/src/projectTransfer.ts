@@ -25,6 +25,15 @@ const MAX_BACKUP_BYTES = 750 * 1024 * 1024;
 const MAX_FILE_BYTES = 200 * 1024 * 1024;
 const MAX_DOCUMENTS = 100_000;
 const MAX_FILES = 20_000;
+// Strop na ROZBALENOU velikost položek v ZIPu (obrana proti zip-bombě před
+// `buffer()` do paměti). manifest.json nese serializovaný Firestore → velkorysý.
+const MAX_MANIFEST_BYTES = 256 * 1024 * 1024;
+
+function assertEntryNotBomb(entry: { uncompressedSize?: number; path?: string }, cap: number): void {
+  if (typeof entry.uncompressedSize === "number" && entry.uncompressedSize > cap) {
+    throw new HttpsError("resource-exhausted", `Položka zálohy ${entry.path ?? ""} je po rozbalení příliš velká.`);
+  }
+}
 
 type Encoded = null | boolean | number | string | Encoded[] | { [key: string]: Encoded };
 
@@ -60,6 +69,39 @@ function requireResourceId(value: string, label: string): string {
   return value;
 }
 
+/**
+ * Principal (OIDC subject) se používá jako segment ve Storage cestách. Subjekty
+ * jsou neprůhledné — odmítni `/`, `..`, `\` a prázdno, ať nemůže uniknout mimo
+ * svůj adresář (bez omezení znakové sady jako u requireResourceId).
+ */
+function assertSafePrincipalSegment(who: string): string {
+  if (!who || who.includes("/") || who.includes("\\") || who.includes("..")) {
+    throw new HttpsError("invalid-argument", "Neplatný identifikátor uživatele.");
+  }
+  return who;
+}
+
+/**
+ * Povolený rozsah cest dokumentů v záloze (v ZDROJOVÝCH souřadnicích). Import je
+ * nedůvěryhodný vstup (záloha od jiné instance) — bez tohoto allowlistu by
+ * vyrobená záloha mohla zapsat kamkoli (sourozenecký projekt, workspace doc,
+ * pozvánky = převzetí workspace). Povoleno: oba stromy projektu + PLOCHÉ
+ * `workspaces/{sw}/companies/{id}` (firemní adresář). Nic jiného.
+ */
+export function isTransferableDocumentPath(path: string, sourceWorkspaceId: string, sourceProjectId: string): boolean {
+  if (typeof path !== "string" || path.length === 0 || path.includes("..")) return false;
+  const topRoot = `projects/${sourceProjectId}`;
+  if (path === topRoot || path.startsWith(`${topRoot}/`)) return true;
+  const wsProject = `workspaces/${sourceWorkspaceId}/projects/${sourceProjectId}`;
+  if (path === wsProject || path.startsWith(`${wsProject}/`)) return true;
+  const companiesPrefix = `workspaces/${sourceWorkspaceId}/companies/`;
+  if (path.startsWith(companiesPrefix)) {
+    const rest = path.slice(companiesPrefix.length);
+    return rest.length > 0 && !rest.includes("/");
+  }
+  return false;
+}
+
 export function validateManifest(manifest: BackupManifest): void {
   if (
     manifest.format !== "openbuildos-project-backup" ||
@@ -76,6 +118,11 @@ export function validateManifest(manifest: BackupManifest): void {
   requireResourceId(manifest.sourceProjectId, "sourceProjectId");
   if (manifest.documents.length > MAX_DOCUMENTS || manifest.files.length > MAX_FILES) {
     throw new HttpsError("resource-exhausted", "Záloha překračuje podporovaný počet záznamů nebo souborů.");
+  }
+  for (const document of manifest.documents) {
+    if (!isTransferableDocumentPath(document?.path, manifest.sourceWorkspaceId, manifest.sourceProjectId)) {
+      throw new HttpsError("invalid-argument", `Záloha obsahuje nepovolenou cestu dokumentu: ${String(document?.path)}.`);
+    }
   }
   const prefix = `workspaces/${manifest.sourceWorkspaceId}/projects/${manifest.sourceProjectId}/`;
   let total = 0;
@@ -290,7 +337,9 @@ async function collectTree(path: string, output: BackupDocument[]): Promise<void
   const snapshot = await reference.get();
   if (snapshot.exists) output.push({ path, data: encode(snapshot.data() as DocumentData) });
   for (const child of await reference.listCollections()) {
-    for (const childDoc of (await child.get()).docs) await collectTree(childDoc.ref.path, output);
+    // listDocuments() vrací i „phantom" parent dokumenty (existují jen jako
+    // rodič subkolekce, .get() je nevrací) — jinak by jejich podstrom tiše zmizel.
+    for (const childRef of await child.listDocuments()) await collectTree(childRef.path, output);
   }
 }
 
@@ -369,7 +418,7 @@ export const exportProjectBackup = onCall<{ workspaceId?: string; projectId?: st
     const workspaceId = requireResourceId(request.data.workspaceId?.trim() ?? "", "workspaceId");
     const projectId = requireResourceId(request.data.projectId?.trim() ?? "", "projectId");
     if (!workspaceId || !projectId) throw new HttpsError("invalid-argument", "Chybí workspaceId nebo projectId.");
-    const who = principal(request.auth);
+    const who = assertSafePrincipalSegment(principal(request.auth));
     await requireWorkspaceAdmin(workspaceId, who);
     await requireProjectInWorkspace(workspaceId, projectId);
     const manifest = await buildManifest(workspaceId, projectId);
@@ -393,7 +442,7 @@ export const prepareProjectBackupImport = onCall<{ workspaceId?: string; fileNam
   async (request) => {
     if (!request.auth) throw new HttpsError("unauthenticated", "Chybí přihlášení.");
     const workspaceId = requireResourceId(request.data.workspaceId?.trim() ?? "", "workspaceId");
-    const who = principal(request.auth);
+    const who = assertSafePrincipalSegment(principal(request.auth));
     await requireWorkspaceAdmin(workspaceId, who);
     const safeName = (request.data.fileName || "project.obosbackup").replace(/[^a-zA-Z0-9._-]/g, "-");
     const objectPath = `workspaces/${workspaceId}/${IMPORT_PREFIX}/${who}/${randomUUID()}-${safeName}`;
@@ -421,12 +470,14 @@ export function remapPath(path: string, manifest: BackupManifest, workspaceId: s
   if (path === wsProject || path.startsWith(`${wsProject}/`)) {
     return `workspaces/${workspaceId}/projects/${projectId}${path.slice(wsProject.length)}`;
   }
-  // Workspace-level sourozenci (firemní adresář `workspaces/{wid}/companies/…`).
-  const wsRoot = `workspaces/${sw}/`;
-  if (path.startsWith(wsRoot)) {
-    return `workspaces/${workspaceId}/${path.slice(wsRoot.length)}`;
+  // Workspace-level sourozenci — POUZE firemní adresář `workspaces/{wid}/companies/…`.
+  const companiesRoot = `workspaces/${sw}/companies/`;
+  if (path.startsWith(companiesRoot)) {
+    return `workspaces/${workspaceId}/companies/${path.slice(companiesRoot.length)}`;
   }
-  return path;
+  // Cokoli mimo povolený rozsah = poškozený/nepřátelský manifest (obrana do
+  // hloubky; validateManifest to už odmítl dřív).
+  throw new HttpsError("invalid-argument", `Nepovolená cesta v záloze: ${path}.`);
 }
 
 export function rewriteStrings(value: unknown, manifest: BackupManifest, workspaceId: string, projectId: string, targetBucket: string): unknown {
@@ -505,7 +556,7 @@ async function commitDocuments(manifest: BackupManifest, workspaceId: string, pr
     for (const [path, data] of entries.slice(offset, offset + 400)) {
       // Firemní adresář zapisovat s merge (nepřepsat existující firmu v cíli se
       // stejným ID); zbytek je čistý přenos se zachovanými doc IDs.
-      if (path.includes("/companies/")) batch.set(db.doc(path), data, { merge: true });
+      if (/^workspaces\/[^/]+\/companies\/[^/]+$/.test(path)) batch.set(db.doc(path), data, { merge: true });
       else batch.set(db.doc(path), data);
     }
     await batch.commit();
@@ -518,6 +569,7 @@ async function restoreFiles(directory: unzipper.CentralDirectory, manifest: Back
   for (const item of manifest.files) {
     const entry = byEntry.get(item.entry);
     if (!entry) throw new HttpsError("invalid-argument", `V záloze chybí ${item.entry}.`);
+    assertEntryNotBomb(entry, MAX_FILE_BYTES);
     const content = await entry.buffer();
     if (content.byteLength !== item.size || createHash("sha256").update(content).digest("hex") !== item.sha256) throw new HttpsError("data-loss", `Velikost nebo kontrolní součet nesedí pro ${item.entry}.`);
     const relative = item.sourcePath.split(`/projects/${manifest.sourceProjectId}/`)[1];
@@ -536,7 +588,7 @@ export const importProjectBackup = onCall<{ workspaceId?: string; objectPath?: s
     const workspaceId = requireResourceId(request.data.workspaceId?.trim() ?? "", "workspaceId");
     const objectPath = request.data.objectPath?.trim() ?? "";
     const sourceUrl = request.data.sourceUrl?.trim() ?? "";
-    const who = principal(request.auth);
+    const who = assertSafePrincipalSegment(principal(request.auth));
     const validObjectPath = objectPath.startsWith(`workspaces/${workspaceId}/${IMPORT_PREFIX}/${who}/`);
     if (validObjectPath === Boolean(sourceUrl)) {
       throw new HttpsError("invalid-argument", "Zadejte právě jeden zdroj importu.");
@@ -557,6 +609,7 @@ export const importProjectBackup = onCall<{ workspaceId?: string; objectPath?: s
       const directory = await unzipper.Open.file(localPath);
       const manifestEntry = directory.files.find((entry) => entry.path === "manifest.json");
       if (!manifestEntry) throw new HttpsError("invalid-argument", "Soubor není OpenBuildOS záloha.");
+      assertEntryNotBomb(manifestEntry, MAX_MANIFEST_BYTES);
       const manifest = JSON.parse((await manifestEntry.buffer()).toString("utf8")) as BackupManifest;
       validateManifest(manifest);
       projectId = requireResourceId(request.data.projectId?.trim() || manifest.sourceProjectId, "projectId");
@@ -619,7 +672,7 @@ export const deleteProjectPermanently = onCall<{ workspaceId?: string; projectId
     if (!request.auth) throw new HttpsError("unauthenticated", "Chybí přihlášení.");
     const workspaceId = requireResourceId(request.data.workspaceId?.trim() ?? "", "workspaceId");
     const projectId = requireResourceId(request.data.projectId?.trim() ?? "", "projectId");
-    const who = principal(request.auth);
+    const who = assertSafePrincipalSegment(principal(request.auth));
     if (!workspaceId || !projectId || request.data.confirmation !== projectId) throw new HttpsError("invalid-argument", "Potvrzení neodpovídá ID projektu.");
     await requireWorkspaceAdmin(workspaceId, who);
     const projectData = await requireProjectInWorkspace(workspaceId, projectId);

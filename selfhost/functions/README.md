@@ -98,12 +98,34 @@ zachovávají 1:1 (ploché joiny jako `documentVersions↔documentId`); cílové
 - Autorizace: obě strany vyžadují owner/admin daného workspace (`requireWorkspaceAdmin`),
   jen podepsané `storage.googleapis.com` URL; limity 750 MB / 200 MB soubor / 100k docs / 20k souborů.
 
-**Známá omezení (první cut):**
+**Bezpečnost importu:** `importProjectBackup` bere nedůvěryhodný vstup (záloha od
+jiné instance). Cesty dokumentů v manifestu procházejí allowlistem
+(`isTransferableDocumentPath`) — povolené jsou jen oba stromy projektu a ploché
+`workspaces/{wid}/companies/{id}`; cokoli jiného manifest odmítne (jinak by
+vyrobená záloha mohla přepsat cizí projekt / workspace doc / pozvánky). ZIP má
+strop na rozbalenou velikost položek (`assertEntryNotBomb`), principal se validuje
+před použitím v cestě.
+
+**První nasazení (bbfs):** nasazují se JEN `exportProjectBackup` +
+`importProjectBackup` (přesně co wizard volá). `prepareProjectBackupImport`
+(upload-staging) a `deleteProjectPermanently` (destruktivní) se zatím NEnasazují —
+viz follow-up.
+
+**Známá omezení / follow-up (před nasazením prepare/delete):**
+- `prepareProjectBackupImport`: staging cesta `workspaces/{wid}/openbuildos-imports/**`
+  je dnes pokrytá generickým `storage.rules` (čitelná/zapisovatelná členy firmy) →
+  před nasazením přidat deny (jen funkce + signed URL). Wizard tuto funkci nepoužívá
+  (jede přímý přenos přes `sourceUrl`).
+- `deleteProjectPermanently`: gate „ověřená záloha" akceptuje i STAROU zálohu
+  (kontroluje jen existenci + metadata projektu, ne čerstvost/hashe) → před
+  nasazením svázat delete s konkrétní zálohou z téhož flow.
+- `verificationTargetUrl` je strženo; případný zbytkový `k=<apiKey>` v jiných polích
+  se negeneralizovaně nečistí (Firebase web apiKey je veřejný identifikátor).
 - Rollback neúspěšného importu maže projektové stromy, **ne** merge-nuté firmy
   (`companies` s merge+zachovanými IDs → re-import je idempotentní).
 - Nefederovaní (dev-uid) členové v cíli nedosednou — degradace na provenance je
   zatím na re-invite, import je neodlišuje.
-- Přidává runtime deps `archiver` + `unzipper`.
+- Exportované zálohy nemají TTL/lifecycle; `archiver` + `unzipper` jako runtime deps.
 
 ## Konfigurace
 

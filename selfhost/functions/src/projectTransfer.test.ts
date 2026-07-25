@@ -79,6 +79,8 @@ test("isTransferableDocumentPath povolí projekt+companies, odmítne cizí cesty
   assert.ok(!isTransferableDocumentPath("workspaces/source-workspace/companies/c1/sub/y", sw, sp));
   assert.ok(!isTransferableDocumentPath("workspaces/other/projects/source-project/tasks/t", sw, sp));
   assert.ok(!isTransferableDocumentPath("projects/source-project/../evil", sw, sp));
+  // Legitimní doc ID smí obsahovat `..` jako substring (ne jako segment).
+  assert.ok(isTransferableDocumentPath("workspaces/source-workspace/projects/source-project/documents/plan..v2", sw, sp));
 });
 
 test("validateManifest odmítne nepovolenou cestu dokumentu (workspace takeover)", () => {

@@ -89,7 +89,10 @@ function assertSafePrincipalSegment(who: string): string {
  * `workspaces/{sw}/companies/{id}` (firemní adresář). Nic jiného.
  */
 export function isTransferableDocumentPath(path: string, sourceWorkspaceId: string, sourceProjectId: string): boolean {
-  if (typeof path !== "string" || path.length === 0 || path.includes("..")) return false;
+  if (typeof path !== "string" || path.length === 0) return false;
+  // Odmítni traversal jen jako celý SEGMENT (`.`/`..`), ne jako substring —
+  // legitimní doc ID smí obsahovat `..` (např. `plan..v2`).
+  if (path.split("/").some((segment) => segment === "." || segment === "..")) return false;
   const topRoot = `projects/${sourceProjectId}`;
   if (path === topRoot || path.startsWith(`${topRoot}/`)) return true;
   const wsProject = `workspaces/${sourceWorkspaceId}/projects/${sourceProjectId}`;

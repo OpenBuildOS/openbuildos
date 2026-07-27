@@ -258,12 +258,25 @@ service cloud.firestore {
                  .data.get('canPublishOfficial', false) == true);
     }
 
-    // Anti-spoof atribuce firmě u oficiálních dokumentů: `ownerCompanyId` na
-    // create smí být buď prázdný (bez atribuce), nebo VLASTNÍ firma volajícího
-    // (nelze přiřknout dokument cizí firmě). Čte se z `projects/{pid}.companies`.
-    function validOfficialOwnerCompany(pid) {
+    // Anti-spoof atribuce firmě u oficiálních dokumentů: `ownerCompanyId` na create
+    // smí být buď prázdný (bez atribuce), VLASTNÍ firma volajícího, NEBO cokoli,
+    // pokud je volající editor/admin (canEditContent) — ten je důvěryhodný správce
+    // obsahu a legitimně přeřazuje/publikuje napříč firmami (např. rozdělení chybně
+    // spárovaného dokumentu). Omezení „jen vlastní firma" tak reálně drží pro
+    // ne-editor publishera s flagem canPublishOfficial. Čte z `projects/{pid}.companies`.
+    function validOfficialOwnerCompany(wid, pid) {
       return request.resource.data.get('ownerCompanyId', '') == ''
-        || request.resource.data.get('ownerCompanyId', '') == memberCompany(pid, principal());
+        || request.resource.data.get('ownerCompanyId', '') == memberCompany(pid, principal())
+        || canEditContent(wid, pid);
+    }
+
+    // Autor obsahu na create nesmí být podvržený: `createdBy` je prázdný nebo přímo
+    // volající (principal), nikdy někdo jiný. Zrcadlí invariant `canCreateContent`,
+    // který jsme u oficiálních dokumentů/verzí nahradili gate `canPublishOfficial`
+    // — bez tohohle by publisher mohl podvrhnout autorství (a získat edit-own).
+    function authorNotSpoofedOnCreate() {
+      return request.resource.data.get('createdBy', '') == ''
+        || request.resource.data.get('createdBy', '') == principal();
     }
 
     // ---------------------------------------------------------------------
@@ -730,8 +743,11 @@ service cloud.firestore {
     match /workspaces/{wid}/projects/{pid}/documents/{docId} {
       allow read: if isProjectMember(wid, pid);
       // Do OFICIÁLNÍ dokumentace smí zakládat jen určení lidé (canPublishOfficial),
-      // ne každý člen. Atribuce firmě jen na vlastní firmu (anti-spoof).
-      allow create: if canPublishOfficial(wid, pid) && validOfficialOwnerCompany(pid);
+      // ne každý člen. Atribuce firmě jen na vlastní firmu (anti-spoof) a autor
+      // nesmí být podvržený.
+      allow create: if canPublishOfficial(wid, pid)
+        && validOfficialOwnerCompany(wid, pid)
+        && authorNotSpoofedOnCreate();
       // Author immutable. Editovat smí běžná práva k obsahu; schvalovatel nebo
       // publikující navíc smí jako vedlejší efekt upload/approve transakce
       // přepnout jen platnou revizi (currentVersionId/updatedAt) — i když není
@@ -748,7 +764,9 @@ service cloud.firestore {
     match /workspaces/{wid}/projects/{pid}/documentVersions/{docId} {
       allow read: if isProjectMember(wid, pid);
       // Nahrát verzi do oficiální dokumentace smí jen určení lidé (viz documents).
-      allow create: if canPublishOfficial(wid, pid) && validOfficialOwnerCompany(pid);
+      allow create: if canPublishOfficial(wid, pid)
+        && validOfficialOwnerCompany(wid, pid)
+        && authorNotSpoofedOnCreate();
       // Schvalovatel (isApprover) smí verzi aktualizovat plně — zapsat svoje
       // rozhodnutí do `approvals` mapy, odvozený status i supersede (i když u
       // policy „all" status zatím zůstává under_review). Ostatní (uploader/

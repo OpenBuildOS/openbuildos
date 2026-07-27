@@ -245,6 +245,40 @@ service cloud.firestore {
                  .data.get('canApprove', false) == true);
     }
 
+    // Member allowed to PUBLISH into official documentation (upload new
+    // documents/revisions + „Nahrát do oficiální dokumentace" promote from an
+    // internal company folder). Editor/admin (a workspace admin) publish
+    // implicitly; others need the explicit `canPublishOfficial == true` flag on
+    // their member doc. „Jen určení lidé" — plain viewer members can no longer
+    // create official documents/versions.
+    function canPublishOfficial(wid, pid) {
+      return isProjectMember(wid, pid)
+        && (canEditContent(wid, pid)
+            || get(/databases/$(database)/documents/workspaces/$(wid)/projects/$(pid)/members/$(principal()))
+                 .data.get('canPublishOfficial', false) == true);
+    }
+
+    // Anti-spoof atribuce firmě u oficiálních dokumentů: `ownerCompanyId` na create
+    // smí být buď prázdný (bez atribuce), VLASTNÍ firma volajícího, NEBO cokoli,
+    // pokud je volající editor/admin (canEditContent) — ten je důvěryhodný správce
+    // obsahu a legitimně přeřazuje/publikuje napříč firmami (např. rozdělení chybně
+    // spárovaného dokumentu). Omezení „jen vlastní firma" tak reálně drží pro
+    // ne-editor publishera s flagem canPublishOfficial. Čte z `projects/{pid}.companies`.
+    function validOfficialOwnerCompany(wid, pid) {
+      return request.resource.data.get('ownerCompanyId', '') == ''
+        || request.resource.data.get('ownerCompanyId', '') == memberCompany(pid, principal())
+        || canEditContent(wid, pid);
+    }
+
+    // Autor obsahu na create nesmí být podvržený: `createdBy` je prázdný nebo přímo
+    // volající (principal), nikdy někdo jiný. Zrcadlí invariant `canCreateContent`,
+    // který jsme u oficiálních dokumentů/verzí nahradili gate `canPublishOfficial`
+    // — bez tohohle by publisher mohl podvrhnout autorství (a získat edit-own).
+    function authorNotSpoofedOnCreate() {
+      return request.resource.data.get('createdBy', '') == ''
+        || request.resource.data.get('createdBy', '') == principal();
+    }
+
     // ---------------------------------------------------------------------
     // Workspaces
     // ---------------------------------------------------------------------
@@ -708,14 +742,20 @@ service cloud.firestore {
 
     match /workspaces/{wid}/projects/{pid}/documents/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create: if canCreateContent(wid, pid);
-      // Author immutable. Editovat smí běžná práva k obsahu; schvalovatel navíc
-      // smí jako vedlejší efekt approve transakce přepnout jen platnou revizi
-      // (currentVersionId/updatedAt) — i když není editor/autor dokumentu (WP1).
+      // Do OFICIÁLNÍ dokumentace smí zakládat jen určení lidé (canPublishOfficial),
+      // ne každý člen. Atribuce firmě jen na vlastní firmu (anti-spoof) a autor
+      // nesmí být podvržený.
+      allow create: if canPublishOfficial(wid, pid)
+        && validOfficialOwnerCompany(wid, pid)
+        && authorNotSpoofedOnCreate();
+      // Author immutable. Editovat smí běžná práva k obsahu; schvalovatel nebo
+      // publikující navíc smí jako vedlejší efekt upload/approve transakce
+      // přepnout jen platnou revizi (currentVersionId/updatedAt) — i když není
+      // editor/autor dokumentu (WP1 / nová revize od publikujícího).
       allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
         && (
           canModifyContent(wid, pid)
-          || (isApprover(wid, pid)
+          || ((isApprover(wid, pid) || canPublishOfficial(wid, pid))
               && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['currentVersionId', 'updatedAt']))
         );
       allow delete: if canModifyContent(wid, pid);
@@ -723,7 +763,10 @@ service cloud.firestore {
 
     match /workspaces/{wid}/projects/{pid}/documentVersions/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create: if canCreateContent(wid, pid);
+      // Nahrát verzi do oficiální dokumentace smí jen určení lidé (viz documents).
+      allow create: if canPublishOfficial(wid, pid)
+        && validOfficialOwnerCompany(wid, pid)
+        && authorNotSpoofedOnCreate();
       // Schvalovatel (isApprover) smí verzi aktualizovat plně — zapsat svoje
       // rozhodnutí do `approvals` mapy, odvozený status i supersede (i když u
       // policy „all" status zatím zůstává under_review). Ostatní (uploader/
@@ -922,8 +965,13 @@ service cloud.firestore {
       // ten musí ošetřit konzument tokenu na FE (re-derivace z config/public +
       // potvrzení cíle uživatelem), případně přesun zápisu do Cloud Function.
       allow create: if isRealUser()
+        // POZOR: 'token' tu MUSÍ být. Klient ho zapisuje i do dat (nejen jako
+        // doc id) — bez něj hasOnly zápis odmítne a pozvánka se do centrálního
+        // registru vůbec nedostane. Přesně to se stalo po #396: publikace tiše
+        // padala na permission-denied, takže adresát pozvánku nikdy neuviděl
+        // v Hubu a nešlo ji ani odeslat e-mailem.
         && request.resource.data.diff({}).affectedKeys().hasOnly([
-             'workspaceId', 'workspaceName', 'apiKey', 'authExchangeUrl',
+             'token', 'workspaceId', 'workspaceName', 'apiKey', 'authExchangeUrl',
              'projectId', 'projectName', 'role', 'inviteeEmail',
              'inviterName', 'inviterEmail', 'status', 'createdAt', 'expiresAt'
            ])

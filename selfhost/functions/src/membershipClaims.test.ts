@@ -4,6 +4,7 @@ import {
   CLAIMS_BYTE_LIMIT,
   ClaimsTooLargeError,
   assertClaimsFit,
+  belongsToWorkspace,
   buildMembershipClaims,
   claimsByteSize,
   type MembershipInput,
@@ -12,8 +13,6 @@ import {
 const base: MembershipInput = {
   principal: "u1",
   adminWorkspaces: [],
-  memberWorkspaceIds: [],
-  excludedProjectIds: [],
   projects: [],
 };
 
@@ -27,20 +26,9 @@ test("vlastník a admin firmy dostanou wsa", () => {
     ],
   });
   assert.deepEqual(claims.wsa, ["W1", "W2"]);
-  assert.equal(claims.ws, undefined);
 });
 
-test("zaměstnanec firmy dostane ws, admin se nezdvojuje", () => {
-  const claims = buildMembershipClaims({
-    ...base,
-    adminWorkspaces: [{ id: "W1", ownerId: "u1", adminIds: [] }],
-    memberWorkspaceIds: ["W1", "W2"],
-  });
-  assert.deepEqual(claims.wsa, ["W1"]);
-  assert.deepEqual(claims.ws, ["W2"]);
-});
-
-test("host dostane per-projekt claim podle role", () => {
+test("člen projektu dostane claim podle role", () => {
   const claims = buildMembershipClaims({
     ...base,
     projects: [
@@ -53,10 +41,9 @@ test("host dostane per-projekt claim podle role", () => {
   assert.deepEqual(claims.pw, ["W9/P2", "W9/P3"]);
   // company_lead smí zakládat, ale ne mazat cizí binárky → čtecí claim.
   assert.deepEqual(claims.p, ["W9/P1", "W9/P4"]);
-  assert.equal(claims.ws, undefined);
 });
 
-test("hostovský claim nese i workspace, ať neautorizuje cizí prefix", () => {
+test("claim nese i workspace, ať neautorizuje cizí prefix", () => {
   const claims = buildMembershipClaims({
     ...base,
     projects: [{ id: "P1", workspaceId: "W1", roles: { u1: "editor" } }],
@@ -65,37 +52,53 @@ test("hostovský claim nese i workspace, ať neautorizuje cizí prefix", () => {
   assert.ok(!claims.pw?.includes("P1"), "holý pid by pustil workspaces/CIZI/projects/P1/…");
 });
 
-test("projekty pokryté workspacem se do claims nepíšou (šetří bajty)", () => {
+test("projekty pokryté adminstvím firmy se do claims nepíšou (šetří bajty)", () => {
   const claims = buildMembershipClaims({
     ...base,
-    memberWorkspaceIds: ["W1"],
+    adminWorkspaces: [{ id: "W1", ownerId: "u1", adminIds: [] }],
     projects: [
       { id: "P1", workspaceId: "W1", roles: { u1: "viewer" } },
       { id: "P2", workspaceId: "W2", roles: { u1: "viewer" } },
     ],
   });
-  assert.deepEqual(claims.ws, ["W1"]);
+  assert.deepEqual(claims.wsa, ["W1"]);
   assert.deepEqual(claims.p, ["W2/P2"]);
 });
 
-test("vyloučený projekt firmy jde do px", () => {
+// 🔴 REGRESE. Adresářový záznam `workspaces/{wid}/members/{principal}` zakládá
+// `redeemInvite` KAŽDÉMU pozvanému včetně hosta z cizí firmy. Kdyby z něj plynul
+// workspace-level claim, TDI pozvaný na jednu stavbu by dostal všech osm.
+// Vstup výpočtu proto o firemním adresáři vůbec neví — a vědět nesmí.
+test("členství se odvozuje JEN z projektů a adminství, ne z firemního adresáře", () => {
   const claims = buildMembershipClaims({
     ...base,
-    memberWorkspaceIds: ["W1"],
-    excludedProjectIds: ["P9"],
-    projects: [{ id: "P1", workspaceId: "W1", roles: { u1: "editor" } }],
+    projects: [{ id: "P1", workspaceId: "W1", roles: { u1: "viewer" } }],
   });
-  assert.deepEqual(claims.px, ["P9"]);
+  // Pořadí záleží: `assert.deepEqual` je assertion funkce a typ tu zúží.
+  assert.equal(claims.wsa, undefined, "host nesmí dostat workspace-level claim");
+  assert.deepEqual(claims, { p: ["W1/P1"] });
+
+  // MembershipInput nemá kam adresářový záznam předat — to je záměr, ne opomenutí.
+  assert.deepEqual(Object.keys(base).sort(), ["adminWorkspaces", "principal", "projects"]);
 });
 
-test("výjimka neplatí, když je člen přesto v memberIds (Storage nesmí být přísnější než Firestore)", () => {
-  const claims = buildMembershipClaims({
+// 🔴 REGRESE. Dokud přístup plynul z workspace, odebraný člen ztratil Firestore
+// okamžitě a Storage nikdy. Claims teď zrcadlí `memberIds`, takže odebrání platí.
+test("odebrání z projektu vezme claim (claims zrcadlí memberIds)", () => {
+  const before = buildMembershipClaims({
     ...base,
-    memberWorkspaceIds: ["W1"],
-    excludedProjectIds: ["P1"],
+    projects: [
+      { id: "P1", workspaceId: "W1", roles: { u1: "editor" } },
+      { id: "P2", workspaceId: "W1", roles: { u1: "editor" } },
+    ],
+  });
+  assert.deepEqual(before.pw, ["W1/P1", "W1/P2"]);
+
+  const after = buildMembershipClaims({
+    ...base,
     projects: [{ id: "P1", workspaceId: "W1", roles: { u1: "editor" } }],
   });
-  assert.equal(claims.px, undefined);
+  assert.deepEqual(after.pw, ["W1/P1"]);
 });
 
 test("neznámá role spadne do čtecího claimu, ne do zápisového", () => {
@@ -114,10 +117,23 @@ test("prázdné členství = prázdné claims (uživatel se nikam nedostane)", (
   assert.deepEqual(buildMembershipClaims(base), {});
 });
 
+test("belongsToWorkspace pozná vlastní workspace a odmítne cizí", () => {
+  const claims = buildMembershipClaims({
+    ...base,
+    projects: [{ id: "P1", workspaceId: "W1", roles: { u1: "editor" } }],
+  });
+  assert.equal(belongsToWorkspace(claims, "W1"), true);
+  assert.equal(belongsToWorkspace(claims, "W2"), false);
+  // Prefix se nesmí splést s jiným workspacem, který jím začíná.
+  assert.equal(belongsToWorkspace(claims, "W"), false);
+  assert.equal(belongsToWorkspace({ wsa: ["W5"] }, "W5"), true);
+  assert.equal(belongsToWorkspace({}, "W1"), false);
+});
+
 test("claims v mezích projdou", () => {
   const claims = buildMembershipClaims({
     ...base,
-    memberWorkspaceIds: ["workspace-with-a-fairly-long-id"],
+    adminWorkspaces: [{ id: "workspace-with-a-fairly-long-id", ownerId: "u1", adminIds: [] }],
   });
   assert.doesNotThrow(() => assertClaimsFit({ ...claims, email: "a@b.cz", name: "Jan Novák" }));
 });
@@ -142,7 +158,6 @@ test("přetečení je TVRDÁ chyba se srozumitelnou hláškou, ne tiché uřízn
   const error = thrown as ClaimsTooLargeError;
   assert.ok(error.bytes > error.limit);
   assert.match(error.message, /60 projektů/);
-  assert.match(error.message, /člena firmy/);
   // Seznam zůstal celý — nic se tiše neuřízlo.
   assert.equal(claims.p?.length, 60);
 });

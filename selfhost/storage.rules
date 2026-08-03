@@ -17,14 +17,21 @@ rules_version = '2';
 // `selfhost/functions/src/membershipClaims.ts`) spočítá členství z Firestore
 // a orazí ho do custom claims:
 //
-//   wsa: [wid, …]  vlastník / admin firmy      → celý workspace, plná práva
-//   ws:  [wid, …]  zaměstnanec firmy           → celý workspace, plná práva
-//   px:  [pid, …]  výjimka z `ws` (excludedProjectIds) — projekty firmy, do
-//                  kterých zaměstnanec NESMÍ (drží Storage v souladu s tím, co
-//                  říká Firestore `memberIds`)
-//   pw:  ["{wid}/{pid}", …]  host s rolí editor/admin → plná práva na projekt
-//   p:   ["{wid}/{pid}", …]  host s rolí viewer / company_lead
-//                            → čtení + ZALOŽENÍ nového objektu
+//   wsa: [wid, …]           vlastník / admin firmy → všechny projekty té firmy
+//   pw:  ["{wid}/{pid}", …] role editor / admin na projektu → plná práva
+//   p:   ["{wid}/{pid}", …] ostatní členství (viewer, company_lead)
+//                           → čtení + ZALOŽENÍ nového objektu
+//
+// ⭐ Claims zrcadlí `isProjectMember` z firestore.rules jedna ku jedné:
+//     principal in projects/{pid}.memberIds || isWsAdmin(wid)
+// Proto má `wsa` nevázané `pid` (admin firmy má i ve Firestore celý workspace),
+// kdežto `p`/`pw` nesou konkrétní dvojici. Jakákoli odchylka od téhle symetrie
+// je díra na jednu nebo druhou stranu.
+//
+// 🔴 Claim „zaměstnanec firmy" (`ws`) tu ZÁMĚRNĚ NENÍ. Odvozoval by se z
+// existence `workspaces/{wid}/members/{principal}`, jenže ten dokument zakládá
+// `redeemInvite` i HOSTOVI z cizí firmy. Host pozvaný na jednu stavbu by tak
+// dostal všechny stavby té firmy. Podrobně v membershipClaims.ts.
 //
 // Role `viewer` smí obsah VYTVÁŘET (viz `ProjectRole` v src/types/workspace.ts),
 // takže musí umět nahrát fotku. Nesmí ale přepsat ani smazat cizí soubor —
@@ -50,37 +57,32 @@ service firebase.storage {
       return request.auth.token.get(name, []);
     }
 
-    // Zaměstnanec / admin firmy: celý workspace, kromě výslovných výjimek.
-    function inWorkspace(wid) {
-      return wid in claim('ws') || wid in claim('wsa');
+    // Vlastník / admin firmy — protějšek `isWsAdmin` z firestore.rules, který
+    // taky platí na celý workspace bez ohledu na `pid`.
+    function isWorkspaceAdmin(wid) {
+      return wid in claim('wsa');
     }
 
-    // `excludedProjectIds` na firemním member docu — Firestore takového člena
-    // do `memberIds` nedá, takže by neměl mít ani soubory.
-    function workspaceGrant(wid, pid) {
-      return inWorkspace(wid) && !(pid in claim('px'));
-    }
-
-    // Hostovské claims jsou ve tvaru `"{wid}/{pid}"`. Cestu si volí volající,
+    // Členské claims jsou ve tvaru `"{wid}/{pid}"`. Cestu si volí volající,
     // takže holé `pid` by autorizovalo i `workspaces/CIZI-FIRMA/projects/MUJ-
     // PROJEKT/…` — psaní pod cizí prefix. Workspace musí sedět taky.
     function projectKey(wid, pid) {
       return wid + '/' + pid;
     }
 
-    // Host s právem zápisu (editor / admin na projektu).
+    // Člen projektu s právem zápisu (editor / admin).
     function projectWriteGrant(wid, pid) {
       return projectKey(wid, pid) in claim('pw');
     }
 
-    // Host s právem čtení (viewer / company_lead na projektu).
+    // Člen projektu bez práva mazat (viewer / company_lead).
     function projectReadGrant(wid, pid) {
       return projectKey(wid, pid) in claim('p');
     }
 
     function canReadProject(wid, pid) {
       return isRealUser()
-        && (workspaceGrant(wid, pid)
+        && (isWorkspaceAdmin(wid)
             || projectWriteGrant(wid, pid)
             || projectReadGrant(wid, pid));
     }
@@ -89,7 +91,7 @@ service firebase.storage {
     // spadne do `canReadProject`, ale sem ne — svou fotku nahraje, cizí nesmaže.
     function canOverwriteProject(wid, pid) {
       return isRealUser()
-        && (workspaceGrant(wid, pid) || projectWriteGrant(wid, pid));
+        && (isWorkspaceAdmin(wid) || projectWriteGrant(wid, pid));
     }
 
     function withinSizeLimit() {
@@ -124,17 +126,19 @@ service firebase.storage {
         );
     }
 
-    // Připojovací probe a případné neprojektové objekty workspace. Host
-    // (claim `p`/`pw`) sem nesmí — nemá jak prokázat příslušnost k workspace.
+    // Připojovací probe a případné neprojektové objekty workspace. Jen
+    // vlastník/admin firmy — nikdo jiný nemá jak prokázat příslušnost
+    // k workspace jako celku. Probe (`__preflight__`) běží ve StorageSettings,
+    // což je stejně obrazovka vlastníka.
     match /workspaces/{wid}/{objectName} {
-      allow read: if isRealUser() && inWorkspace(wid);
-      allow write: if isRealUser() && inWorkspace(wid) && withinSizeLimit();
+      allow read: if isRealUser() && isWorkspaceAdmin(wid);
+      allow write: if isRealUser() && isWorkspaceAdmin(wid) && withinSizeLimit();
     }
     match /workspaces/{wid}/{category}/{rest=**} {
-      allow read: if category != 'projects' && isRealUser() && inWorkspace(wid);
+      allow read: if category != 'projects' && isRealUser() && isWorkspaceAdmin(wid);
       allow write: if category != 'projects'
         && isRealUser()
-        && inWorkspace(wid)
+        && isWorkspaceAdmin(wid)
         && withinSizeLimit();
     }
 

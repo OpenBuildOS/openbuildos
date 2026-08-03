@@ -7,22 +7,41 @@ import type { Firestore } from "firebase-admin/firestore";
  * autorizace musí přijet v TOKENU. Tenhle modul spočítá z Firestore, kam
  * uživatel patří, a složí z toho claims:
  *
- *   wsa  vlastník / admin firmy      → celý workspace, plná práva
- *   ws   zaměstnanec firmy           → celý workspace, plná práva
- *   px   projekty firmy, ze kterých je zaměstnanec VYLOUČEN (excludedProjectIds)
- *   pw   host s rolí editor/admin    → plná práva na konkrétní projekt
- *   p    ostatní hosté (viewer, company_lead) → čtení + založení nového objektu
+ *   wsa  vlastník / admin firmy   → všechny projekty té firmy
+ *   pw   role editor / admin na projektu → plná práva na ten projekt
+ *   p    ostatní členství (viewer, company_lead) → čtení + založení objektu
+ *
+ * ⭐ Claims ZÁMĚRNĚ zrcadlí `isProjectMember` z firestore.rules jedna ku jedné:
+ *
+ *     isProjectMember(wid, pid) = principal in projects/{pid}.memberIds
+ *                              || isWsAdmin(wid)
+ *
+ * Nic víc, nic míň. Kdykoli se claims od tohohle vzorce odchýlí, vznikne
+ * asymetrie mezi Firestore a Storage — a ta je vždycky díra na jednu nebo
+ * druhou stranu.
  *
  * ⚠️ Položky `p`/`pw` jsou ve tvaru `"{wid}/{pid}"`, ne holé `pid`. Cestu ve
- * Storage si volí volající, takže holý `pid` by autorizoval `workspaces/CIZI-
- * FIRMA/projects/MUJ-PROJEKT/…` — útočník by sice nečetl cizí data, ale mohl by
- * psát pod cizí prefix. `px` naopak jen ODEBÍRÁ a vyhodnocuje se až uvnitř
- * známého `wid`, takže holé `pid` tam stačí.
+ * Storage si volí volající, takže holý `pid` by autorizoval
+ * `workspaces/CIZI-FIRMA/projects/MUJ-PROJEKT/…` — psaní pod cizí prefix.
  *
- * Proč `company_lead` spadá do `p` a ne do `pw`: ve Firestore smí mazat obsah
- * SVÉ firmy, ale Storage rules o firmách nic nevědí — `pw` by mu dovolilo
- * smazat i cizí binárku. Vytvořit nový objekt smí (nová revize = nová cesta),
- * takže reálný dopad je nanejvýš osiřelá binárka, ne ztráta cizích dat.
+ * 🔴 PROČ TU NENÍ CLAIM „ZAMĚSTNANEC FIRMY" (`ws`)
+ *
+ * Návrh počítal s `ws: [wid]` pro zaměstnance, odvozeným z existence dokumentu
+ * `workspaces/{wid}/members/{principal}`. **Nejde to.** Ten dokument zakládá
+ * `redeemInvite` KAŽDÉMU pozvanému — včetně hosta z cizí firmy (TDI, investor,
+ * subdodavatel) — a zapisuje mu `workspaceRole: "member"`. Nic v něm hosta od
+ * zaměstnance neodliší.
+ *
+ * Odvozovat z něj přístup by znamenalo, že TDI pozvaný na JEDNU stavbu dostane
+ * read/write/delete na VŠECH osm staveb generálního dodavatele — přesně scénář,
+ * kvůli kterému návrh workspace-level claims zamítl. A nebylo by to okno
+ * zastaralosti, ale trvalý, správně spočítaný claim.
+ *
+ * Zaměstnanec proto claims dostává per projekt, stejně jako host. Je to přesné
+ * a fail-closed; cenou je velikost tokenu, kterou hlídá `assertClaimsFit`
+ * tvrdou chybou. Kdyby měl `ws` někdy vzniknout, musí mu předcházet EXPLICITNÍ
+ * a nefalšovatelný příznak zaměstnaneckého vztahu — ne pouhá existence
+ * adresářového záznamu.
  */
 
 /** Tvrdý limit Firebase na developer claims v tokenu. */
@@ -54,10 +73,6 @@ export interface MembershipInput {
   principal: string;
   /** Workspacy, kde je principal owner nebo v adminIds. */
   adminWorkspaces: WorkspaceFacts[];
-  /** Workspacy s firemním member docem `workspaces/{wid}/members/{principal}`. */
-  memberWorkspaceIds: string[];
-  /** Sjednocení `excludedProjectIds` z těch firemních member doců. */
-  excludedProjectIds: string[];
   /** Projekty, kde je principal v `memberIds`. */
   projects: ProjectFacts[];
 }
@@ -66,8 +81,6 @@ export interface MembershipInput {
 // `Record<string, unknown>`, což potřebuje payload tokenu (claims + email/name).
 export type MembershipClaims = {
   wsa?: string[];
-  ws?: string[];
-  px?: string[];
   pw?: string[];
   p?: string[];
 };
@@ -93,6 +106,8 @@ function sortedUnique(values: Iterable<string>): string[] {
 
 /**
  * Čistá část výpočtu — bez Firestore, ať jde otestovat unit testem.
+ * Tuhle funkci používají i rules testy (`tests/rules/helpers.ts`), aby fixtura
+ * nemohla „opravit" to, co produkční kód počítá jinak.
  */
 export function buildMembershipClaims(input: MembershipInput): MembershipClaims {
   const { principal } = input;
@@ -107,32 +122,11 @@ export function buildMembershipClaims(input: MembershipInput): MembershipClaims 
     }
   }
 
-  // `ws` je doplněk k `wsa` — admin už má všechno, není důvod platit bajty dvakrát.
-  const ws = new Set<string>();
-  for (const wid of input.memberWorkspaceIds) {
-    if (wid && !wsa.has(wid)) {
-      ws.add(wid);
-    }
-  }
-
-  const workspaceWide = new Set<string>([...wsa, ...ws]);
-  const memberProjectIds = new Set(input.projects.map((project) => project.id));
-
-  // Vyloučené projekty ubírají z `ws`/`wsa`. Kdyby admin projektu člena do
-  // `memberIds` přesto přidal, Firestore ho pustí — pak výjimku neuplatňujeme,
-  // ať se Storage nechová PŘÍSNĚJI než živá autorita.
-  const px = new Set<string>();
-  for (const pid of input.excludedProjectIds) {
-    if (pid && !memberProjectIds.has(pid)) {
-      px.add(pid);
-    }
-  }
-
   const pw = new Set<string>();
   const p = new Set<string>();
   for (const project of input.projects) {
-    if (workspaceWide.has(project.workspaceId)) {
-      // Pokrytí přes workspace — per-projektový claim by byl jen bajty navíc.
+    if (wsa.has(project.workspaceId)) {
+      // Admin firmy má celý workspace — per-projektový claim by byl jen bajty navíc.
       continue;
     }
     const role = project.roles?.[principal] ?? "";
@@ -146,8 +140,6 @@ export function buildMembershipClaims(input: MembershipInput): MembershipClaims 
 
   const claims: MembershipClaims = {};
   if (wsa.size) claims.wsa = sortedUnique(wsa);
-  if (ws.size) claims.ws = sortedUnique(ws);
-  if (px.size) claims.px = sortedUnique(px);
   if (pw.size) claims.pw = sortedUnique(pw);
   if (p.size) claims.p = sortedUnique(p);
   return claims;
@@ -174,9 +166,9 @@ export function assertClaimsFit(
   const projectCount = (claims.p?.length ?? 0) + (claims.pw?.length ?? 0);
   throw new ClaimsTooLargeError(
     `Seznam přístupů se nevejde do přihlašovacího tokenu (${bytes} B, limit ${limit} B; `
-      + `${projectCount} projektů jako host). Firebase dovoluje nejvýš ${CLAIMS_BYTE_LIMIT} B. `
-      + "Řešení: udělejte z uživatele člena firmy (workspaces/{wid}/members) místo hosta "
-      + "na jednotlivých projektech — členovi firmy stačí jediná položka na celý workspace.",
+      + `${projectCount} projektů). Firebase dovoluje nejvýš ${CLAIMS_BYTE_LIMIT} B. `
+      + "Řešení: rozdělit práci na míň projektů, nebo z uživatele udělat admina "
+      + "firmy (ten má jedinou položku na celý workspace).",
     bytes,
     limit
   );
@@ -186,6 +178,9 @@ export function assertClaimsFit(
  * Načte podklady z Firestore. Dotazy jsou indexované (`ownerId ==`,
  * `adminIds array-contains`, `memberIds array-contains`), takže cena neroste
  * s velikostí tenantu, jen s počtem míst, kam uživatel opravdu patří.
+ *
+ * `workspaces/{wid}/members/{principal}` se ZÁMĚRNĚ nečte — viz komentář
+ * v hlavičce modulu (zakládá ho i host, takže nic nedokazuje).
  */
 export async function loadMembershipInput(
   db: Firestore,
@@ -207,7 +202,6 @@ export async function loadMembershipInput(
   }
 
   const projects: ProjectFacts[] = [];
-  const candidateWorkspaceIds = new Set<string>(adminWorkspaces.keys());
   for (const doc of projectSnap.docs) {
     const workspaceId = doc.get("workspaceId");
     if (typeof workspaceId !== "string" || !workspaceId) {
@@ -218,52 +212,27 @@ export async function loadMembershipInput(
       workspaceId,
       roles: (doc.get("roles") as Record<string, string> | undefined) ?? {},
     });
-    candidateWorkspaceIds.add(workspaceId);
   }
 
-  // Firemní příslušnost se ověřuje jen u workspaců, které přicházejí v úvahu —
-  // tedy tam, kde je uživatel admin nebo má aspoň jeden projekt. Zaměstnanec
-  // úplně bez projektů žádné soubory nemá, takže mu claim nechybí.
-  const memberWorkspaceIds: string[] = [];
-  const excludedProjectIds: string[] = [];
-  const candidates = Array.from(candidateWorkspaceIds);
-  if (candidates.length > 0) {
-    const memberDocs = await db.getAll(
-      ...candidates.map((wid) => db.doc(`workspaces/${wid}/members/${principal}`))
-    );
-    for (const doc of memberDocs) {
-      if (!doc.exists) {
-        continue;
-      }
-      const wid = doc.ref.parent.parent?.id;
-      if (!wid) {
-        continue;
-      }
-      memberWorkspaceIds.push(wid);
-      const excluded = doc.get("excludedProjectIds");
-      if (Array.isArray(excluded)) {
-        for (const pid of excluded) {
-          if (typeof pid === "string" && pid) {
-            excludedProjectIds.push(pid);
-          }
-        }
-      }
-    }
-  }
-
-  return {
-    principal,
-    adminWorkspaces: Array.from(adminWorkspaces.values()),
-    memberWorkspaceIds,
-    excludedProjectIds,
-    projects,
-  };
+  return { principal, adminWorkspaces: Array.from(adminWorkspaces.values()), projects };
 }
 
-/** Načte podklady a složí claims. Vyhodí `ClaimsTooLargeError`, když se nevejdou. */
+/** Načte podklady a složí claims. */
 export async function computeMembershipClaims(
   db: Firestore,
   principal: string
 ): Promise<MembershipClaims> {
   return buildMembershipClaims(await loadMembershipInput(db, principal));
+}
+
+/**
+ * Patří uživatel vůbec do daného workspace? Brána pro `syncMemberClaims`:
+ * bez ní by admin firmy A mohl poslat `revoke` na uživatele firmy B (odhlašovací
+ * DoS napříč tenanty) nebo mu přes `createUser` založit Auth účet.
+ */
+export function belongsToWorkspace(claims: MembershipClaims, workspaceId: string): boolean {
+  const prefix = `${workspaceId}/`;
+  return (claims.wsa ?? []).includes(workspaceId)
+    || (claims.pw ?? []).some((entry) => entry.startsWith(prefix))
+    || (claims.p ?? []).some((entry) => entry.startsWith(prefix));
 }

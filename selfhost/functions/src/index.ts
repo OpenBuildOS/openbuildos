@@ -21,6 +21,7 @@ export {
 import {
   ClaimsTooLargeError,
   assertClaimsFit,
+  belongsToWorkspace,
   computeMembershipClaims,
   type MembershipClaims,
 } from "./membershipClaims";
@@ -138,15 +139,15 @@ export const authExchange = onRequest({ region: "europe-west1" }, async (req, re
     // claims z custom tokenu platí pro tuhle session; `setCustomUserClaims` je
     // zapíše na uživatele, takže `getIdToken(true)` po změně členství přinese
     // nové hodnoty (invalidace podle SECURITY_CLAIMS_DESIGN.md kap. 3).
-    await persistMembershipClaims(uid, membership, { email, name });
+    await persistMembershipClaims(uid, membership, { email, name }, { allowCreate: true });
 
     const customToken = await getAuth(getLocalApp()).createCustomToken(uid, claims);
 
     logger.info("authExchange OK", {
       uid,
       hasEmail: Boolean(email),
-      workspaces: (membership.wsa?.length ?? 0) + (membership.ws?.length ?? 0),
-      guestProjects: (membership.pw?.length ?? 0) + (membership.p?.length ?? 0),
+      adminWorkspaces: membership.wsa?.length ?? 0,
+      projects: (membership.pw?.length ?? 0) + (membership.p?.length ?? 0),
     });
     res.status(200).json({ customToken });
   } catch (error) {
@@ -174,12 +175,20 @@ export const authExchange = onRequest({ region: "europe-west1" }, async (req, re
 async function persistMembershipClaims(
   uid: string,
   membership: MembershipClaims,
-  profile: { email: string | null; name: string | null }
+  profile: { email: string | null; name: string | null },
+  { allowCreate = false }: { allowCreate?: boolean } = {}
 ): Promise<void> {
   const auth = getAuth(getLocalApp());
   try {
     await auth.getUser(uid);
   } catch {
+    // Zakládat uživatele smíme JEN při vlastním přihlášení (authExchange).
+    // Na cizí cíl ne — jinak by šlo přes `syncMemberClaims` zakládat libovolné
+    // Auth účty s uid, které si útočník zvolí.
+    if (!allowCreate) {
+      logger.info("persistMembershipClaims: cílový uživatel neexistuje, přeskakuji", { uid });
+      return;
+    }
     try {
       // Bez e-mailu záměrně: kdyby tentýž e-mail už patřil jinému uid, založení
       // by spadlo a shodilo by celé přihlášení. Uid je jediné, na čem záleží.
@@ -637,6 +646,26 @@ export const syncMemberClaims = onCall<
 
   const db = getFirestore(getLocalApp());
   const membership = await computeMembershipClaims(db, target);
+
+  // Cizí cíl musí mít k TOMUHLE workspace vztah. Bez téhle brány by admin firmy
+  // A mohl poslat `revoke` na uživatele firmy B — odhlašovací DoS napříč tenanty.
+  //
+  // ⚠️ Nestačí `belongsToWorkspace`: nejčastější volání je PRÁVĚ PO odebrání
+  // z projektu, kdy už cíl nikam nepatří — a to je ten okamžik, kdy se claims
+  // musí přepočítat nejvíc. Proto bereme i adresářový záznam firmy, který
+  // odebrání z projektu nemaže.
+  //
+  // Ten záznam tu slouží jako důkaz VZTAHU k firmě, ne jako důkaz oprávnění —
+  // zakládá ho i host, takže na udělení přístupu se použít nesmí (viz
+  // membershipClaims.ts). Na omezení dosahu adminů je ale přesně správný.
+  if (!isSelf) {
+    const associated = belongsToWorkspace(membership, workspaceId)
+      || (await db.doc(`workspaces/${workspaceId}/members/${target}`).get()).exists;
+    if (!associated) {
+      throw new HttpsError("permission-denied", "Uživatel k tomuto workspace nepatří.");
+    }
+  }
+
   const claims = { src: "openbuildos", ...membership };
   try {
     assertClaimsFit(claims);
@@ -677,8 +706,8 @@ export const syncMemberClaims = onCall<
     target,
     workspaceId,
     revoke,
-    workspaces: (membership.wsa?.length ?? 0) + (membership.ws?.length ?? 0),
-    guestProjects: (membership.pw?.length ?? 0) + (membership.p?.length ?? 0),
+    adminWorkspaces: membership.wsa?.length ?? 0,
+    projects: (membership.pw?.length ?? 0) + (membership.p?.length ?? 0),
   });
 
   return { synced: true, revoked: revoke };

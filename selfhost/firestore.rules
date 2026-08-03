@@ -344,15 +344,18 @@ service cloud.firestore {
     // admin klientsky.
     //
     // Číst smí JEN dotčený principal — z cizího signálu by šlo odvodit, že
-    // někdo je členem téhle firmy. Bumpnout smí workspace admin nebo firemní
-    // člen (ten, kdo reálně mění členství na projektu); host z cizí firmy ne,
-    // jinak by šlo cizím uživatelům vynucovat obnovu tokenu (šum + náklady).
+    // někdo je členem téhle firmy.
+    //
+    // Zapisovat smí JEN vlastník/admin firmy. Běžnou cestou ho stejně píše
+    // `syncMemberClaims` přes Admin SDK (rules obchází), takže klientský zápis
+    // je jen doplněk.
+    //
+    // ⚠️ Původní verze pouštěla i „firemního člena" přes existenci dokumentu
+    // `workspaces/{wid}/members/{principal}`. Ten ale zakládá `redeemInvite`
+    // KAŽDÉMU pozvanému včetně hosta z cizí firmy — takže by to nebyla brána,
+    // ale otevřená vrátka: kdokoli pozvaný by mohl cizím lidem vynucovat obnovu
+    // tokenu (šum + náklady na Cloud Functions).
     // ---------------------------------------------------------------------
-
-    function isWsMember(wid) {
-      return isRealUser()
-        && exists(/databases/$(database)/documents/workspaces/$(wid)/members/$(principal()));
-    }
 
     function validAccessSignal() {
       return request.resource.data.keys().hasOnly(['rev', 'updatedAt', 'reason'])
@@ -363,8 +366,7 @@ service cloud.firestore {
     match /workspaces/{wid}/accessSignals/{signalPrincipal} {
       allow get: if isRealUser() && principal() == signalPrincipal;
       allow list: if isWsAdmin(wid);
-      allow create, update: if (isWsAdmin(wid) || isWsMember(wid))
-        && validAccessSignal();
+      allow create, update: if isWsAdmin(wid) && validAccessSignal();
       allow delete: if isWsAdmin(wid);
     }
 

@@ -1,24 +1,40 @@
 rules_version = '2';
 
-// Firemní úložiště souborů (per-firma Firebase projekt).
+// Firemní úložiště souborů.
 //
-// POZOR — DESIGN ROZHODNUTÍ (22. 6. 2026): původní verze gateovala write per
-// projekt přes cross-service `firestore.get()` (kontrola memberIds/roles/ownerId
-// v Firestore). To se v praxi ukázalo jako NESPOLEHLIVÉ — Storage vracel 403
-// (storage/unauthorized) i pro VLASTNÍKA, který má v projektu roli 'admin' a je
-// ownerId workspace. Cross-service get ve Storage rules je dlouhodobě vrtkavý.
+// AUTORIZACE PŘES CUSTOM CLAIMS (1. 8. 2026, docs/SECURITY_CLAIMS_DESIGN.md).
 //
-// Proto držíme JEDNODUCHÝ a SPOLEHLIVÝ gate: čte/píše každý PŘIHLÁŠENÝ uživatel
-// FIRMY (přihlášení do firemního backendu probíhá token-exchangem, takže to je
-// vždy člen firmy — cizí firma má vlastní projekt s vlastními rules).
+// Historie: od 22. 6. 2026 tu byl gate jen na „přihlášený skutečný uživatel".
+// Původní verze gateovala per projekt přes cross-service `firestore.get()` a ta
+// se ukázala jako NESPOLEHLIVÁ (403 i pro vlastníka). Zjednodušený gate držel,
+// dokud měla KAŽDÁ FIRMA VLASTNÍ Firebase projekt — cizí firma prostě neměla
+// kam sáhnout. Ve SDÍLENÉM tenantu (hostovaný model) ten předpoklad padá:
+// „každý přihlášený uživatel" by znamenalo, že si kterýkoli zákazník přečte
+// soubory kteréhokoli jiného, pokud zná cestu. Cesty jsou UUID, ale bezpečnost
+// přes neuhodnutelnost cesty není bezpečnost.
 //
-// Granularita per-PROJEKT je vynucená na úrovni FIRESTORE METADAT: každý
-// foto/dokument/plán má v Firestore svůj doc s member rules. Bez přístupu k tomu
-// docu uživatel ani neobjeví cestu objektu ve Storage (cesty jsou UUID).
+// Řešení: členství nese SÁM TOKEN. Funkce `authExchange` (companion,
+// `selfhost/functions/src/membershipClaims.ts`) spočítá členství z Firestore
+// a orazí ho do custom claims:
 //
-// TODO (až bude potřeba tvrdší izolace mezi projekty jedné firmy): vrátit
-// per-projekt přes spolehlivý mechanismus — custom claims se seznamem projektů
-// v token-exchange tokenu, nebo ověřený fungující cross-service get.
+//   wsa: [wid, …]  vlastník / admin firmy      → celý workspace, plná práva
+//   ws:  [wid, …]  zaměstnanec firmy           → celý workspace, plná práva
+//   px:  [pid, …]  výjimka z `ws` (excludedProjectIds) — projekty firmy, do
+//                  kterých zaměstnanec NESMÍ (drží Storage v souladu s tím, co
+//                  říká Firestore `memberIds`)
+//   pw:  ["{wid}/{pid}", …]  host s rolí editor/admin → plná práva na projekt
+//   p:   ["{wid}/{pid}", …]  host s rolí viewer / company_lead
+//                            → čtení + ZALOŽENÍ nového objektu
+//
+// Role `viewer` smí obsah VYTVÁŘET (viz `ProjectRole` v src/types/workspace.ts),
+// takže musí umět nahrát fotku. Nesmí ale přepsat ani smazat cizí soubor —
+// proto je `write` rozpadlý na `create` × `update, delete`.
+//
+// ⚠️ Claims žijí v tokenu, ne v databázi. Platnost Firebase ID tokenu je pevná
+// 1 hodina a nejde zkrátit → okno zastaralosti až hodinu. Zmírnění (vynucená
+// obnova, signální dokument `workspaces/{wid}/accessSignals/{principal}`,
+// `revokeRefreshTokens`) je v kap. 3 návrhu a ve funkci `syncMemberClaims`.
+// Firestore zůstává živou autoritou — tam je odebrání okamžité.
 
 service firebase.storage {
   match /b/{bucket}/o {
@@ -26,6 +42,59 @@ service firebase.storage {
     function isRealUser() {
       return request.auth != null
         && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+
+    // Chybějící claim čteme jako prázdný seznam — uživatel bez orazítkovaného
+    // členství (starý token, selhaný exchange) nemá přístup nikam.
+    function claim(name) {
+      return request.auth.token.get(name, []);
+    }
+
+    // Zaměstnanec / admin firmy: celý workspace, kromě výslovných výjimek.
+    function inWorkspace(wid) {
+      return wid in claim('ws') || wid in claim('wsa');
+    }
+
+    // `excludedProjectIds` na firemním member docu — Firestore takového člena
+    // do `memberIds` nedá, takže by neměl mít ani soubory.
+    function workspaceGrant(wid, pid) {
+      return inWorkspace(wid) && !(pid in claim('px'));
+    }
+
+    // Hostovské claims jsou ve tvaru `"{wid}/{pid}"`. Cestu si volí volající,
+    // takže holé `pid` by autorizovalo i `workspaces/CIZI-FIRMA/projects/MUJ-
+    // PROJEKT/…` — psaní pod cizí prefix. Workspace musí sedět taky.
+    function projectKey(wid, pid) {
+      return wid + '/' + pid;
+    }
+
+    // Host s právem zápisu (editor / admin na projektu).
+    function projectWriteGrant(wid, pid) {
+      return projectKey(wid, pid) in claim('pw');
+    }
+
+    // Host s právem čtení (viewer / company_lead na projektu).
+    function projectReadGrant(wid, pid) {
+      return projectKey(wid, pid) in claim('p');
+    }
+
+    function canReadProject(wid, pid) {
+      return isRealUser()
+        && (workspaceGrant(wid, pid)
+            || projectWriteGrant(wid, pid)
+            || projectReadGrant(wid, pid));
+    }
+
+    // Přepsat/smazat existující objekt smí jen role s plným zápisem. Viewer
+    // spadne do `canReadProject`, ale sem ne — svou fotku nahraje, cizí nesmaže.
+    function canOverwriteProject(wid, pid) {
+      return isRealUser()
+        && (workspaceGrant(wid, pid) || projectWriteGrant(wid, pid));
+    }
+
+    function withinSizeLimit() {
+      return request.resource == null
+        || request.resource.size < 200 * 1024 * 1024;
     }
 
     // Přímý Firebase download/upload interních firemních objektů je zakázaný.
@@ -38,23 +107,35 @@ service firebase.storage {
     // pravidlo nemohlo přebít bezpečnou Function bránu výše (allow se mezi
     // souběžnými match bloky skládá pomocí OR).
     match /workspaces/{wid}/projects/{pid}/{category}/{rest=**} {
+      allow read: if category != 'companySpaces' && canReadProject(wid, pid);
+
+      // Rozdíl „nový objekt" × „sáhnutí na existující" schválně NEstavíme na
+      // create/update/delete: upload přes existující cestu emulátor vyhodnocuje
+      // jako `create`, takže by se přepis cizího souboru propašoval mezi
+      // zakládání. `resource` (stav PŘED zápisem) je jednoznačný — null znamená,
+      // že tam ještě nic není.
       allow write: if category != 'companySpaces'
-        && isRealUser()
-        && (request.resource == null || request.resource.size < 200 * 1024 * 1024);
-      allow read: if category != 'companySpaces' && isRealUser();
+        && withinSizeLimit()
+        && (
+          // Založení nového objektu — smí každý člen projektu včetně viewera.
+          (resource == null && request.resource != null && canReadProject(wid, pid))
+          // Přepis i smazání existujícího objektu — jen role s plným zápisem.
+          || canOverwriteProject(wid, pid)
+        );
     }
 
-    // Připojovací probe a případné neprojektové objekty workspace.
+    // Připojovací probe a případné neprojektové objekty workspace. Host
+    // (claim `p`/`pw`) sem nesmí — nemá jak prokázat příslušnost k workspace.
     match /workspaces/{wid}/{objectName} {
-      allow read: if isRealUser();
-      allow write: if isRealUser()
-        && (request.resource == null || request.resource.size < 200 * 1024 * 1024);
+      allow read: if isRealUser() && inWorkspace(wid);
+      allow write: if isRealUser() && inWorkspace(wid) && withinSizeLimit();
     }
     match /workspaces/{wid}/{category}/{rest=**} {
-      allow read: if category != 'projects' && isRealUser();
+      allow read: if category != 'projects' && isRealUser() && inWorkspace(wid);
       allow write: if category != 'projects'
         && isRealUser()
-        && (request.resource == null || request.resource.size < 200 * 1024 * 1024);
+        && inWorkspace(wid)
+        && withinSizeLimit();
     }
 
     // Vše ostatní (vč. legacy /projects/**) je zakázané.

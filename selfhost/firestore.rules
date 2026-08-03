@@ -334,6 +334,41 @@ service cloud.firestore {
     }
 
     // ---------------------------------------------------------------------
+    // Signál invalidace custom claims (docs/SECURITY_CLAIMS_DESIGN.md kap. 3)
+    //
+    // Autorizace Storage jede přes custom claims v tokenu. Token má pevnou
+    // platnost 1 h a nejde zkrátit, takže po změně členství by claims mohly být
+    // až hodinu zastaralé. Tenhle dokument je SIGNÁL: klient sleduje TEN SVŮJ
+    // a při každé změně `rev` si vynutí `getIdToken(true)` → nové claims má
+    // během sekund. Zapisuje ho Cloud Function `syncMemberClaims`, případně
+    // admin klientsky.
+    //
+    // Číst smí JEN dotčený principal — z cizího signálu by šlo odvodit, že
+    // někdo je členem téhle firmy. Bumpnout smí workspace admin nebo firemní
+    // člen (ten, kdo reálně mění členství na projektu); host z cizí firmy ne,
+    // jinak by šlo cizím uživatelům vynucovat obnovu tokenu (šum + náklady).
+    // ---------------------------------------------------------------------
+
+    function isWsMember(wid) {
+      return isRealUser()
+        && exists(/databases/$(database)/documents/workspaces/$(wid)/members/$(principal()));
+    }
+
+    function validAccessSignal() {
+      return request.resource.data.keys().hasOnly(['rev', 'updatedAt', 'reason'])
+        && request.resource.data.rev is int
+        && request.resource.data.rev >= 0;
+    }
+
+    match /workspaces/{wid}/accessSignals/{signalPrincipal} {
+      allow get: if isRealUser() && principal() == signalPrincipal;
+      allow list: if isWsAdmin(wid);
+      allow create, update: if (isWsAdmin(wid) || isWsMember(wid))
+        && validAccessSignal();
+      allow delete: if isWsAdmin(wid);
+    }
+
+    // ---------------------------------------------------------------------
     // Invites (bearer token documents)
     // ---------------------------------------------------------------------
 

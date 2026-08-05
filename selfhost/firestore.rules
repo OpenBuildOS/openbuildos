@@ -334,6 +334,43 @@ service cloud.firestore {
     }
 
     // ---------------------------------------------------------------------
+    // Signál invalidace custom claims (docs/SECURITY_CLAIMS_DESIGN.md kap. 3)
+    //
+    // Autorizace Storage jede přes custom claims v tokenu. Token má pevnou
+    // platnost 1 h a nejde zkrátit, takže po změně členství by claims mohly být
+    // až hodinu zastaralé. Tenhle dokument je SIGNÁL: klient sleduje TEN SVŮJ
+    // a při každé změně `rev` si vynutí `getIdToken(true)` → nové claims má
+    // během sekund. Zapisuje ho Cloud Function `syncMemberClaims`, případně
+    // admin klientsky.
+    //
+    // Číst smí JEN dotčený principal — z cizího signálu by šlo odvodit, že
+    // někdo je členem téhle firmy.
+    //
+    // Zapisovat smí JEN vlastník/admin firmy. Běžnou cestou ho stejně píše
+    // `syncMemberClaims` přes Admin SDK (rules obchází), takže klientský zápis
+    // je jen doplněk.
+    //
+    // ⚠️ Původní verze pouštěla i „firemního člena" přes existenci dokumentu
+    // `workspaces/{wid}/members/{principal}`. Ten ale zakládá `redeemInvite`
+    // KAŽDÉMU pozvanému včetně hosta z cizí firmy — takže by to nebyla brána,
+    // ale otevřená vrátka: kdokoli pozvaný by mohl cizím lidem vynucovat obnovu
+    // tokenu (šum + náklady na Cloud Functions).
+    // ---------------------------------------------------------------------
+
+    function validAccessSignal() {
+      return request.resource.data.keys().hasOnly(['rev', 'updatedAt', 'reason'])
+        && request.resource.data.rev is int
+        && request.resource.data.rev >= 0;
+    }
+
+    match /workspaces/{wid}/accessSignals/{signalPrincipal} {
+      allow get: if isRealUser() && principal() == signalPrincipal;
+      allow list: if isWsAdmin(wid);
+      allow create, update: if isWsAdmin(wid) && validAccessSignal();
+      allow delete: if isWsAdmin(wid);
+    }
+
+    // ---------------------------------------------------------------------
     // Invites (bearer token documents)
     // ---------------------------------------------------------------------
 

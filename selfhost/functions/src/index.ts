@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { initializeApp, getApps, getApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
-import { getFirestore } from "firebase-admin/firestore";
+import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
 import { HttpsError, onCall, onRequest, type Request } from "firebase-functions/v2/https";
 import * as logger from "firebase-functions/logger";
@@ -17,6 +17,14 @@ export {
   importProjectBackup,
   deleteProjectPermanently,
 } from "./projectTransfer";
+
+import {
+  ClaimsTooLargeError,
+  assertClaimsFit,
+  belongsToWorkspace,
+  computeMembershipClaims,
+  type MembershipClaims,
+} from "./membershipClaims";
 
 /**
  * Token-exchange Cloud Function `authExchange` pro OpenBuildOS federaci.
@@ -121,19 +129,77 @@ export const authExchange = onRequest({ region: "europe-west1" }, async (req, re
     const email = decoded.email ?? null;
     const name = (decoded.name as string | undefined) ?? null;
 
-    const customToken = await getAuth(getLocalApp()).createCustomToken(uid, {
-      email,
-      name,
-      src: "openbuildos",
-    });
+    // Členství se razí do tokenu — Storage rules ho jinak nemají jak zjistit
+    // (cross-service firestore.get() je nespolehlivý). Viz membershipClaims.ts.
+    const membership = await computeMembershipClaims(getFirestore(getLocalApp()), uid);
+    const claims = { email, name, src: "openbuildos", ...membership };
+    assertClaimsFit(claims);
 
-    logger.info("authExchange OK", { uid, hasEmail: Boolean(email) });
+    // Claims musí přežít i OBNOVU tokenu, ne jen tohle přihlášení. Developer
+    // claims z custom tokenu platí pro tuhle session; `setCustomUserClaims` je
+    // zapíše na uživatele, takže `getIdToken(true)` po změně členství přinese
+    // nové hodnoty (invalidace podle SECURITY_CLAIMS_DESIGN.md kap. 3).
+    await persistMembershipClaims(uid, membership, { email, name }, { allowCreate: true });
+
+    const customToken = await getAuth(getLocalApp()).createCustomToken(uid, claims);
+
+    logger.info("authExchange OK", {
+      uid,
+      hasEmail: Boolean(email),
+      adminWorkspaces: membership.wsa?.length ?? 0,
+      projects: (membership.pw?.length ?? 0) + (membership.p?.length ?? 0),
+    });
     res.status(200).json({ customToken });
   } catch (error) {
+    if (error instanceof ClaimsTooLargeError) {
+      // TVRDÁ chyba, ne tiché uříznutí seznamu — jinak by uživatel bez varování
+      // přišel o přístup k části staveb.
+      logger.error("authExchange: claims se nevejdou do tokenu", {
+        bytes: error.bytes,
+        limit: error.limit,
+      });
+      res.status(413).json({ error: error.message });
+      return;
+    }
     logger.error("authExchange selhalo", error);
     res.status(401).json({ error: "Ověření centrálního tokenu selhalo." });
   }
 });
+
+/**
+ * Zapíše členství na uživatele lokálního projektu. Uživatel při PRVNÍM
+ * přihlášení ještě neexistuje (vzniká až `signInWithCustomToken`), takže ho
+ * musíme založit — jinak by `setCustomUserClaims` spadlo na user-not-found a
+ * claims by přežily jen do vypršení prvního tokenu.
+ */
+async function persistMembershipClaims(
+  uid: string,
+  membership: MembershipClaims,
+  profile: { email: string | null; name: string | null },
+  { allowCreate = false }: { allowCreate?: boolean } = {}
+): Promise<void> {
+  const auth = getAuth(getLocalApp());
+  try {
+    await auth.getUser(uid);
+  } catch {
+    // Zakládat uživatele smíme JEN při vlastním přihlášení (authExchange).
+    // Na cizí cíl ne — jinak by šlo přes `syncMemberClaims` zakládat libovolné
+    // Auth účty s uid, které si útočník zvolí.
+    if (!allowCreate) {
+      logger.info("persistMembershipClaims: cílový uživatel neexistuje, přeskakuji", { uid });
+      return;
+    }
+    try {
+      // Bez e-mailu záměrně: kdyby tentýž e-mail už patřil jinému uid, založení
+      // by spadlo a shodilo by celé přihlášení. Uid je jediné, na čem záleží.
+      await auth.createUser({ uid, displayName: profile.name ?? undefined });
+    } catch (createError) {
+      logger.warn("persistMembershipClaims: uživatele nelze založit", createError);
+      return;
+    }
+  }
+  await auth.setCustomUserClaims(uid, { src: "openbuildos", ...membership });
+}
 
 type CompanyAccess = {
   principal: string;
@@ -525,4 +591,124 @@ export const revokeShareLinkAndRotateToken = onCall<
   });
 
   return { revoked: true, tokenRotated: true };
+});
+
+async function isWorkspaceAdmin(workspaceId: string, principal: string): Promise<boolean> {
+  const snap = await getFirestore(getLocalApp()).doc(`workspaces/${workspaceId}`).get();
+  const data = snap.data() as { ownerId?: string; adminIds?: string[] } | undefined;
+  if (!snap.exists || !data) {
+    return false;
+  }
+  return data.ownerId === principal || (data.adminIds ?? []).includes(principal);
+}
+
+/**
+ * Přepočítá custom claims a (u cizího uživatele) shodí jeho token.
+ *
+ * Claims jsou v tokenu s pevnou platností 1 h, takže po změně členství by byly
+ * až hodinu zastaralé (SECURITY_CLAIMS_DESIGN.md kap. 3). Tahle funkce to
+ * zkracuje na sekundy:
+ *  - `{ }` nebo `{ principal: já }` — SEBEOBSLUHA. Smí ji volat kdokoli
+ *    přihlášený; přepočet čte Firestore, takže nemůže udělit víc, než co už
+ *    tam stojí. Klient ji volá po přijetí pozvánky a pak si dá getIdToken(true).
+ *  - `{ wid, principal: někdo jiný }` — jen vlastník/admin té firmy. Kromě
+ *    přepočtu bumpne SIGNÁLNÍ dokument, kterého si všimne klient dotčeného
+ *    uživatele a vynutí si obnovu tokenu.
+ *  - `{ wid, principal, revoke: true }` — navíc `revokeRefreshTokens`, tedy
+ *    tvrdé vyhození při odebrání z firmy.
+ */
+export const syncMemberClaims = onCall<
+  { wid?: string; principal?: string; revoke?: boolean }
+>({ region: "europe-west1" }, async (request) => {
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "Chybí přihlášení do workspace.");
+  }
+
+  const caller = principalFromAuth(request.auth);
+  const target = typeof request.data?.principal === "string" && request.data.principal
+    ? request.data.principal
+    : caller;
+  const workspaceId = typeof request.data?.wid === "string" ? request.data.wid : "";
+  const revoke = request.data?.revoke === true;
+  const isSelf = target === caller;
+
+  if (!isSelf || revoke) {
+    if (!workspaceId) {
+      throw new HttpsError("invalid-argument", "Chybí wid.");
+    }
+    if (!(await isWorkspaceAdmin(workspaceId, caller))) {
+      throw new HttpsError(
+        "permission-denied",
+        "Přepočet přístupů cizího uživatele smí vyvolat jen vlastník nebo admin firmy."
+      );
+    }
+  }
+
+  const db = getFirestore(getLocalApp());
+  const membership = await computeMembershipClaims(db, target);
+
+  // Cizí cíl musí mít k TOMUHLE workspace vztah. Bez téhle brány by admin firmy
+  // A mohl poslat `revoke` na uživatele firmy B — odhlašovací DoS napříč tenanty.
+  //
+  // ⚠️ Nestačí `belongsToWorkspace`: nejčastější volání je PRÁVĚ PO odebrání
+  // z projektu, kdy už cíl nikam nepatří — a to je ten okamžik, kdy se claims
+  // musí přepočítat nejvíc. Proto bereme i adresářový záznam firmy, který
+  // odebrání z projektu nemaže.
+  //
+  // Ten záznam tu slouží jako důkaz VZTAHU k firmě, ne jako důkaz oprávnění —
+  // zakládá ho i host, takže na udělení přístupu se použít nesmí (viz
+  // membershipClaims.ts). Na omezení dosahu adminů je ale přesně správný.
+  if (!isSelf) {
+    const associated = belongsToWorkspace(membership, workspaceId)
+      || (await db.doc(`workspaces/${workspaceId}/members/${target}`).get()).exists;
+    if (!associated) {
+      throw new HttpsError("permission-denied", "Uživatel k tomuto workspace nepatří.");
+    }
+  }
+
+  const claims = { src: "openbuildos", ...membership };
+  try {
+    assertClaimsFit(claims);
+  } catch (error) {
+    if (error instanceof ClaimsTooLargeError) {
+      throw new HttpsError("resource-exhausted", error.message);
+    }
+    throw error;
+  }
+
+  await persistMembershipClaims(target, membership, { email: null, name: null });
+
+  if (workspaceId && !isSelf) {
+    // Signál pro klienta dotčeného uživatele — onSnapshot → getIdToken(true).
+    await db.doc(`workspaces/${workspaceId}/accessSignals/${target}`).set(
+      {
+        rev: FieldValue.increment(1),
+        updatedAt: new Date().toISOString(),
+        reason: revoke ? "revoked" : "membership",
+      },
+      { merge: true }
+    );
+  }
+
+  if (revoke) {
+    // Tvrdé vyhození: uživatel se musí přihlásit znovu (což u federace znamená
+    // nový token-exchange, tedy i nové claims). Chybějící uživatel není chyba —
+    // odebíráme někoho, kdo se do firemního backendu nikdy nepřihlásil.
+    try {
+      await getAuth(getLocalApp()).revokeRefreshTokens(target);
+    } catch (error) {
+      logger.warn("syncMemberClaims: revokeRefreshTokens selhalo", { target, error });
+    }
+  }
+
+  logger.info("syncMemberClaims OK", {
+    caller,
+    target,
+    workspaceId,
+    revoke,
+    adminWorkspaces: membership.wsa?.length ?? 0,
+    projects: (membership.pw?.length ?? 0) + (membership.p?.length ?? 0),
+  });
+
+  return { synced: true, revoked: revoke };
 });

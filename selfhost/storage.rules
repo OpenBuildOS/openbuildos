@@ -18,8 +18,8 @@ rules_version = '2';
 // a orazí ho do custom claims:
 //
 //   wsa: [wid, …]           vlastník / admin firmy → všechny projekty té firmy
-//   pw:  ["{wid}/{pid}", …] role editor / admin na projektu → plná práva
-//   p:   ["{wid}/{pid}", …] ostatní členství (viewer, company_lead)
+//   pw:  ["{wid}/{pid}", …] oprávnění `edit` na projektu → plná práva
+//   p:   ["{wid}/{pid}", …] ostatní členství (contribute / read)
 //                           → čtení + ZALOŽENÍ nového objektu
 //
 // ⭐ Claims zrcadlí `isProjectMember` z firestore.rules jedna ku jedné:
@@ -33,8 +33,9 @@ rules_version = '2';
 // `redeemInvite` i HOSTOVI z cizí firmy. Host pozvaný na jednu stavbu by tak
 // dostal všechny stavby té firmy. Podrobně v membershipClaims.ts.
 //
-// Role `viewer` smí obsah VYTVÁŘET (viz `ProjectRole` v src/types/workspace.ts),
-// takže musí umět nahrát fotku. Nesmí ale přepsat ani smazat cizí soubor —
+// Oprávnění `contribute` (dnešní role viewer) smí obsah VYTVÁŘET — viz model
+// v `src/lib/permissions/projectPermissions.ts` — takže musí umět nahrát fotku.
+// Nesmí ale přepsat ani smazat cizí soubor —
 // proto je `write` rozpadlý na `create` × `update, delete`.
 //
 // ⚠️ Claims žijí v tokenu, ne v databázi. Platnost Firebase ID tokenu je pevná
@@ -75,7 +76,7 @@ service firebase.storage {
       return projectKey(wid, pid) in claim('pw');
     }
 
-    // Člen projektu bez práva mazat (viewer / company_lead).
+    // Člen projektu bez práva mazat (contribute / read, tedy bez `edit`).
     function projectReadGrant(wid, pid) {
       return projectKey(wid, pid) in claim('p');
     }

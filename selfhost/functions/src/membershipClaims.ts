@@ -54,8 +54,29 @@ export const CLAIMS_BYTE_LIMIT = 1000;
  */
 export const CLAIMS_BYTE_BUDGET = 900;
 
-/** Role, které na projektu znamenají plný zápis (přepis i mazání souborů). */
-const FULL_WRITE_ROLES = new Set(["editor", "admin"]);
+/**
+ * Role, které na projektu znamenají plný zápis do Storage (přepis i mazání).
+ *
+ * Zrcadlí oprávnění **`edit`** z modelu #506 (fáze 2) — tedy „smí měnit CIZÍ
+ * obsah". Storage nemá jemnější rozlišení: claim `pw` je plný zápis, `p` je
+ * čtení + založení nového objektu.
+ *
+ * `company_lead` je ZRUŠENÁ role, kterou drží už jen legacy data; migrační
+ * tabulka jí dává `edit`, takže sem patří. Bez toho by měla ve Firestore právo
+ * měnit cizí obsah, ale ve Storage ne — a mazání záznamu by po sobě nechávalo
+ * soubory (nález F5).
+ *
+ * ⚠️ SDÍLENÝ SOUBOR (docs/REPO_BOUNDARIES.md). Tabulka je třetí kopií modelu
+ * vedle `firestore.rules` (`rolePermissions`) a
+ * `src/lib/permissions/projectPermissions.ts`. Když jednu měníš, měň všechny tři.
+ *
+ * 🟠 Známá mez: role `reader` (jen `read`) dostane `p`, takže smí do Storage
+ * ZALOŽIT nový objekt, přestože ve Firestore k němu nesmí vytvořit záznam.
+ * Osiřelý objekt je bez záznamu neviditelný a nedohledatelný; užší claim by
+ * znamenal čtvrtou úroveň v tokenu a nasazení funkcí PŘED pravidly v každém
+ * firemním projektu (docs/REPO_BOUNDARIES.md, Háček 3). Necháno vědomě.
+ */
+const FULL_WRITE_ROLES = new Set(["editor", "admin", "company_lead"]);
 
 export interface WorkspaceFacts {
   id: string;

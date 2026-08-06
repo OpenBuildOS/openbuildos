@@ -29,40 +29,58 @@ podle uid fungují napříč firmami. Přihlášení spadá do free koše „Cus
 Předpoklady: vlastní Firebase projekt firmy s aktivním plánem **Blaze**
 (Cloud Functions vyžadují Blaze). Provoz je **zdarma do free tier**.
 
+**Doporučený postup je setup CLI**, ne ruční deploy — nasadí funkce, IAM role,
+pravidla úložiště i CORS ve správném pořadí a zapíše URL ověřovací funkce do
+`config/public`, takže si ji aplikace **najde sama**:
+
 ```bash
-cd functions
+cd selfhost
+node scripts/openbuildos-setup.mjs --project <id-firemního-projektu>
+```
+
+Detaily a troubleshooting org policy: [`docs/COMPANION_CLI.md`](../docs/COMPANION_CLI.md),
+krok za krokem pro netechnické uživatele: [`docs/cloudshell-tutorial.md`](../docs/cloudshell-tutorial.md).
+
+Ručně (jen když víte proč):
+
+```bash
+cd selfhost/functions
 npm install
+cd ..
 firebase deploy --only functions --project <id-firemního-projektu>
 ```
 
-Po nasazení získáte URL funkce, např.:
+⚠️ **Bez `--force`.** `--force` odklepne i smazání funkcí, které ve vašem klonu
+nejsou — ze staršího klonu byste si tím odstranili část vlastního backendu.
 
-```
-https://europe-west1-<id-firemního-projektu>.cloudfunctions.net/authExchange
-```
-
-Tuto URL vložte v aplikaci do pole **„URL ověřovací funkce (token-exchange
-endpoint)"** při připojování workspace (modal *Připojit workspace*).
-
-> **Pozn.:** Tohle je RUČNÍ postup. Companion CLI níže navíc zapíše URL do
-> `config/public`, takže si ji aplikace **najde sama** (auto-discovery) a ruční
-> vložení pak není potřeba.
-
-> **Tip — companion CLI:** Místo ručního postupu lze použít skript, který nasadí
-> pravidla i funkci (s retry pro čerstvý Blaze projekt) a nastaví potřebné IAM
-> role (veřejný `run.invoker` + `serviceAccountTokenCreator`):
-> `npm run setup:company -- --project <id-firemního-projektu>`
-> Detaily a troubleshooting org policy: [`docs/COMPANION_CLI.md`](../docs/COMPANION_CLI.md).
+Funkce běží jako **gen2**, tedy na Cloud Run; URL má tvar
+`https://authexchange-xxxxxxxxxx-ew.a.run.app` (ne `…cloudfunctions.net`).
+Ruční deploy ji **nezapíše** do `config/public`, takže ji pak musíte vložit
+v aplikaci do pole **„URL ověřovací funkce"** (modal *Připojení firmy*).
 
 ## Aktualizace
 
-Funkce je **součástí open-source repozitáře** OpenBuildOS. Při aktualizaci stačí
-znovu spustit `firebase deploy --only functions --project <firma>` — nasadí se
-nové verze funkcí.
+Funkce jsou **součástí open-source repozitáře** OpenBuildOS.
+
+> 🔴 **Aktualizace NENÍ jen redeploy funkcí.** Od srpna 2026 gatují pravidla
+> úložiště na custom claims, které razí `authExchange` + `syncMemberClaims` —
+> funkce a `storage.rules` se od sebe nedají oddělit. Aktualizujte proto
+> **celým setup CLI** (`node scripts/openbuildos-setup.mjs --project <firma>`),
+> které pustí obojí ve správném pořadí. Samotný `openbuildos-storage-setup.mjs`
+> se bez nasazených funkcí odmítne spustit — schválně.
 
 ## Funkce v balíčku
 
-- `authExchange` — federace centrální session do firemního backendu.
+Devět exportů. **`authExchange` a `syncMemberClaims` jsou povinné** — bez nich
+nikdo nedostane claims a pravidla úložiště nepustí ke svým souborům ani
+vlastníka firmy.
+
+- `authExchange` — federace centrální session do firemního backendu; zároveň
+  razí členství do custom claims (`wsa`/`pw`/`p`).
+- `syncMemberClaims` — přerazítkuje claims po změně členství a zneplatní
+  refresh tokeny, aby se odebrání přístupu projevilo hned, ne až za hodinu.
+- `companyFile` — autorizovaný přístup k interním firemním souborům
+  (`companySpaces`), které jsou v pravidlech úložiště zakázané napřímo.
 - `revokeShareLinkAndRotateToken` — callable funkce pro skutečnou revokaci
   veřejného share linku: označí Firestore záznam jako `revoked` a zároveň
   zrotuje Firebase Storage download token souboru.

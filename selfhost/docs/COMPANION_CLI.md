@@ -9,10 +9,22 @@ federačního backendu OpenBuildOS. Krok za krokem pro netechnické uživatele v
 Do firemního Firebase projektu (na plánu Blaze) nasadí:
 
 1. **Firestore pravidla** (`firestore.rules`) — s retry/backoffem.
-2. **Cloud Functions** (`functions/`) — `authExchange` a `revokeShareLinkAndRotateToken`,
-   nasazené jedním `--force` deployem
+2. **Cloud Functions** (`functions/`) — všech devět exportů jedním deployem:
+   `authExchange`, `syncMemberClaims`, `sendProjectInvite`, `companyFile`,
+   `revokeShareLinkAndRotateToken` a čtyři pro přesun projektů
    (1. pokus čerstvého Blaze projektu typicky selže na *build service account*,
-   retry to vyřeší; `--force` zároveň nastaví **artifact cleanup policy**).
+   retry to vyřeší).
+
+   > 🔴 **Deploy funkcí NIKDY nemaže.** `--force` se tu záměrně nepoužívá:
+   > odklepl by i smazání funkcí, které v aktuálním klonu nejsou, takže setup
+   > pouštěný ze **staršího** klonu by firmě tiše odstranil část backendu —
+   > včetně `syncMemberClaims`, na kterou gatují pravidla úložiště. Když by
+   > deploy něco mazal, skript **skončí chybou** a vypíše co. Řešení je stáhnout
+   > čerstvý klon, ne mazat. (Artifact cleanup policy, kterou `--force` dřív
+   > nastavoval mimochodem, se doplňuje samostatným krokem.)
+3. **Pravidla úložiště + CORS** (krok 9, přes `openbuildos-storage-setup.mjs`) —
+   **až po funkcích**, protože se o ně opírají. Selhání tohohle kroku setup
+   zastaví: je to bezpečnostní hranice, ne kosmetika.
 
 A nastaví **dvě IAM role**, bez kterých federace nefunguje:
 

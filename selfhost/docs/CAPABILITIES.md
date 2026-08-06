@@ -40,7 +40,8 @@ originálů, výkresy) potřebují zapnuté Storage — viz další sekce.
 ## Soubory ve Fotkách a Dokumentech (Storage)
 
 - **Prerekvizity:** zapnutý **Firebase Storage** (bucket
-  `<projectId>.firebasestorage.app`).
+  `<projectId>.firebasestorage.app`) **a nasazené Cloud Functions** — viz
+  upozornění níže.
 - **Jak zapnout:**
   1. [Firebase konzole](https://console.firebase.google.com/) → váš projekt →
      **Build → Storage → Get started** → lokace **EU (`eur3`)**.
@@ -51,7 +52,22 @@ originálů, výkresy) potřebují zapnuté Storage — viz další sekce.
      node scripts/openbuildos-storage-setup.mjs --project <projectId>
      ```
 - **Cena/plán:** **Spark, zdarma** po zapnutí (v rámci Spark limitů Storage);
-  nad limity pay-as-you-go na Blaze.
+  nad limity pay-as-you-go na Blaze. Pravidla úložiště se ale opírají o funkce,
+  a ty vyžadují **Blaze** — bez něj soubory nerozjedete.
+
+> 🔴 **Úložiště a backend jdou VŽDY spolu — nikdy jen jedna půlka.**
+> Pravidla úložiště pouštějí ke každému souboru **jen podle custom claims**
+> (`wsa`/`pw`/`p`), které do přihlášení razí funkce **`authExchange`**
+> a **`syncMemberClaims`**. Nasadit pravidla do projektu, kde ty funkce
+> neběží, znamená, že claims nemá **nikdo** — o přístup k souborům přijde
+> i vlastník firmy a v pravidlech není žádná záchranná cesta.
+>
+> Do verze z července 2026 to platit nemuselo (pravidla tehdy stačilo mít
+> „přihlášený uživatel"). **Aktualizujete-li starší instalaci, pusťte celý
+> `openbuildos-setup`, ne jen krok Úložiště.**
+>
+> `openbuildos-storage-setup.mjs` si to sám ověří (krok 3) a bez nasazených
+> funkcí se **odmítne spustit** — pravidla tedy nenasadí a nic nerozbije.
 
 ## Firemní prostory (`companySpaces`)
 

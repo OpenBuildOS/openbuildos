@@ -84,8 +84,17 @@ stahovat soubory (CORS). `PROJECT_ID` opět nahraďte svým ID:
 cd ~/ob/selfhost && node scripts/openbuildos-storage-setup.mjs --project PROJECT_ID
 ```
 
-Předpoklad: **Storage** máte zapnuté (krok 1, bod 5). Kdyby skript hlásil, že
-bucket neexistuje, zapněte Storage ve Firebase konzoli a spusťte ho znovu.
+Předpoklady:
+
+1. **Storage** máte zapnuté (krok 1, bod 5). Kdyby skript hlásil, že bucket
+   neexistuje, zapněte Storage ve Firebase konzoli a spusťte ho znovu.
+2. **Krok 2 proběhl** — pravidla úložiště se opírají o funkce nasazené v kroku 2
+   (`authExchange`, `syncMemberClaims`). Skript si to sám ověří a bez nich se
+   **odmítne spustit**; kdyby to udělal, nikdo by se k souborům nedostal ani vy.
+   Pořadí je tedy vždy **krok 2 → krok 3**.
+
+> **Aktualizujete starší instalaci?** Pusťte celý krok 2 znovu, ne jen tenhle
+> skript. Backend a pravidla úložiště od srpna 2026 jdou vždy spolu.
 
 > Vlastní doménu appky (self-host) přidáte navíc přes `--origin`, např.
 > `--origin https://app.mojefirma.cz`. Oficiální domény OpenBuildOS jsou

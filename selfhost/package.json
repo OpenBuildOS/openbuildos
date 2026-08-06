@@ -9,6 +9,7 @@
   },
   "scripts": {
     "setup:company": "node scripts/openbuildos-setup.mjs",
-    "setup": "node scripts/openbuildos-setup.mjs"
+    "setup": "node scripts/openbuildos-setup.mjs",
+    "test": "node --test scripts/*.test.mjs"
   }
 }

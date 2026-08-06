@@ -4,7 +4,9 @@
  *
  * Zautomatizuje přesně ten ruční „asistovaný setup" federačního backendu, který
  * je popsán v `docs/cloudshell-tutorial.md` a `docs/COMPANION_CLI.md`. Nasadí firestore pravidla a
- * token-exchange funkci `authExchange` do firemního Firebase projektu (Blaze) a
+ * VŠECHNY funkce backendu firmy (`authExchange`, `syncMemberClaims`,
+ * `sendProjectInvite`, `companyFile`, `revokeShareLinkAndRotateToken` a čtyři
+ * pro přesun projektů) do firemního Firebase projektu (Blaze) a
  * nastaví dvě IAM role, bez kterých federace nefunguje:
  *   1) allUsers → roles/run.invoker na Cloud Run službě authexchange
  *      (jinak Cloud Run vrací 403 a browser federaci nezavolá),
@@ -14,10 +16,15 @@
  * Skript je IDEMPOTENTNÍ — lze ho spustit opakovaně. Nepoužívá žádné nové npm
  * závislosti; volá lokální `npx firebase` a `gcloud`.
  *
- * Po federaci navíc (best-effort): zdetekuje kapacity projektu (Blaze, Storage,
- * AI Logic/App Check), spustí krok Úložiště (openbuildos-storage-setup.mjs jako
- * child process) a zapíše `workspaces/{projectId}.modules` — mapu zapnutých
- * modulů, kterou čte appka (Nastavení → Moduly). Viz docs/CAPABILITIES.md.
+ * Po federaci navíc: zdetekuje kapacity projektu (Blaze, Storage, AI Logic/App
+ * Check), spustí krok Úložiště (openbuildos-storage-setup.mjs jako child
+ * process) a zapíše `workspaces/{projectId}.modules` — mapu zapnutých modulů,
+ * kterou čte appka (Nastavení → Moduly). Viz docs/CAPABILITIES.md.
+ *
+ * 🔴 Pořadí kroků 4 (funkce) → 9 (storage.rules) je BEZPEČNOSTNÍ, ne kosmetické:
+ * pravidla úložiště gatují na custom claims, které razí `authExchange` +
+ * `syncMemberClaims`. Nasadit je dřív, než ty funkce běží, znamená zamknout
+ * firmu ven z úložiště. Krok 4 je proto fatální a krok 9 od 6. 8. 2026 taky.
  *
  * Použití:
  *   node scripts/openbuildos-setup.mjs --project <companyProjectId> \
@@ -37,7 +44,8 @@ import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // ---------------------------------------------------------------------------
 // Logování (čeština, jednoduché značky stavu)
@@ -112,10 +120,14 @@ function resolveFirebase() {
  * @param {number} [opts.retries] počet OPAKOVÁNÍ navíc (0 = bez retry)
  * @param {number} [opts.baseDelayMs] základ backoffu (default 4000)
  * @param {boolean} [opts.quiet]  nevypisovat živý výstup
+ * @param {(output: string) => boolean} [opts.retryIf] retry jen když vrátí true.
+ *        Bez toho by se opakoval i deploy, který ve skutečnosti PROŠEL a spadl
+ *        až na cleanup policy — tedy několik minut navíc za nic.
  */
 function run(cmd, args, opts = {}) {
   const retries = opts.retries ?? 0;
   const baseDelayMs = opts.baseDelayMs ?? 4000;
+  const retryIf = opts.retryIf ?? (() => true);
   let lastErr;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -131,6 +143,9 @@ function run(cmd, args, opts = {}) {
       lastErr = err;
       const stderr = (err.stderr ? String(err.stderr) : "") + (err.stdout ? String(err.stdout) : "");
       lastErr.combinedOutput = stderr;
+      if (!retryIf(stderr)) {
+        break;
+      }
       if (attempt < retries) {
         const delay = baseDelayMs * Math.pow(2, attempt);
         warn(`pokus ${attempt + 1} selhal, zkouším znovu za ${Math.round(delay / 1000)}s (propagace API/IAM)`);
@@ -222,14 +237,14 @@ CO DĚLÁ (idempotentně, lze pouštět opakovaně):
   1. Preflight: ověří firebase-tools, gcloud, aktivní gcloud účet.
   2. npm install ve functions/.
   3. Deploy firestore pravidel (retry/backoff).
-  4. Deploy funkce authExchange (--force, retry/backoff) + vyparsuje URL.
+  4. Deploy funkcí backendu (retry/backoff, NIKDY nemaže funkce) + URL.
   5. Zjistí runtime service account funkce.
   6. allUsers → roles/run.invoker na Cloud Run službě authexchange.
   7. roles/iam.serviceAccountTokenCreator runtime SA sám na sebe
      (+ 7b: zápis federační URL do config/public).
   8. Detekce kapacit projektu (Blaze / Storage bucket / AI Logic, App Check).
   9. Úložiště: spustí openbuildos-storage-setup.mjs (rules + CORS), když je
-     Storage zapnuté; při selhání jen varování.
+     Storage zapnuté. Je to bezpečnostní krok — jeho selhání setup ZASTAVÍ.
  10. Zapíše workspaces/<projectId>.modules (mapa modulů pro appku; existující
      nastavení se NEpřepisuje, jen se doplní chybějící moduly).
  11. Vypíše funkce URL + checklist pro moduly, které zapnout nešly.
@@ -344,26 +359,111 @@ function deployRules(project, account, fb) {
   }
 }
 
-/** KROK 4: Deploy funkce s --force a retry; vrátí vyparsovanou URL nebo null. */
-function deployFunctions(project, account, fb) {
-  step("Krok 4/11 — Deploy funkce authExchange");
+/**
+ * KROK 4: Deploy VŠECH funkcí backendu firmy s retry; vrátí URL nebo null.
+ *
+ * 🔴 BEZ `--force` (6. 8. 2026). `--force` odklepne i SMAZÁNÍ funkcí, které
+ * v tomhle checkoutu nejsou. Kdo pustil setup ze staršího klonu, přišel bez
+ * jediného dotazu o `syncMemberClaims` (a pravidla na ni přitom pořád gatují),
+ * nebo rovnou o `sendProjectInvite`, `companyFile` a přesuny projektů.
+ * `--non-interactive` místo něj znamená, že v takové situaci deploy RADŠI
+ * SPADNE a vypíše, co by smazal — mazat funkce se dá jen vědomě, ručně.
+ *
+ * Daň za to je artifact cleanup policy: tu `--force` nastavoval mimochodem.
+ * Bez něj firebase-tools po ÚSPĚŠNÉM deployi skončí chybou „could not set up
+ * cleanup policy". Tu jednu konkrétní chybu proto rozpoznáme a dorovnáme
+ * samostatným příkazem (`functions:artifacts:setpolicy`), který se týká jen
+ * úklidu image v Artifact Registry — žádných funkcí.
+ */
+function deployFunctions(project, account, fb, region) {
+  step("Krok 4/11 — Deploy funkcí backendu (authExchange, syncMemberClaims, …)");
   info("  (čerstvý Blaze projekt: 1. pokus může selhat na build service account — retry to vyřeší)");
   const { cmd, args } = firebaseInvocation(fb, account);
+  const deployArgs = [
+    ...args,
+    "deploy",
+    "--only",
+    "functions",
+    "--project",
+    project,
+    "--non-interactive",
+  ];
   try {
-    const { stdout } = run(
-      cmd,
-      [...args, "deploy", "--only", "functions", "--project", project, "--force"],
-      { retries: 2, baseDelayMs: 8000 }
-    );
-    ok("funkce authExchange nasazena (--force nastavil i artifact cleanup policy)");
+    const { stdout } = run(cmd, deployArgs, {
+      retries: 2,
+      baseDelayMs: 8000,
+      // Opakovat má smysl jen u propagace API/IAM. „Deploy prošel, chybí cleanup
+      // policy" a „smazal bych ti funkce" retry nevyřeší — obojí řešíme níž.
+      retryIf: (out) =>
+        !isCleanupPolicyOnlyFailure(out) && !/do not exist in your local source code/i.test(out),
+    });
+    ok("funkce nasazeny");
+    ensureCleanupPolicy(cmd, args, project, region);
     const url = parseFunctionUrl(stdout);
     if (url) {
       ok(`URL z deploy výstupu: ${url}`);
     }
     return url;
   } catch (err) {
-    fail("Deploy funkce selhal i po retry.");
-    throw new Error(errOutput(err));
+    const output = errOutput(err);
+
+    // Deploy proběhl, spadlo až nastavení cleanup policy (chybí `--force`).
+    if (isCleanupPolicyOnlyFailure(output)) {
+      ok("funkce nasazeny");
+      ensureCleanupPolicy(cmd, args, project, region);
+      const url = parseFunctionUrl(output);
+      if (url) {
+        ok(`URL z deploy výstupu: ${url}`);
+      }
+      return url;
+    }
+
+    // Deploy by smazal funkce, které v tomhle klonu nejsou → zastavit.
+    if (/do not exist in your local source code/i.test(output)) {
+      fail("Deploy zastaven: tenhle klon NEZNÁ funkce, které v projektu už běží.");
+      info("  Skoro jistě máš zastaralý klon self-host kitu. Stáhni čerstvý a spusť znovu:");
+      info("    rm -rf ~/ob && git clone https://github.com/OpenBuildOS/openbuildos.git ~/ob && cd ~/ob/selfhost");
+      info("  Funkce se ze setupu ZÁMĚRNĚ nemažou — smazání `syncMemberClaims` by");
+      info("  při dnešních storage.rules odřízlo firmu od úložiště.");
+      throw new Error(output);
+    }
+
+    fail("Deploy funkcí selhal i po retry.");
+    throw new Error(output);
+  }
+}
+
+/** Pozná chybu, která znamená „funkce nasazeny, jen chybí cleanup policy". */
+function isCleanupPolicyOnlyFailure(output) {
+  return /could not set up cleanup policy/i.test(output ?? "");
+}
+
+/**
+ * Doplní artifact cleanup policy (jinak se v Artifact Registry hromadí image
+ * a firmě roste účet). Best-effort — nesmí shodit setup: s funkcemi to nemá
+ * co dělat. `--force` je tady bezpečné, odklepává jen tuhle politiku.
+ */
+function ensureCleanupPolicy(cmd, args, project, region) {
+  try {
+    run(cmd, [
+      ...args,
+      "functions:artifacts:setpolicy",
+      "--project",
+      project,
+      "--location",
+      region,
+      "--days",
+      "5",
+      "--force",
+      "--non-interactive",
+    ]);
+    ok("artifact cleanup policy nastavena (image starší 5 dnů se mažou)");
+  } catch (err) {
+    warn(
+      "Artifact cleanup policy se nepodařilo nastavit — image v Artifact Registry se budou " +
+        "hromadit (drobný účet navíc). Doplň: firebase functions:artifacts:setpolicy --project " +
+        `${project} --location ${region}. Důvod: ${String(errOutput(err)).split("\n").slice(-1)[0]}`
+    );
   }
 }
 
@@ -649,9 +749,19 @@ function detectCapabilities(gcloud, project, { functionsDeployed = false } = {})
 /**
  * KROK 9: Úložiště — spustí SDÍLENÝ skript openbuildos-storage-setup.mjs jako
  * child process (rules + CORS). Skript se NEmění (musí zůstat identický s kopií
- * v hlavním repu). Selhání je jen varování, ne fatal.
+ * v hlavním repu).
+ *
+ * 🔴 SELHÁNÍ JE FATÁLNÍ (6. 8. 2026). Tenhle krok instaluje bezpečnostní
+ * hranici úložiště. Když selže, zůstane bucket na výchozích pravidlech
+ * z konzole (`allow read, write: if request.auth != null`) — tedy bez izolace
+ * mezi projekty. Dřív to bylo jen varování a CLI přesto hlásilo „✓ dokončeno",
+ * takže se firma o nezabezpečeném bucketu nedozvěděla. Tichý úspěch
+ * u bezpečnostního kroku je nepřijatelný.
+ *
+ * Jediná nefatální větev je „bucket neexistuje" (Storage není zapnuté): tam
+ * není co zabezpečit a appka soubory neuloží. To se hlásí jako varování.
  */
-async function runStorageSetup(project, caps, { yes }, repoRoot) {
+async function runStorageSetup(project, caps, repoRoot) {
   step("Krok 9/11 — Úložiště (openbuildos-storage-setup: storage.rules + CORS)");
 
   if (caps.storage === false) {
@@ -662,38 +772,41 @@ async function runStorageSetup(project, caps, { yes }, repoRoot) {
     );
     return;
   }
-  if (caps.storage === null) {
-    let proceed = false;
-    if (!yes) {
-      proceed = await confirm("  Stav Storage se nepodařilo zjistit. Spustit krok Úložiště i tak?");
-    }
-    if (!proceed) {
-      warn(
-        "Úložiště přeskočeno (stav Storage neznámý). Až Storage zapneš/ověříš, spusť: " +
-          `node scripts/openbuildos-storage-setup.mjs --project ${project}`
-      );
-      return;
-    }
-  }
 
+  // caps.storage === null (stav se nepodařilo zjistit): krok se pouští TAKY.
+  // Autorita na existenci bucketu je sám storage-setup — když bucket není,
+  // skončí exitem 2 a zpracuje se to jako „přeskočeno", ne jako chyba.
   info("  (spouštím openbuildos-storage-setup.mjs — výstup níže)");
   const script = join(repoRoot, "scripts", "openbuildos-storage-setup.mjs");
   const res = spawnSync(process.execPath, [script, "--project", project], {
     stdio: "inherit",
     cwd: repoRoot,
   });
+
   if (res.status === 0) {
     caps.storage = true;
     ok("úložiště připraveno (bucket + storage.rules + CORS)");
-  } else {
-    if (res.status === 2) {
-      caps.storage = false; // exit 2 = bucket neexistuje
-    }
-    warn(
-      `openbuildos-storage-setup skončil chybou (exit ${res.status ?? "?"}) — nefatální. ` +
-        `Dokonči ručně: node scripts/openbuildos-storage-setup.mjs --project ${project}`
-    );
+    return;
   }
+
+  if (res.status === 2) {
+    caps.storage = false; // exit 2 = bucket neexistuje → není co zabezpečit
+    warn(
+      "Úložiště přeskočeno: Storage bucket neexistuje. Zapni Storage v konzoli " +
+        `(https://console.firebase.google.com/project/${project}/storage, lokace EU/eur3) ` +
+        `a spusť: node scripts/openbuildos-storage-setup.mjs --project ${project}`
+    );
+    return;
+  }
+
+  caps.storage = false;
+  fail(`Krok Úložiště selhal (exit ${res.status ?? "?"}) — a je to bezpečnostní krok.`);
+  info("  Bucket ZŮSTAL na výchozích pravidlech z konzole (kdokoli přihlášený = plný přístup),");
+  info("  nebo appka na něj kvůli CORS nedosáhne. Setup proto končí chybou, ne „hotovo“.");
+  info(`  Dokonči ho: node scripts/openbuildos-storage-setup.mjs --project ${project}`);
+  throw new Error(
+    `openbuildos-storage-setup skončil s exit ${res.status ?? "?"} — storage.rules nejsou nasazeny.`
+  );
 }
 
 /** Převede JS hodnotu na Firestore REST Value (bool/string/number/map). */
@@ -924,12 +1037,20 @@ function printConclusion(url) {
   info("  (Kdyby auto-discovery selhalo: Upravit připojení → „Zadat ručně“ → URL výše.)");
 }
 
+/** Stav úložiště do shrnutí — bezpečnostní krok musí být vidět na první pohled. */
+function storageSummaryLine(caps) {
+  if (!caps) return `${WARN} nedošlo se k němu`;
+  if (caps.storage === true) return `${OK} zabezpečeno (storage.rules + CORS)`;
+  return `${WARN} vypnuté nebo NEZABEZPEČENÉ — viz varování výše`;
+}
+
 /** Závěrečné shrnutí. */
-function printSummary({ project, region, url, success }) {
+function printSummary({ project, region, url, success, caps }) {
   console.log("\n──────────────────────── SHRNUTÍ ────────────────────────");
   console.log(`Projekt:  ${project}`);
   console.log(`Region:   ${region}`);
   console.log(`Stav:     ${success ? `${OK} dokončeno` : `${FAIL} přerušeno chybou`}`);
+  console.log(`Úložiště: ${storageSummaryLine(caps)}`);
   if (url) {
     console.log(`URL:      ${url}`);
   }
@@ -997,11 +1118,12 @@ async function main() {
   }
 
   let url = null;
+  let caps = null;
   try {
     preflight(gcloud, fb); // krok 1 (gcloud null se zde řeší)
     npmInstallFunctions(repoRoot); // krok 2
     deployRules(project, account, fb); // krok 3
-    url = deployFunctions(project, account, fb); // krok 4
+    url = deployFunctions(project, account, fb, region); // krok 4
 
     if (!url) {
       url = describeRunUrl(gcloud, project, region);
@@ -1018,23 +1140,33 @@ async function main() {
     writeFederationConfig(gcloud, project, url); // krok 7b — auto-discovery
 
     // krok 8 — detekce kapacit (deploy functions už prošel → Blaze jistý)
-    const caps = detectCapabilities(gcloud, project, { functionsDeployed: true });
-    await runStorageSetup(project, caps, { yes: args.yes }, repoRoot); // krok 9
+    caps = detectCapabilities(gcloud, project, { functionsDeployed: true });
+    await runStorageSetup(project, caps, repoRoot); // krok 9 (selhání = fatal)
     seedWorkspaceModules(gcloud, project, caps, args.minimal === true); // krok 10
 
     printConclusion(url); // krok 11
-    printSummary({ project, region, url, success: true });
+    printSummary({ project, region, url, success: true, caps });
     return 0;
   } catch (err) {
     console.error(`\n${FAIL} Setup přerušen: ${err.message}`);
-    printSummary({ project, region, url, success: false });
+    printSummary({ project, region, url, success: false, caps });
     return 1;
   }
 }
 
-main()
-  .then((code) => process.exit(code))
-  .catch((err) => {
-    console.error(`${FAIL} Neočekávaná chyba: ${err?.message || err}`);
-    process.exit(1);
-  });
+// `main()` jen při přímém spuštění, ať jdou pomocné funkce importovat v testu.
+// Firma skript vždycky pouští přímo (`node scripts/openbuildos-setup.mjs`),
+// takže se pro ni nic nemění.
+const isDirectRun =
+  Boolean(process.argv[1]) && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isDirectRun) {
+  main()
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      console.error(`${FAIL} Neočekávaná chyba: ${err?.message || err}`);
+      process.exit(1);
+    });
+}
+
+export { isCleanupPolicyOnlyFailure, storageSummaryLine, parseFunctionUrl, isOrgPolicyError };

@@ -4,8 +4,12 @@ import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
 import { HttpsError, onCall, onRequest, type Request } from "firebase-functions/v2/https";
+import { onDocumentUpdated } from "firebase-functions/v2/firestore";
 import * as logger from "firebase-functions/logger";
 import type { Response } from "express";
+
+// Serverové povýšení schválené revize výkresu do Plánů (viz planPromotion.ts).
+import { isApprovalTransition, promoteApprovedDrawing } from "./planPromotion";
 
 // Odesílání pozvánek e-mailem (samostatný modul, viz sendProjectInvite.ts).
 export { sendProjectInvite } from "./sendProjectInvite";
@@ -712,3 +716,84 @@ export const syncMemberClaims = onCall<
 
   return { synced: true, revoked: revoke };
 });
+
+/**
+ * `promoteApprovedDrawingToPlan` — schválený jednostránkový výkres se povýší
+ * do Plánů na SERVERU (#506, fáze 2).
+ *
+ * ⭐ PROČ TRIGGER, NE CALLABLE.
+ *  1. Smyslem změny je, aby povýšení NEZÁVISELO na prohlížeči schvalovatele.
+ *     Callable by se pořád volala z jeho záložky — kdyby ji zavřel, ztratil
+ *     signál nebo mu vypršel token mezi schválením a druhým voláním, revize by
+ *     byla schválená a výkres by v Plánech nebyl. Trigger vychází z DAT: jakmile
+ *     je schválení commitnuté ve Firestoru, důsledek nastane nezávisle na tom,
+ *     co dělá klient.
+ *  2. Selhání zůstane VIDĚT v datech (marker na revizi) i v logu backendu;
+ *     u callable by zmizelo s tou záložkou, ve které se stalo.
+ *  3. Callable by si musela sama ověřit, že volající SMÍ schvalovat — tedy
+ *     zduplikovat `isApprover` z firestore.rules do TypeScriptu. Trigger žádné
+ *     nové rozhodnutí o oprávnění nedělá: čte stav, který pravidly už prošel.
+ *  4. Schválení se zapisuje z několika míst klienta; trigger je zachytí všechna,
+ *     aniž by se sahalo na `src/` (kde souběžně běží fáze 1).
+ *
+ * Cena horší chybové zpětné vazby (hlavní výhoda callable) se platí zápisem
+ * výsledku zpátky na revizi (`documentVersions/{id}.planPromotion`), takže UI
+ * má co ukázat a odmítnuté povýšení nemůže skončit tiše — viz „nulté pravidlo"
+ * v #506.
+ *
+ * ⚠️ REGION SE ZÁMĚRNĚ NEURČUJE (na rozdíl od ostatních funkcí v tomhle souboru).
+ * Eventarc trigger MUSÍ ležet v téže lokaci jako databáze Firestore; firebase-tools
+ * si lokaci databáze zjistí a region funkce z ní odvodí (`eur3` → `europe-west1`,
+ * tedy totéž, co má zbytek). Natvrdo psaný region by se rozešel s triggerem
+ * v každém zákaznickém projektu, kde si firma zvolila jinou lokaci databáze —
+ * a tenhle kit se nasazuje právě do nich.
+ */
+export const promoteApprovedDrawingToPlan = onDocumentUpdated(
+  {
+    document: "workspaces/{workspaceId}/projects/{projectId}/documentVersions/{versionId}",
+    // ⚠️ ŽÁDNÉ `retry: true`, i když by se sem hodilo (funkce JE idempotentní).
+    // firebase-tools odmítne nasadit failure policy bez `--force` — a `--force`
+    // v self-host setupu použít NESMÍME: odklepl by zároveň smazání funkcí,
+    // které v klonu nejsou. Přesně tak přišla firma o sedm funkcí, než se to
+    // 6. 8. 2026 zakázalo (docs/REPO_BOUNDARIES.md). Platí tedy
+    // `RETRY_POLICY_DO_NOT_RETRY`; selhání není tiché — zůstane po něm marker
+    // `planPromotion.status = "failed"`, který UI ukáže.
+  },
+  async (event) => {
+    const before = event.data?.before.data();
+    const after = event.data?.after.data();
+    if (!after || !isApprovalTransition(before?.status, after.status)) {
+      // Sem spadne i vlastní zápis markeru — status se nezměnil, takže se
+      // trigger nemůže zacyklit.
+      return;
+    }
+
+    const { workspaceId, projectId, versionId } = event.params;
+
+    try {
+      const result = await promoteApprovedDrawing(getFirestore(getLocalApp()), {
+        workspaceId,
+        projectId,
+        versionId,
+      });
+      logger.info("promoteApprovedDrawingToPlan", { workspaceId, projectId, versionId, ...result });
+    } catch (error) {
+      logger.error("promoteApprovedDrawingToPlan selhalo", { workspaceId, projectId, versionId, error });
+      // Uživatel se to musí dozvědět, i když trigger doběhne s chybou.
+      await getFirestore(getLocalApp())
+        .doc(`workspaces/${workspaceId}/projects/${projectId}/documentVersions/${versionId}`)
+        .set(
+          {
+            planPromotion: {
+              status: "failed",
+              reason: error instanceof Error ? error.message : String(error),
+              at: new Date().toISOString(),
+            },
+          },
+          { merge: true }
+        )
+        .catch(() => undefined);
+      throw error;
+    }
+  }
+);

@@ -390,8 +390,14 @@ function deployFunctions(project, account, fb, region) {
   ];
   try {
     const { stdout } = run(cmd, deployArgs, {
-      retries: 2,
-      baseDelayMs: 8000,
+      // 🔴 Od `promoteApprovedDrawingToPlan` je v balíčku Firestore trigger, a ten
+      // potřebuje Eventarc Service Agenta. V projektu, kde se 2. generace funkcí
+      // nasazuje POPRVÉ, agent ještě nemá roli a deploy skončí „Permission denied
+      // while using the Eventarc Service Agent". Google k tomu píše „a few minutes",
+      // a naměřeno to opravdu bylo v řádu minut — původní 8s/16s backoff byl na to
+      // krátký a setup na čerstvém projektu spadl. Proto 20s/40s/80s.
+      retries: 3,
+      baseDelayMs: 20000,
       // Opakovat má smysl jen u propagace API/IAM. „Deploy prošel, chybí cleanup
       // policy" a „smazal bych ti funkce" retry nevyřeší — obojí řešíme níž.
       retryIf: (out) =>
@@ -428,6 +434,19 @@ function deployFunctions(project, account, fb, region) {
       throw new Error(output);
     }
 
+    // Eventarc Service Agent se v čerstvém projektu propaguje i několik minut.
+    // Není to chyba klonu ani oprávnění firmy — jen se má počkat a pustit znovu.
+    if (isEventarcAgentPropagation(output)) {
+      fail("Deploy funkcí selhal na Eventarc Service Agentovi (Firestore trigger).");
+      info("  Tohle potká KAŽDÝ projekt, kde se 2. generace funkcí nasazuje poprvé.");
+      info("  Není potřeba nic měnit — počkej 3–5 minut a spusť setup znovu:");
+      info(`    node scripts/openbuildos-setup.mjs --project ${project}`);
+      info("  Kdyby to trvalo dál, zkontroluj, že service agent");
+      info(`    service-<číslo projektu>@gcp-sa-eventarc.iam.gserviceaccount.com`);
+      info("  má roli roles/eventarc.serviceAgent.");
+      throw new Error(output);
+    }
+
     fail("Deploy funkcí selhal i po retry.");
     throw new Error(output);
   }
@@ -436,6 +455,14 @@ function deployFunctions(project, account, fb, region) {
 /** Pozná chybu, která znamená „funkce nasazeny, jen chybí cleanup policy". */
 function isCleanupPolicyOnlyFailure(output) {
   return /could not set up cleanup policy/i.test(output ?? "");
+}
+
+/**
+ * Pozná „Eventarc Service Agent se ještě nestihl propagovat". Jediné řešení je
+ * počkat a spustit znovu — proto se to nesmí hlásit jako obecné selhání deploye.
+ */
+function isEventarcAgentPropagation(output) {
+  return /eventarc service agent/i.test(output ?? "");
 }
 
 /**
@@ -1169,4 +1196,10 @@ if (isDirectRun) {
     });
 }
 
-export { isCleanupPolicyOnlyFailure, storageSummaryLine, parseFunctionUrl, isOrgPolicyError };
+export {
+  isCleanupPolicyOnlyFailure,
+  isEventarcAgentPropagation,
+  storageSummaryLine,
+  parseFunctionUrl,
+  isOrgPolicyError,
+};

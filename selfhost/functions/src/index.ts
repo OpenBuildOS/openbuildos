@@ -728,7 +728,8 @@ export const syncMemberClaims = onCall<
  *     byla schválená a výkres by v Plánech nebyl. Trigger vychází z DAT: jakmile
  *     je schválení commitnuté ve Firestoru, důsledek nastane nezávisle na tom,
  *     co dělá klient.
- *  2. Platforma trigger při chybě opakuje; selhání callable je problém uživatele.
+ *  2. Selhání zůstane VIDĚT v datech (marker na revizi) i v logu backendu;
+ *     u callable by zmizelo s tou záložkou, ve které se stalo.
  *  3. Callable by si musela sama ověřit, že volající SMÍ schvalovat — tedy
  *     zduplikovat `isApprover` z firestore.rules do TypeScriptu. Trigger žádné
  *     nové rozhodnutí o oprávnění nedělá: čte stav, který pravidly už prošel.
@@ -750,6 +751,13 @@ export const syncMemberClaims = onCall<
 export const promoteApprovedDrawingToPlan = onDocumentUpdated(
   {
     document: "workspaces/{workspaceId}/projects/{projectId}/documentVersions/{versionId}",
+    // ⚠️ ŽÁDNÉ `retry: true`, i když by se sem hodilo (funkce JE idempotentní).
+    // firebase-tools odmítne nasadit failure policy bez `--force` — a `--force`
+    // v self-host setupu použít NESMÍME: odklepl by zároveň smazání funkcí,
+    // které v klonu nejsou. Přesně tak přišla firma o sedm funkcí, než se to
+    // 6. 8. 2026 zakázalo (docs/REPO_BOUNDARIES.md). Platí tedy
+    // `RETRY_POLICY_DO_NOT_RETRY`; selhání není tiché — zůstane po něm marker
+    // `planPromotion.status = "failed"`, který UI ukáže.
   },
   async (event) => {
     const before = event.data?.before.data();

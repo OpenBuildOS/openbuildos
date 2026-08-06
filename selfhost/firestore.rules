@@ -943,10 +943,76 @@ service cloud.firestore {
           && request.resource.data.workspaceId == resource.data.workspaceId
           && !request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['memberIds', 'roles'])
+        ) || (
+          // Značka „stavba žije" — `lastActivityAt`
+          // (docs/BILLING_IMPLEMENTATION.md kap. 2.2, návrh
+          // docs/ai/blok-a-rules-navrh.md). Píše ji `src/services/projectActivity.ts`
+          // po jakékoli práci na stavbě, takže ji musí umět zapsat i běžný
+          // přispěvatel, který do project docu jinak psát nesmí. Bez téhle
+          // větve se značka zapisuje jen tehdy, když je zrovna online správce —
+          // tedy prakticky nikdy, a měření je k ničemu.
+          //
+          // Uzavřené `hasOnly` (ne `!hasAny([...])`): propustí PRÁVĚ jeden klíč,
+          // takže se přes tuhle větev nedá sáhnout na memberIds/roles/
+          // workspaceId/archived/modules — ani na pole, která na project docu
+          // teprve přibudou. Allowlist přes `!hasAny` by naopak s každým novým
+          // polem tiše otevíral díru.
+          //
+          // Nejhorší možné zneužití: člen zapíše nepravdivý čas poslední
+          // aktivity na stavbě, kde stejně je členem.
+          isRealUser()
+          && principal() in resource.data.get('memberIds', [])
+          && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['lastActivityAt'])
+          // ISO řetězec, shodně s createdAt/updatedAt v src/services/projects.ts.
+          && request.resource.data.lastActivityAt is string
         ) || inviteSelfJoin(pid);
       allow delete: if isRealUser()
         && (resource.data.get('roles', {}).get(principal(), '') == 'admin'
             || isWsAdmin(resource.data.get('workspaceId', '')));
+    }
+
+    // ---------------------------------------------------------------------
+    // Počítadlo spotřeby stavby — `projects/{pid}/usage/{docId}`
+    // (docs/BILLING_IMPLEMENTATION.md kap. 2.3, návrh docs/ai/blok-a-rules-navrh.md).
+    //
+    // Mění se VÝHRADNĚ přírůstkem (`FieldValue.increment`) při uploadu nebo
+    // trvalém smazání — `src/services/projectUsage.ts`. Že jde opravdu
+    // o increment, rules ověřit nedokážou; vynutitelné maximum je uzavřený
+    // seznam klíčů (`hasOnly`), aby se do dokumentu nedaly propašovat cizí pole
+    // (`plan`, `amount`, …), ze kterých by někdo mohl začít odvozovat cenu.
+    //
+    // 🔴 Zápis je klientský, tedy FALŠOVATELNÝ. Vědomě přijaté: tenhle blok
+    // MĚŘÍ, nefakturuje. Až se z čísla bude počítat částka, musí se přepnout na
+    // `allow write: if false` a psát ho Cloud Function — stejně jako
+    // `workspaces/{wid}/billing/current`. Do té doby se z `usage` nesmí
+    // odvozovat žádná částka.
+    //
+    // Proč je bránou zápisu ČLENSTVÍ, a ne `canEditContent`: novou fotku smí
+    // založit každý člen projektu VČETNĚ viewera — `photos` gatuje
+    // `canCreateContent` a `storage.rules` výslovně pouští založení nového
+    // objektu „každému členu projektu včetně viewera". S užší bránou by
+    // viewerův upload počítadlo nezvedl a spotřeba by se tiše PODhodnotila —
+    // přesně ta třída chyby, kvůli které tahle pravidla vznikla. Nikomu to
+    // nedává nic navíc: kdo smí nahrávat obsah, ten číslem stejně hýbe.
+    match /projects/{pid}/usage/{docId} {
+      allow read: if isProjectMember(projectData(pid).get('workspaceId', ''), pid);
+      // POZOR: `create, update` — NIKDY `write`. `allow write` pokrývá i delete
+      // a s `allow delete: if false` níž by se OR-oval (souběžné allow větve se
+      // skládají SJEDNOCENÍM, ne průnikem), takže by zákaz mazání byl pouhá
+      // dekorace a počítadlo by šlo vynulovat smazáním dokumentu. Ověřeno
+      // v emulátoru: `allow write` + `allow delete: if false` mazání PUSTÍ.
+      // (Že to dnes při doslovném `hasOnly` nespadne, je jen náhoda —
+      // `request.resource` je u delete null, takže výraz skončí chybou. Na
+      // takové náhodě se bezpečnost stavět nesmí.)
+      allow create, update: if isProjectMember(projectData(pid).get('workspaceId', ''), pid)
+        && request.resource.data.keys()
+             .hasOnly(['storageBytes', 'photoCount', 'docCount', 'updatedAt'])
+        && request.resource.data.get('storageBytes', 0) is number
+        && request.resource.data.get('photoCount', 0) is number
+        && request.resource.data.get('docCount', 0) is number;
+      // Počítadlo se snižuje ZÁPORNÝM přírůstkem, ne mazáním dokumentu.
+      allow delete: if false;
     }
 
     // Immutable per-project audit log.

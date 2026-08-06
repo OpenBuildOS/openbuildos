@@ -4,7 +4,7 @@
   "description": "OpenBuildOS token-exchange Cloud Function (authExchange) — jedno přihlášení napříč samostatnými self-host Firebase backendy.",
   "private": true,
   "engines": {
-    "node": "20"
+    "node": "22"
   },
   "main": "lib/index.js",
   "scripts": {

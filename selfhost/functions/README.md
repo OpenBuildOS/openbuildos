@@ -71,7 +71,7 @@ Funkce jsou **součástí open-source repozitáře** OpenBuildOS.
 
 ## Funkce v balíčku
 
-Devět exportů. **`authExchange` a `syncMemberClaims` jsou povinné** — bez nich
+Deset exportů. **`authExchange` a `syncMemberClaims` jsou povinné** — bez nich
 nikdo nedostane claims a pravidla úložiště nepustí ke svým souborům ani
 vlastníka firmy.
 
@@ -87,6 +87,10 @@ vlastníka firmy.
 - `sendProjectInvite` — odeslání pozvánky e-mailem (SMTP/Resend).
 - **Přenos projektu (#291)** — `exportProjectBackup`, `prepareProjectBackupImport`,
   `importProjectBackup`, `deleteProjectPermanently` (viz níže).
+- `promoteApprovedDrawingToPlan` — **Firestore trigger** (jediný v balíčku):
+  po schválení jednostránkového výkresu ho povýší do Plánů. Běží na serveru
+  schválně — zápis do `plans` vyžaduje editační práva, která schvalovatel
+  (TDI, projektant) mít nemusí. Viz `src/planPromotion.ts`.
 
 ## Přenos projektu mezi backendy (#291)
 

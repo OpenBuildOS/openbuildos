@@ -16,7 +16,11 @@ import {
   missingClaimsFunctions,
   rulesRequireClaims,
 } from "./openbuildos-storage-setup.mjs";
-import { isCleanupPolicyOnlyFailure, storageSummaryLine } from "./openbuildos-setup.mjs";
+import {
+  isCleanupPolicyOnlyFailure,
+  isEventarcAgentPropagation,
+  storageSummaryLine,
+} from "./openbuildos-setup.mjs";
 
 const selfhostRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -72,4 +76,18 @@ test("shrnutí nehlásí zabezpečené úložiště, když zabezpečené není",
   assert.match(storageSummaryLine({ storage: true }), /zabezpečeno/);
   assert.doesNotMatch(storageSummaryLine({ storage: false }), /^✓/);
   assert.doesNotMatch(storageSummaryLine(null), /^✓/);
+});
+
+// Firestore trigger (promoteApprovedDrawingToPlan) potřebuje Eventarc Service
+// Agenta. Na projektu, kde se 2. generace funkcí nasazuje poprvé, deploy jednou
+// spadne — to se NESMÍ hlásit jako „rozbitý klon" nebo „chybí oprávnění firmy".
+test("propagace Eventarc agenta se pozná a odliší od ostatních selhání", () => {
+  const eventarc =
+    'HTTP Error: 400, Validation failed for trigger projects/x/locations/eur3/triggers/y: '
+    + 'Invalid resource state for "": Permission denied while using the Eventarc Service Agent.';
+  assert.equal(isEventarcAgentPropagation(eventarc), true);
+  assert.equal(isEventarcAgentPropagation("could not set up cleanup policy"), false);
+  assert.equal(isEventarcAgentPropagation("do not exist in your local source code"), false);
+  assert.equal(isEventarcAgentPropagation(""), false);
+  assert.equal(isEventarcAgentPropagation(undefined), false);
 });

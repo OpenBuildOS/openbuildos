@@ -2,8 +2,14 @@ rules_version = '2';
 
 // OpenBuildOS workspace-project security rules.
 //
+// MODEL OPRÁVNĚNÍ (#506, fáze 2): role není stupeň na škále, ale POJMENOVANÁ
+// KOMBINACE nezávislých oprávnění `read` · `contribute` · `edit` · `certify` ·
+// `publish` · `manage`. Vstupní bod je helper `hasPerm()` níž; nic jiného už
+// nesmí rozhodovat podle názvu role. Klientské zrcadlo modelu žije v
+// `src/lib/permissions/projectPermissions.ts`.
+//
 // Membership source of truth lives on the top-level /projects/{pid} document:
-//   { workspaceId: string, memberIds: string[], roles: { [uid]: viewer|editor|admin } }
+//   { workspaceId: string, memberIds: string[], roles: { [uid]: reader|viewer|editor|admin } }
 // Workspace-level admins live on /workspaces/{wid}: { ownerId, adminIds }.
 // Invites are bearer tokens under /workspaces/{wid}/invites/{inviteId} and are
 // redeemed atomically (invite claim + members doc + project membership arrays
@@ -90,16 +96,114 @@ service cloud.firestore {
             || isWsAdmin(wid));
     }
 
-    function canEditContent(wid, pid) {
-      return isRealUser()
-        && projectInWorkspace(wid, pid)
-        && (projectRole(pid) in ['editor', 'admin'] || isWsAdmin(wid));
+    // ---------------------------------------------------------------------
+    // MODEL OPRÁVNĚNÍ (#506, fáze 2) — skládaná MNOŽINA, ne žebříček
+    //
+    // Dosud byla role stupeň na škále: kdo chtěl vyšší úkon, musel mít i
+    // všechna nižší práva. Kvůli tomu KONTROLNÍ role nemohla provést KONTROLNÍ
+    // ÚKON — TDI/projektant, který má jen schvalovat, potřeboval editační právo
+    // k cizímu obsahu, jinak mu pravidla odmítla ověření úkolu (a povýšení
+    // schváleného výkresu do Plánů).
+    //
+    //   read       vidí projekt (= členství; nikdy se neodebírá)
+    //   contribute zakládá VLASTNÍ obsah a mění JEN svůj
+    //   edit       mění CIZÍ obsah
+    //   certify    schvaluje revize dokumentů a ověřuje úkoly (verified)
+    //   publish    vydává do OFICIÁLNÍ dokumentace
+    //   manage     spravuje členy a nastavení projektu
+    //
+    // 🔑 `certify` NEVYŽADUJE `edit`. To je celý smysl přestavby.
+    //
+    // Zdroje: role z `projects/{pid}.roles[principal]` (jediný zdroj, který
+    // vynucují pravidla) + dva ORTOGONÁLNÍ flagy ze zrcadla členů
+    // (`canApprove` → certify, `canPublishOfficial` → publish). Vlastník/admin
+    // firmy má na svých projektech vše.
+    //
+    // ⚠️ ZRCADLO tohohle modelu na klientu je `src/lib/permissions/projectPermissions.ts`.
+    // Když měníš jedno, měň obojí — a přidej rules test do tests/rules/firestore.permissions.test.ts.
+    // ---------------------------------------------------------------------
+
+    // Migrační tabulka role → množina oprávnění (#506: „nikomu nic nevezme").
+    //
+    // ⚠️ `editor` má i `publish`: do #506 publikoval do oficiální dokumentace
+    // IMPLICITNĚ (helper `canPublishOfficial` = `canEditContent || flag`).
+    // Odebrat mu to by rozbilo hlavní cestu nahrávání dokumentů.
+    //
+    // 🪦 `company_lead` je ZRUŠENÁ role (#506) — nově ji nejde přiřadit (chybí
+    // v allowlistu zrcadla členů níž). Tabulka ji drží JEN kvůli existujícím
+    // datům v `projects/{pid}.roles`, ať o práva nepřijde nikdo, komu se do dat
+    // dostala. Migrace dle zadání: read + contribute + edit.
+    //
+    // Neznámá / chybějící role se chová jako `viewer` — přesně jako dosud
+    // (`canCreateContent` stálo na pouhém členství). Fail-safe DOLŮ nejdeme:
+    // členovi s legacy hodnotou v `roles` bychom vzali zakládání obsahu.
+    function rolePermissions(role) {
+      return role == 'admin'
+          ? ['read', 'contribute', 'edit', 'certify', 'publish', 'manage']
+        : role == 'editor'
+          ? ['read', 'contribute', 'edit', 'publish']
+        : role == 'company_lead'
+          ? ['read', 'contribute', 'edit']
+        : role == 'reader'
+          ? ['read']
+        : ['read', 'contribute'];
     }
 
-    function canManageProject(wid, pid) {
-      return isRealUser()
-        && projectInWorkspace(wid, pid)
-        && (projectRole(pid) == 'admin' || isWsAdmin(wid));
+    function memberMirrorPath(wid, pid) {
+      return /databases/$(database)/documents/workspaces/$(wid)/projects/$(pid)/members/$(principal());
+    }
+
+    // Ortogonální oprávnění z flagů na zrcadle členů. `exists()` je tu schválně:
+    // bez něj by `get()` na chybějící dokument byl chybový výraz a jeho
+    // vyhodnocení by záviselo na pořadí větví v `||`. Cesta se v rámci requestu
+    // cachuje, takže je to nejvýš jedno čtení navíc.
+    function memberFlagPermissions(wid, pid) {
+      return exists(memberMirrorPath(wid, pid))
+        ? (get(memberMirrorPath(wid, pid)).data.get('canApprove', false) == true
+             ? ['certify'] : [])
+          .concat(get(memberMirrorPath(wid, pid)).data.get('canPublishOfficial', false) == true
+             ? ['publish'] : [])
+        : [];
+    }
+
+    // 🔴 VÝKONNOSTNÍ MEZ: Firestore vyhodnotí nejvýš 1000 výrazů na požadavek.
+    // Množina se proto počítá JEDNOU a dál se PŘEDÁVÁ jako seznam
+    // (`hasAny([...])`), místo aby se pro každé oprávnění volal zvlášť gate.
+    // Naivní varianta (`canEdit() || canCertify() || canPublish()`) ten strop
+    // přerazila hned u prvního složeného pravidla — a selhala jako
+    // permission-denied, tedy k nerozeznání od chybějícího práva.
+    function permsOf(wid, pid) {
+      return isProjectMember(wid, pid)
+        ? (isWsAdmin(wid)
+            ? ['read', 'contribute', 'edit', 'certify', 'publish', 'manage']
+            : rolePermissions(projectRole(pid)).concat(memberFlagPermissions(wid, pid)))
+        : [];
+    }
+
+    // Jednorázová kontrola jednoho oprávnění. Pro pravidla, která jich testují
+    // víc, si vyzvedni seznam přes `permsOf()` a předej ho dál.
+    function hasPerm(wid, pid, perm) {
+      return permsOf(wid, pid).hasAny([perm]);
+    }
+
+    function canContribute(wid, pid) {
+      return hasPerm(wid, pid, 'contribute');
+    }
+
+    function canEdit(wid, pid) {
+      return hasPerm(wid, pid, 'edit');
+    }
+
+    function canCertify(wid, pid) {
+      return hasPerm(wid, pid, 'certify');
+    }
+
+    function canPublish(wid, pid) {
+      return hasPerm(wid, pid, 'publish');
+    }
+
+    function canManage(wid, pid) {
+      return hasPerm(wid, pid, 'manage');
     }
 
     // Bootstrap-friendly variant: also lets admins create a project and its
@@ -108,8 +212,8 @@ service cloud.firestore {
     // batched /projects create was itself validated (workspace admin with
     // roles[uid] == 'admin'). For pre-existing projects only the pre-state
     // role counts, so an invite redeem cannot escalate itself to admin.
-    function canManageProjectAfter(wid, pid) {
-      return canManageProject(wid, pid)
+    function canManageAfter(wid, pid) {
+      return canManage(wid, pid)
         || (isRealUser()
             && !exists(projectPath(pid))
             && getAfter(projectPath(pid)).data.get('workspaceId', '') == wid
@@ -135,9 +239,13 @@ service cloud.firestore {
         && memberCompany(pid, principal()) == companyId;
     }
 
+    // Vedoucí firemního prostoru = člen TÉŽE Company, který smí měnit cizí obsah.
+    // Dřív to byl výčet rolí ['company_lead','editor','admin']; po zrušení
+    // `company_lead` (#506) je to prostě oprávnění `edit` — legacy nositelé role
+    // ho podle migrační tabulky mají dál, takže se nikomu nic nemění.
     function isCompanySpaceLead(wid, pid, companyId) {
       return isSameProjectCompany(wid, pid, companyId)
-        && projectRole(pid) in ['company_lead', 'editor', 'admin'];
+        && canEdit(wid, pid);
     }
 
     function hasCompanyResourceAccess(wid, pid, companyId, data) {
@@ -212,62 +320,86 @@ service cloud.firestore {
       return resource.data.get('createdBy', '') == principal();
     }
 
-    // May modify (update/delete) an existing user-generated content doc.
-    function canModifyContent(wid, pid) {
-      return isProjectMember(wid, pid) && (
-        projectRole(pid) in ['editor', 'admin'] || isWsAdmin(wid)
-        || authoredBySelf()
-        || (projectRole(pid) == 'company_lead'
-            && memberCompany(pid, principal()) != ''
-            && memberCompany(pid, resource.data.get('createdBy', '')) == memberCompany(pid, principal()))
-      );
+    // Změna/smazání existujícího obsahu: cizí smí `edit`, vlastní `contribute`.
+    // (Firemní větev pro `company_lead` zanikla — legacy nositelé té role mají
+    // podle migrační tabulky rovnou `edit`, tedy víc, ne míň.)
+    function canModifyWith(perms) {
+      return perms.hasAny(['edit'])
+        || (perms.hasAny(['contribute']) && authoredBySelf());
     }
 
-    // May create a user-generated content doc. Author (createdBy) musí být buď
+    function canModifyContent(wid, pid) {
+      return canModifyWith(permsOf(wid, pid));
+    }
+
+    // Založení obsahu = `contribute`. Author (createdBy) musí být buď
     // PRÁZDNÝ (obsah ještě nezadrátovaný na authorship → editovatelný jen
-    // editor/admin, bezpečné), nebo SÁM volající (principal) — nikdy NĚKDO JINÝ
+    // přes `edit`, bezpečné), nebo SÁM volající (principal) — nikdy NĚKDO JINÝ
     // (zákaz spoofingu autorství). Tím se žádný create nerozbije, i kdyby daná
     // kolekce createdBy nestampovala.
-    function canCreateContent(wid, pid) {
-      return isProjectMember(wid, pid)
+    function canCreateWith(perms) {
+      return perms.hasAny(['contribute'])
         && (request.resource.data.get('createdBy', '') == ''
             || request.resource.data.get('createdBy', '') == principal());
     }
 
-    // Member designated as a document approver on this project (admin / workspace
-    // admin always count; others need `canApprove == true` on their member doc).
-    // Gate for review decisions on document versions (approve/reject/issue) — WP1.
-    function isApprover(wid, pid) {
-      return isProjectMember(wid, pid)
-        && (projectRole(pid) == 'admin'
-            || isWsAdmin(wid)
-            || get(/databases/$(database)/documents/workspaces/$(wid)/projects/$(pid)/members/$(principal()))
-                 .data.get('canApprove', false) == true);
-    }
-
-    // Member allowed to PUBLISH into official documentation (upload new
-    // documents/revisions + „Nahrát do oficiální dokumentace" promote from an
-    // internal company folder). Editor/admin (a workspace admin) publish
-    // implicitly; others need the explicit `canPublishOfficial == true` flag on
-    // their member doc. „Jen určení lidé" — plain viewer members can no longer
-    // create official documents/versions.
-    function canPublishOfficial(wid, pid) {
-      return isProjectMember(wid, pid)
-        && (canEditContent(wid, pid)
-            || get(/databases/$(database)/documents/workspaces/$(wid)/projects/$(pid)/members/$(principal()))
-                 .data.get('canPublishOfficial', false) == true);
+    function canCreateContent(wid, pid) {
+      return canCreateWith(permsOf(wid, pid));
     }
 
     // Anti-spoof atribuce firmě u oficiálních dokumentů: `ownerCompanyId` na create
     // smí být buď prázdný (bez atribuce), VLASTNÍ firma volajícího, NEBO cokoli,
-    // pokud je volající editor/admin (canEditContent) — ten je důvěryhodný správce
+    // pokud volající smí měnit cizí obsah (`edit`) — ten je důvěryhodný správce
     // obsahu a legitimně přeřazuje/publikuje napříč firmami (např. rozdělení chybně
     // spárovaného dokumentu). Omezení „jen vlastní firma" tak reálně drží pro
-    // ne-editor publishera s flagem canPublishOfficial. Čte z `projects/{pid}.companies`.
-    function validOfficialOwnerCompany(wid, pid) {
+    // publishera bez `edit`. Čte z `projects/{pid}.companies`.
+    function validOfficialOwnerCompany(perms, pid) {
       return request.resource.data.get('ownerCompanyId', '') == ''
         || request.resource.data.get('ownerCompanyId', '') == memberCompany(pid, principal())
-        || canEditContent(wid, pid);
+        || perms.hasAny(['edit']);
+    }
+
+    // Založení oficiálního dokumentu / revize: `publish` + anti-spoof firmy
+    // a autorství. Jedno vyhodnocení množiny na celé pravidlo.
+    function officialCreateOk(perms, pid) {
+      return perms.hasAny(['publish'])
+        && validOfficialOwnerCompany(perms, pid)
+        && authorNotSpoofedOnCreate();
+    }
+
+    // Update dokumentu: běžná práva k obsahu, NEBO — u `certify`/`publish` bez
+    // `edit` — jen přepnutí platné revize jako vedlejší efekt schválení/uploadu.
+    function documentUpdateOk(perms) {
+      return canModifyWith(perms)
+        || (perms.hasAny(['certify', 'publish'])
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['currentVersionId', 'updatedAt']));
+    }
+
+    // Update revize dokumentu.
+    //
+    // `certify` zapisuje SVÉ ROZHODNUTÍ: `approvals` mapu, odvozený status
+    // (i supersede předchozí verze) a razítko recenzenta.
+    //
+    // 🔴 Nález R5 (#506): tahle větev dřív NEMĚLA žádné omezení polí, takže
+    // schvalovatel — třeba člen jinak bez práva na cizí obsah — směl u
+    // libovolné verze přepsat `filePath`, `versionLabel` i `documentId`.
+    // Schvalovací právo tak bylo MOCNĚJŠÍ než editorské, přestože ho smí
+    // rozdat i projektový admin, který role měnit nesmí. Teď je uzavřené
+    // `hasOnly` na pole rozhodnutí — přesně to, co zapisuje `documentService.ts`
+    // (`updateVersionStatus` / `recordApprovalDecision`).
+    //
+    // Ostatní (uploader/editor/autor) smí běžné editace, ale NE přechod do
+    // rozhodnutí (zákaz self-approve). Audit se v rules nevynucuje.
+    function versionUpdateOk(perms) {
+      return (perms.hasAny(['certify'])
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+               'status', 'approvals', 'reviewedBy', 'reviewedByName',
+               'reviewedAt', 'reviewerComment', 'updatedAt'
+             ]))
+        || (canModifyWith(perms)
+            && !(request.resource.data.status != resource.data.status
+                 && request.resource.data.status in ['approved', 'approved_with_comments', 'rejected', 'superseded', 'for_construction']));
     }
 
     // Autor obsahu na create nesmí být podvržený: `createdBy` je prázdný nebo přímo
@@ -391,13 +523,12 @@ service cloud.firestore {
         && getAfter(invitePath(wid, inviteId)).data.usedBy == principal();
     }
 
-    // A company lead on the project (company_lead/editor, NOT an admin) may
-    // PROPOSE an invite; it stays pending_approval until a project admin/ws admin
-    // approves it (issue #367). Direct admins/ws admins bypass approval.
+    // Kdo smí pozvánku NAVRHNOUT: člen s `edit` (typicky Koordinátor / vedoucí
+    // úseku), který ale nespravuje projekt. Pozvánka zůstane `pending_approval`,
+    // dokud ji neschválí správce projektu / firmy (issue #367). Správci ji
+    // zakládají rovnou přes `canManage` větev, tuhle nepotřebují.
     function canProposeInvite(wid, pid) {
-      return isRealUser()
-        && projectInWorkspace(wid, pid)
-        && projectRole(pid) in ['company_lead', 'editor'];
+      return canEdit(wid, pid);
     }
 
     match /workspaces/{wid}/invites/{inviteId} {
@@ -405,13 +536,14 @@ service cloud.firestore {
       allow get: if isRealUser();
       allow list: if isWsAdmin(wid);
       allow create: if isRealUser()
-        && request.resource.data.role in ['viewer', 'editor']
+        // Pozvánkou nejde udělit `admin` (eskalace) — jen role bez `manage`.
+        && request.resource.data.role in ['reader', 'viewer', 'editor']
         && request.resource.data.usedBy == null
         && request.resource.data.expiresAt is timestamp
         && request.resource.data.createdBy == principal()
         && (
             // Direct: project admin / workspace admin issues a live invite.
-            (canManageProject(wid, request.resource.data.projectId)
+            (canManage(wid, request.resource.data.projectId)
               && request.resource.data.get('approvalStatus', 'approved') == 'approved')
             // Manager/company lead proposes an invite needing admin approval.
             || (canProposeInvite(wid, request.resource.data.projectId)
@@ -429,13 +561,33 @@ service cloud.firestore {
         )
         // Approve/reject + revoke: project admin / ws admin may edit the invite
         // (this also covers flipping approvalStatus pending_approval -> approved).
-        || canManageProject(wid, resource.data.projectId);
-      allow delete: if canManageProject(wid, resource.data.projectId);
+        || canManage(wid, resource.data.projectId);
+      allow delete: if canManage(wid, resource.data.projectId);
     }
 
     // ---------------------------------------------------------------------
     // Project members mirror (UI metadata; rules read /projects instead)
+    //
+    // 🔴 Nález R1 (#506): tenhle allowlist byl JEDINÉ místo, které minul rename
+    // `company_editor → company_lead`. Pravidla pouštěla `company_editor`, který
+    // v `src/` neexistoval, a odmítala `company_lead`, který existoval — takže
+    // se „Vedoucí úseku" zapsal do vynuceného `projects.roles`, ale ne do
+    // zrcadla, a tentýž člověk měl na dvou obrazovkách dvě různé role.
+    // Fáze 2 roli ruší úplně, takže tu není ani jeden z těch mrtvých názvů.
+    //
+    // `roleAssignable` = role, kterou lze NOVĚ přiřadit. Legacy hodnota (dnes
+    // `company_lead`) smí v dokumentu ZŮSTAT — jinak by byl takový záznam
+    // zamčený navždy a nešlo by u něj nastavit ani `canApprove` (probe P4).
     // ---------------------------------------------------------------------
+
+    function roleAssignable(role) {
+      return role in ['reader', 'viewer', 'editor', 'admin'];
+    }
+
+    function roleWriteOk() {
+      return roleAssignable(request.resource.data.get('role', ''))
+        || request.resource.data.get('role', '') == resource.data.get('role', '');
+    }
 
     match /workspaces/{wid}/projects/{pid}/members/{memberUid} {
       allow get, list: if isProjectMember(wid, pid);
@@ -446,16 +598,15 @@ service cloud.firestore {
           && memberUid == principal()
           && request.resource.data.keys()
               .hasOnly(['role', 'displayName', 'email', 'inviteId', 'joinedAt', 'companyId'])
-          && request.resource.data.role in ['viewer', 'editor']
+          && request.resource.data.role in ['reader', 'viewer', 'editor']
           && redeemOk(wid, pid, request.resource.data.inviteId,
               request.resource.data.role)
         ) || (
-          canManageProjectAfter(wid, pid)
-          && request.resource.data.role in ['viewer', 'editor', 'admin', 'company_editor']
+          canManageAfter(wid, pid)
+          && roleAssignable(request.resource.data.get('role', ''))
         );
-      allow update: if canManageProjectAfter(wid, pid)
-        && request.resource.data.role in ['viewer', 'editor', 'admin', 'company_editor'];
-      allow delete: if canManageProject(wid, pid);
+      allow update: if canManageAfter(wid, pid) && roleWriteOk();
+      allow delete: if canManage(wid, pid);
     }
 
     // Firemní interní pracovní prostory jsou oddělené od oficiálních kolekcí,
@@ -463,7 +614,7 @@ service cloud.firestore {
     match /workspaces/{wid}/projects/{pid}/companySpaces/{companyId} {
       allow get: if isSameProjectCompany(wid, pid, companyId);
       allow list: if false;
-      allow create: if (isSameProjectCompany(wid, pid, companyId) || canManageProject(wid, pid))
+      allow create: if (isSameProjectCompany(wid, pid, companyId) || canManage(wid, pid))
         && request.resource.data.get('companyId', '') == companyId
         && request.resource.data.get('projectId', '') == pid
         && request.resource.data.get('workspaceId', '') == wid
@@ -593,7 +744,7 @@ service cloud.firestore {
             .hasOnly(['readBy'])
         && request.resource.data.readBy.hasAll(resource.data.get('readBy', []))
         && principal() in request.resource.data.readBy;
-      allow delete: if canManageProject(wid, pid);
+      allow delete: if canManage(wid, pid);
     }
 
     // ---------------------------------------------------------------------
@@ -602,12 +753,12 @@ service cloud.firestore {
     // ---------------------------------------------------------------------
 
     // Task status-transition guard (issue #367, docs/TASK_WORKFLOW_USER_STORIES).
-    // 'completed' = Koordinátor+ nebo autor (OQ-4); 'verified' = Schvalovatel
-    // (admin/firma nebo flag canApprove, OQ-5); vrátit verified = Koordinátor+
-    // (OQ-6a). Enforcuje se JEN na změně statusu; nezměněný status projde komukoli,
-    // kdo smí obsah upravit (editace jiných polí u hotového úkolu se nerozbije).
-    function canCompleteTask(wid, pid) {
-      return projectRole(pid) in ['company_lead', 'editor', 'admin'] || isWsAdmin(wid);
+    // 'completed' = `edit` nebo autor (OQ-4); 'verified' = `certify` (OQ-5);
+    // vrátit verified = `edit` (OQ-6a). Enforcuje se JEN na změně statusu;
+    // nezměněný status projde komukoli, kdo smí obsah upravit (editace jiných
+    // polí u hotového úkolu se nerozbije).
+    function canCompleteTask(perms) {
+      return perms.hasAny(['edit']);
     }
     // Autor úkolu (createdBy == principal). Funguje pro create i update — createdBy
     // je u update immutable, takže request.resource nese autora v obou případech.
@@ -615,30 +766,30 @@ service cloud.firestore {
       return request.resource.data.get('createdBy', '') == principal();
     }
     // Kdo smí dostat úkol DO „hotovo" stavu (issue #367, viz TASK_WORKFLOW_USER_STORIES):
-    //  - 'verified'  = Schvalovatel (Správce projektu/firmy NEBO flag canApprove) — OQ-5
-    //  - 'completed' = Koordinátor+ NEBO autor vlastního úkolu — OQ-4
-    function canReachDoneStatus(wid, pid, status) {
-      return status == 'verified' ? isApprover(wid, pid)
-        : status == 'completed' ? (canCompleteTask(wid, pid) || taskAuthoredBySelf())
+    //  - 'verified'  = `certify` — OQ-5
+    //  - 'completed' = `edit` NEBO autor vlastního úkolu — OQ-4
+    function canReachDoneStatus(perms, status) {
+      return status == 'verified' ? perms.hasAny(['certify'])
+        : status == 'completed' ? (canCompleteTask(perms) || taskAuthoredBySelf())
         : true;
     }
     // Návrat ZPĚT z „hotovo" stavu (reopen). Dopředný postup completed→verified NENÍ
-    // reopen (řeší ho jen canReachDoneStatus = isApprover), proto se sem nepočítá.
+    // reopen (řeší ho jen canReachDoneStatus = `certify`), proto se sem nepočítá.
     //  - z 'verified'  = Koordinátor+ (vrací nalezenou vadu; nemusí být admin) — OQ-6a
     //  - z 'completed' do práce = Koordinátor+ NEBO autor — OQ-6c
-    function reopenOk(wid, pid, oldStatus, newStatus) {
-      return oldStatus == 'verified' ? canCompleteTask(wid, pid)
+    function reopenOk(perms, oldStatus, newStatus) {
+      return oldStatus == 'verified' ? canCompleteTask(perms)
         : (oldStatus == 'completed' && newStatus != 'verified')
-            ? (canCompleteTask(wid, pid) || taskAuthoredBySelf())
+            ? (canCompleteTask(perms) || taskAuthoredBySelf())
         : true;
     }
     // Přechod je OK, když se status NEMĚNÍ, nebo když volající smí CÍLOVÝ dosáhnout
     // A (jde-li o návrat z hotovo) smí i reopen. verified nastaví Schvalovatel,
     // vrací Koordinátor+.
-    function taskStatusTransitionOk(wid, pid) {
+    function taskStatusTransitionOk(perms) {
       return request.resource.data.get('status', '') == resource.data.get('status', '')
-        || (canReachDoneStatus(wid, pid, request.resource.data.get('status', ''))
-            && reopenOk(wid, pid, resource.data.get('status', ''), request.resource.data.get('status', '')));
+        || (canReachDoneStatus(perms, request.resource.data.get('status', ''))
+            && reopenOk(perms, resource.data.get('status', ''), request.resource.data.get('status', '')));
     }
 
     // ── #358 Interní úkoly firmy (scope = company_internal) ──────────────────
@@ -674,6 +825,45 @@ service cloud.firestore {
             : true);
     }
 
+    // 🔑 JÁDRO #506: ověření úkolu je VLASTNÍ PŘECHOD, ne update cizího obsahu.
+    //
+    // Dosud update úkolu vyžadoval `canModifyContent`, takže schvalovatel bez
+    // editačních práv (TDI, projektant) nemohl posunout do `verified` NIC, co
+    // sám nenapsal — přestože `canReachDoneStatus` mu to výslovně dovolovalo.
+    // Kontrolní role tedy nemohla provést kontrolní úkon.
+    //
+    // Tahle větev je úzká schválně: JEN přechod do `verified` a JEN pole, která
+    // u toho zapisuje klient (`serializeTask` → status + razítko). Obsah úkolu
+    // (název, popis, řešitel, přílohy) zůstává schvalovateli zapovězený —
+    // `certify` je právo stvrdit, ne právo přepsat.
+    function certifyTaskVerification(perms) {
+      return perms.hasAny(['certify'])
+        && request.resource.data.get('status', '') == 'verified'
+        && resource.data.get('status', '') != 'verified'
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'updatedAt', 'updatedByUserId', 'activityLog']);
+    }
+
+    // Nový úkol nesmí rovnou vzniknout jako completed/verified bez příslušného
+    // oprávnění (jinak by šel guard na update obejít vytvořením už-hotového
+    // úkolu). Interní úkol: člen zakládá do své firmy a nesmí vzniknout rovnou
+    // jako 'verified'.
+    function taskCreateOk(perms, pid) {
+      return canCreateWith(perms) && (
+        taskIsInternal(request.resource.data)
+          ? (validInternalTaskCreate(pid)
+             && request.resource.data.get('status', '') != 'verified')
+          : canReachDoneStatus(perms, request.resource.data.get('status', ''))
+      );
+    }
+
+    // Update PROJEKTOVÉHO úkolu: buď běžná práva k obsahu se stavovým guardem,
+    // nebo úzká větev pro schvalovatele bez `edit` (ověření cizího úkolu).
+    function taskProjectUpdateOk(perms) {
+      return (canModifyWith(perms) && taskStatusTransitionOk(perms))
+        || certifyTaskVerification(perms);
+    }
+
     function taskPath(wid, pid, taskId) {
       return /databases/$(database)/documents/workspaces/$(wid)/projects/$(pid)/tasks/$(taskId);
     }
@@ -700,12 +890,7 @@ service cloud.firestore {
       // Nový úkol nesmí rovnou vzniknout jako completed/verified bez příslušné role
       // (jinak by šel guard na update obejít vytvořením už-hotového úkolu).
       // Interní úkol: člen zakládá do své firmy a nesmí vzniknout rovnou jako 'verified'.
-      allow create: if canCreateContent(wid, pid) && (
-        taskIsInternal(request.resource.data)
-          ? (validInternalTaskCreate(pid)
-             && request.resource.data.get('status', '') != 'verified')
-          : canReachDoneStatus(wid, pid, request.resource.data.get('status', ''))
-      );
+      allow create: if taskCreateOk(permsOf(wid, pid), pid);
       // createdBy, scope i ownerCompanyId immutable. Interní úkol upraví člen
       // vlastnící firmy (na 'verified' jen vedoucí); projektový dle stávajících pravidel.
       allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
@@ -713,7 +898,7 @@ service cloud.firestore {
         && (
           taskIsInternal(resource.data)
             ? (taskCompanyMember(pid, resource.data) && internalTaskStatusOk(wid, pid))
-            : (canModifyContent(wid, pid) && taskStatusTransitionOk(wid, pid))
+            : taskProjectUpdateOk(permsOf(wid, pid))
         );
       // Interní úkol smaže vedoucí firmy nebo autor (z vlastní firmy); projektový dle stávajících.
       allow delete: if taskIsInternal(resource.data)
@@ -763,9 +948,14 @@ service cloud.firestore {
       allow delete: if canModifyContent(wid, pid);
     }
 
+    // Plány: číst smí každý člen (`read`), měnit jen `edit`. Do #506 fáze 2
+    // NEMĚL modul Plány na klientu ŽÁDNOU bránu — čtenář dostal celý toolbar
+    // včetně markupu a kalibrace měřítka, zápis mu pravidla odmítla a appka ho
+    // schovala do localStorage (nálezy U1–U3, F4). Klientská brána je teď
+    // v `PlansPage`/`PlanViewer` a zrcadlí přesně tahle dvě práva.
     match /workspaces/{wid}/projects/{pid}/plans/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEditContent(wid, pid);
+      allow create, update, delete: if canEdit(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/planAnnotations/{docId} {
@@ -774,48 +964,42 @@ service cloud.firestore {
       allow read: if isProjectMember(wid, pid)
         && (resource.data.get('isPrivate', false) == false
             || resource.data.get('ownerPrincipal', '') == principal());
-      allow create, update, delete: if canEditContent(wid, pid);
+      allow create, update, delete: if canEdit(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documents/{docId} {
       allow read: if isProjectMember(wid, pid);
-      // Do OFICIÁLNÍ dokumentace smí zakládat jen určení lidé (canPublishOfficial),
-      // ne každý člen. Atribuce firmě jen na vlastní firmu (anti-spoof) a autor
-      // nesmí být podvržený.
-      allow create: if canPublishOfficial(wid, pid)
-        && validOfficialOwnerCompany(wid, pid)
-        && authorNotSpoofedOnCreate();
-      // Author immutable. Editovat smí běžná práva k obsahu; schvalovatel nebo
-      // publikující navíc smí jako vedlejší efekt upload/approve transakce
-      // přepnout jen platnou revizi (currentVersionId/updatedAt) — i když není
-      // editor/autor dokumentu (WP1 / nová revize od publikujícího).
+      // Do OFICIÁLNÍ dokumentace smí zakládat jen `publish`, ne každý člen.
+      // Atribuce firmě jen na vlastní firmu (anti-spoof) a autor nesmí být podvržený.
+      allow create: if officialCreateOk(permsOf(wid, pid), pid);
+      // Author immutable. Editovat smí běžná práva k obsahu; `certify` nebo
+      // `publish` navíc smí jako vedlejší efekt upload/approve transakce
+      // přepnout jen platnou revizi (currentVersionId/updatedAt) — i když nemá
+      // `edit` ani autorství (schválení revize / nová revize od publikujícího).
       allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
-        && (
-          canModifyContent(wid, pid)
-          || ((isApprover(wid, pid) || canPublishOfficial(wid, pid))
-              && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['currentVersionId', 'updatedAt']))
-        );
+        && documentUpdateOk(permsOf(wid, pid));
       allow delete: if canModifyContent(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documentVersions/{docId} {
       allow read: if isProjectMember(wid, pid);
-      // Nahrát verzi do oficiální dokumentace smí jen určení lidé (viz documents).
-      allow create: if canPublishOfficial(wid, pid)
-        && validOfficialOwnerCompany(wid, pid)
-        && authorNotSpoofedOnCreate();
-      // Schvalovatel (isApprover) smí verzi aktualizovat plně — zapsat svoje
-      // rozhodnutí do `approvals` mapy, odvozený status i supersede (i když u
-      // policy „all" status zatím zůstává under_review). Ostatní (uploader/
-      // editor/autor) smí běžné editace, ale NE přechod do rozhodnutí (zákaz
-      // self-approve). Audit se v rules nevynucuje.
+      // Nahrát verzi do oficiální dokumentace smí jen `publish` (viz documents).
+      allow create: if officialCreateOk(permsOf(wid, pid), pid);
+      // `certify` (schvalovatel) smí zapsat SVÉ ROZHODNUTÍ: `approvals` mapu,
+      // odvozený status (i supersede předchozí verze) a razítko recenzenta.
+      //
+      // 🔴 Nález R5 (#506): dřív tahle větev NEMĚLA žádné omezení polí, takže
+      // schvalovatel — třeba člen jinak bez práva na cizí obsah — směl u
+      // libovolné verze přepsat `filePath`, `versionLabel` i `documentId`.
+      // Schvalovací právo tak bylo MOCNĚJŠÍ než editorské, přestože ho smí
+      // rozdat i projektový admin, který role měnit nesmí. Teď je uzavřené
+      // `hasOnly` na pole rozhodnutí — přesně to, co zapisuje
+      // `documentService.ts` (`updateVersionStatus` / `recordApprovalDecision`).
+      //
+      // Ostatní (uploader/editor/autor) smí běžné editace, ale NE přechod do
+      // rozhodnutí (zákaz self-approve). Audit se v rules nevynucuje.
       allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')  // author immutable
-        && (
-          isApprover(wid, pid)
-          || (canModifyContent(wid, pid)
-              && !(request.resource.data.status != resource.data.status
-                   && request.resource.data.status in ['approved', 'approved_with_comments', 'rejected', 'superseded', 'for_construction']))
-        );
+        && versionUpdateOk(permsOf(wid, pid));
       allow delete: if canModifyContent(wid, pid);
     }
 
@@ -837,7 +1021,7 @@ service cloud.firestore {
 
     match /workspaces/{wid}/projects/{pid}/transmittals/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEditContent(wid, pid);
+      allow create, update, delete: if canEdit(wid, pid);
     }
 
     // Zapečený stav dokumentace na hranici fáze — immutable otisk sady verzí.
@@ -846,12 +1030,12 @@ service cloud.firestore {
     // vynucená rules (stejný vzor jako share pointer, jen tady i list pro člena).
     match /workspaces/{wid}/projects/{pid}/documentBaselines/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, delete: if canEditContent(wid, pid);
+      allow create, delete: if canEdit(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documentEvents/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEditContent(wid, pid);
+      allow create, update, delete: if canEdit(wid, pid);
     }
 
     // ---------------------------------------------------------------------
@@ -866,7 +1050,7 @@ service cloud.firestore {
     match /workspaces/{wid}/projects/{pid}/shareLinks/{token} {
       allow get: if true;
       allow list: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEditContent(wid, pid);
+      allow create, update, delete: if canEdit(wid, pid);
     }
 
     // ---------------------------------------------------------------------
@@ -876,8 +1060,10 @@ service cloud.firestore {
     // verification page (/share/:wid/:token) can tell whether the scanned
     // revision is current or superseded. Carries ONLY harmless data
     // (currentVersionId + label) -- never titles, URLs or member info.
-    // Written best-effort by upload (editors) and approval (approvers may
-    // lack edit rights, hence the isApprover branch).
+    // Zapisuje se best-effort při uploadu (`edit`/`publish`) i při schválení
+    // (`certify`) — schvalovatel ani publisher nemusí mít `edit`, proto tu jsou
+    // všechny tři větve. Bez `publish` končila QR verifikace čerstvě nahrané
+    // revize „neutrálním stavem" (nález F2).
     // ---------------------------------------------------------------------
 
     function validDocumentStatus(data) {
@@ -890,9 +1076,9 @@ service cloud.firestore {
     match /workspaces/{wid}/projects/{pid}/documentStatus/{documentId} {
       allow get: if true;
       allow list: if isProjectMember(wid, pid);
-      allow create, update: if (canEditContent(wid, pid) || isApprover(wid, pid))
+      allow create, update: if permsOf(wid, pid).hasAny(['edit', 'certify', 'publish'])
         && validDocumentStatus(request.resource.data);
-      allow delete: if canEditContent(wid, pid);
+      allow delete: if canEdit(wid, pid);
     }
 
     // ---------------------------------------------------------------------
@@ -988,7 +1174,7 @@ service cloud.firestore {
     // `workspaces/{wid}/billing/current`. Do té doby se z `usage` nesmí
     // odvozovat žádná částka.
     //
-    // Proč je bránou zápisu ČLENSTVÍ, a ne `canEditContent`: novou fotku smí
+    // Proč je bránou zápisu ČLENSTVÍ, a ne oprávnění `edit`: novou fotku smí
     // založit každý člen projektu VČETNĚ viewera — `photos` gatuje
     // `canCreateContent` a `storage.rules` výslovně pouští založení nového
     // objektu „každému členu projektu včetně viewera". S užší bránou by
@@ -1015,10 +1201,18 @@ service cloud.firestore {
       allow delete: if false;
     }
 
-    // Immutable per-project audit log.
+    // Neměnná auditní stopa projektu.
+    //
+    // 🟠 Nález F3 (#506): create dřív vyžadoval `canEditContent`, jenže úkol smí
+    // legitimně posunout i přispěvatel (svůj vlastní) a nově SCHVALOVATEL
+    // (`certify` → `verified` na cizím úkolu). Právě u nich audit dává největší
+    // smysl, a právě jim zápis pravidla odmítla — takže „schvalovatel ověřil
+    // úkol" se do stopy nikdy nezapsalo. Zápis je proto na úrovni ČLENSTVÍ:
+    // záznam je stejně append-only (update i delete zůstávají zakázané), takže
+    // širší brána nedovolí historii přepsat, jen doplnit.
     match /projects/{pid}/task_audit/{entryId} {
       allow read: if isProjectMember(projectData(pid).get('workspaceId', ''), pid);
-      allow create: if canEditContent(projectData(pid).get('workspaceId', ''), pid);
+      allow create: if isProjectMember(projectData(pid).get('workspaceId', ''), pid);
       allow update, delete: if false;
     }
 
@@ -1085,7 +1279,7 @@ service cloud.firestore {
         // shodovat s e-mailem odesílatele — nelze se vydávat za konkrétního kolegu.
         && (request.resource.data.get('inviterEmail', null) == null
             || request.resource.data.get('inviterEmail', '') == request.auth.token.get('email', ''))
-        && request.resource.data.get('role', '') in ['viewer', 'editor'];
+        && request.resource.data.get('role', '') in ['reader', 'viewer', 'editor'];
       // Adresát smí jen překlopit status (přijmout/odmítnout), nic jiného.
       allow update: if isRealUser()
         && resource.data.get('inviteeEmail', '') == request.auth.token.get('email', '')

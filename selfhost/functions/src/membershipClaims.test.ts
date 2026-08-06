@@ -36,11 +36,15 @@ test("člen projektu dostane claim podle role", () => {
       { id: "P2", workspaceId: "W9", roles: { u1: "editor" } },
       { id: "P3", workspaceId: "W9", roles: { u1: "admin" } },
       { id: "P4", workspaceId: "W9", roles: { u1: "company_lead" } },
+      { id: "P5", workspaceId: "W9", roles: { u1: "reader" } },
     ],
   });
-  assert.deepEqual(claims.pw, ["W9/P2", "W9/P3"]);
-  // company_lead smí zakládat, ale ne mazat cizí binárky → čtecí claim.
-  assert.deepEqual(claims.p, ["W9/P1", "W9/P4"]);
+  // Plný zápis = oprávnění `edit` (#506 fáze 2). Legacy `company_lead` ho podle
+  // migrační tabulky má — dřív dostával jen čtecí claim a mazání záznamu tak po
+  // sobě nechávalo soubory (nález F5).
+  assert.deepEqual(claims.pw, ["W9/P2", "W9/P3", "W9/P4"]);
+  // `reader` (jen `read`) sdílí claim s `viewer` — Storage jemnější úroveň nemá.
+  assert.deepEqual(claims.p, ["W9/P1", "W9/P5"]);
 });
 
 test("claim nese i workspace, ať neautorizuje cizí prefix", () => {

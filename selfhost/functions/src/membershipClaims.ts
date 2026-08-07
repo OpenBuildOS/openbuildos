@@ -29,8 +29,13 @@ import type { Firestore } from "firebase-admin/firestore";
  * Návrh počítal s `ws: [wid]` pro zaměstnance, odvozeným z existence dokumentu
  * `workspaces/{wid}/members/{principal}`. **Nejde to.** Ten dokument zakládá
  * `redeemInvite` KAŽDÉMU pozvanému — včetně hosta z cizí firmy (TDI, investor,
- * subdodavatel) — a zapisuje mu `workspaceRole: "member"`. Nic v něm hosta od
- * zaměstnance neodliší.
+ * subdodavatel) — takže jeho pouhá existence hosta od zaměstnance neodliší.
+ * Od #523 v něm sice je pole `membershipKind` (`employee` / `guest`) a
+ * `redeemInvite` novým lidem zapisuje `"guest"`, jenže rules u
+ * `workspaces/{wid}/members/{memberPrincipal}` pouštějí zápis VLASTNÍHO záznamu
+ * (`principal() == memberPrincipal`), takže si host `"employee"` napíše sám.
+ * Ten příznak je tedy explicitní, ale FALŠOVATELNÝ — je popisný (kdo u firmy
+ * doopravdy pracuje) a podklad pro claim z něj není.
  *
  * Odvozovat z něj přístup by znamenalo, že TDI pozvaný na JEDNU stavbu dostane
  * read/write/delete na VŠECH osm staveb generálního dodavatele — přesně scénář,

@@ -136,6 +136,104 @@ export interface SweepSummary {
   reachedLimit: boolean;
 }
 
+// ── hlášení o běhu ──────────────────────────────────────────────────────────
+
+/**
+ * ⭐ PROČ TOHLE EXISTUJE. Doběh koše je funkce, která MAŽE DATA a nikdo ji
+ * nevolá — když se rozbije, pozná se to jedině tím, že se nic neděje. Do 8/2026
+ * po sobě nechávala jediný záznam `logger.info("sweepExpiredTrash", summary)`:
+ * `gcloud functions logs read` ukazuje jen textovou hlášku, takže běh, který
+ * smazal padesát položek, vypadal v logu STEJNĚ jako běh, který neudělal nic
+ * — a stejně jako běh, kterému se všechno rozsypalo. Souhrn se proto překládá
+ * do věty (pro člověka) + plochých polí (pro filtr v Cloud Loggingu)
+ * a hlavně do ZÁVAŽNOSTI, protože podle ní se dá upozorňovat.
+ */
+export type SweepLogSeverity = "info" | "warning" | "error";
+
+/** Značka pro filtr v Cloud Loggingu: `jsonPayload.event="trash_sweep_finished"`. */
+export const SWEEP_LOG_EVENT = "trash_sweep_finished";
+
+/**
+ * Pole záznamu. ZÁMĚRNĚ plochá (filtr `jsonPayload.purgedTotal > 0` je otázka,
+ * kterou si člověk položí; `jsonPayload.purged.task` by šlo filtrovat hůř)
+ * a ZÁMĚRNĚ jen čísla — do logu nepatří názvy úkolů, jména ani e-maily.
+ * Konkrétní projekt u konkrétní chyby říká `onError`, souhrn ho nepotřebuje.
+ */
+export interface SweepLogPayload {
+  event: typeof SWEEP_LOG_EVENT;
+  scannedProjects: number;
+  purgedTotal: number;
+  purgedTasks: number;
+  purgedPhotos: number;
+  purgedDocuments: number;
+  storageObjectsDeleted: number;
+  failures: number;
+  reachedLimit: boolean;
+}
+
+export interface SweepLogRecord {
+  severity: SweepLogSeverity;
+  /** Věta, kterou uvidí člověk v `gcloud functions logs read`. */
+  message: string;
+  payload: SweepLogPayload;
+}
+
+/** 1 / 2–4 / 5+ — bez tohohle by log říkal „smazal 3 položek". */
+function pluralCs(count: number, one: string, few: string, many: string): string {
+  if (count === 1) {
+    return one;
+  }
+  return count >= 2 && count <= 4 ? few : many;
+}
+
+/**
+ * Souhrn → jeden záznam do logu.
+ *
+ * ⚠️ ZÁVAŽNOST NENÍ KOSMETIKA. `failures > 0` = doběh na něco NEDOSÁHL, přestože
+ * to podle zásad ochrany osobních údajů mělo být pryč → ERROR. `reachedLimit` =
+ * úklid se NEDODĚLAL a část dat leží dál, tedy přesně stav, který má tahle
+ * funkce řešit → WARNING. Obojí musí být nad INFO, jinak zapadne mezi denní
+ * „nebylo co mazat". Když nastane obojí, vyhrává vyšší.
+ */
+export function describeSweepRun(summary: SweepSummary): SweepLogRecord {
+  const purgedTotal = summary.purged.task + summary.purged.photo + summary.purged.document;
+
+  const projects = `${summary.scannedProjects} ${pluralCs(summary.scannedProjects, "projekt", "projekty", "projektů")}`;
+  const outcome =
+    purgedTotal === 0
+      ? "nebylo co mazat"
+      : `smazal ${purgedTotal} ${pluralCs(purgedTotal, "položku", "položky", "položek")}` +
+        ` (úkoly ${summary.purged.task}, fotky ${summary.purged.photo}, dokumenty ${summary.purged.document})` +
+        ` a ${summary.storageObjectsDeleted} ${pluralCs(summary.storageObjectsDeleted, "objekt", "objekty", "objektů")} ve Storage`;
+
+  let message = `Doběh koše: prošel ${projects}, ${outcome}.`;
+  if (summary.failures > 0) {
+    message += ` Chyby: ${summary.failures} (podrobnosti v předchozích záznamech).`;
+  }
+  if (summary.reachedLimit) {
+    message += " DOŠEL STROP BĚHU — zbytek dat leží v koši dál a dobere se při dalším běhu.";
+  }
+
+  const severity: SweepLogSeverity =
+    summary.failures > 0 ? "error" : summary.reachedLimit ? "warning" : "info";
+
+  return {
+    severity,
+    message,
+    payload: {
+      event: SWEEP_LOG_EVENT,
+      scannedProjects: summary.scannedProjects,
+      purgedTotal,
+      purgedTasks: summary.purged.task,
+      purgedPhotos: summary.purged.photo,
+      purgedDocuments: summary.purged.document,
+      storageObjectsDeleted: summary.storageObjectsDeleted,
+      failures: summary.failures,
+      reachedLimit: summary.reachedLimit,
+    },
+  };
+}
+
 // ── čisté pomocníky (1:1 s klientem, testovatelné bez Firestoru) ─────────────
 
 function nonEmptyString(value: unknown): value is string {
@@ -270,6 +368,12 @@ export interface SweepOptions {
   maxItemsPerCollection?: number;
   /** Kam se hlásí neúspěch jedné položky. Doběh kvůli ní nikdy nekončí. */
   onError?: (message: string, error: unknown) => void;
+  /**
+   * Kam se hlásí souhrn po skončení běhu. Volá se PRÁVĚ JEDNOU, na každé cestě
+   * ven — u naplánované funkce návratovou hodnotu nikdo nečte, takže tohle je
+   * jediná stopa, kterou po sobě běh nechá.
+   */
+  onSummary?: (record: SweepLogRecord) => void;
 }
 
 function emptySummary(): SweepSummary {
@@ -302,7 +406,14 @@ export async function sweepExpiredTrash(
   const maxItems = options.maxItems ?? SWEEP_MAX_ITEMS_PER_RUN;
   const perCollection = options.maxItemsPerCollection ?? SWEEP_MAX_ITEMS_PER_COLLECTION;
   const onError = options.onError ?? (() => undefined);
+  const onSummary = options.onSummary ?? (() => undefined);
   const summary = emptySummary();
+
+  /** Jediná cesta ven — ať se souhrn nedá „zapomenout" u nové větve `return`. */
+  const finish = (): SweepSummary => {
+    onSummary(describeSweepRun(summary));
+    return summary;
+  };
 
   let projects: ProjectRef[];
   try {
@@ -310,7 +421,7 @@ export async function sweepExpiredTrash(
   } catch (error) {
     onError("Seznam projektů se nepodařilo načíst — doběh koše se přeskočil.", error);
     summary.failures += 1;
-    return summary;
+    return finish();
   }
 
   let budget = maxItems;
@@ -372,7 +483,7 @@ export async function sweepExpiredTrash(
     }
   }
 
-  return summary;
+  return finish();
 }
 
 /** Úkol / fotka — jeden doc, u fotky navíc plná verze + miniatura ve Storage. */

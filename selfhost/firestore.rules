@@ -596,9 +596,15 @@ service cloud.firestore {
           // members/{id} doc is keyed by principal (federated subject or uid).
           isRealUser()
           && memberUid == principal()
+          // `profession` (#506 fáze 3) je POPISNÁ — smí se nést pozvánkou, aby
+          // „pozval jsem TDI" zůstalo pravdou i po přijetí. Oprávnění NEMĚNÍ:
+          // `memberFlagPermissions` níž sahá výhradně na `canApprove` /
+          // `canPublishOfficial`, a ty si sebe-připojující se dopsat NESMÍ —
+          // proto v allowlistu nejsou a zůstávají na správci.
           && request.resource.data.keys()
-              .hasOnly(['role', 'displayName', 'email', 'inviteId', 'joinedAt', 'companyId'])
+              .hasOnly(['role', 'displayName', 'email', 'inviteId', 'joinedAt', 'companyId', 'profession'])
           && request.resource.data.role in ['reader', 'viewer', 'editor']
+          && request.resource.data.get('profession', '') is string
           && redeemOk(wid, pid, request.resource.data.inviteId,
               request.resource.data.role)
         ) || (
@@ -1104,6 +1110,31 @@ service cloud.firestore {
             == getAfter(/databases/$(database)/documents/workspaces/$(resource.data.workspaceId)/projects/$(pid)/members/$(principal())).data.role;
     }
 
+    // -------------------------------------------------------------------
+    // Vlastník dat projektu (#506, osa 3) — `projects/{pid}.dataOwner`.
+    //
+    // Vlastníkem dat je ten, KDO PLATÍ. Dosud se odvozoval od zakladatele
+    // prostoru (`workspaces/{wid}.ownerId`), což neuneslo scénář „projektant
+    // založí projekt a později ho postoupí investorovi": postoupení by přepsalo
+    // vlastníka VŠECH staveb v prostoru.
+    //
+    // ⚠️ Pole NEDÁVÁ žádné oprávnění a rules ho k autorizaci nepoužívají — kdo
+    // co smí, řeší `roles` + flagy. Vynucuje se jedině to, KDO ho smí přepsat:
+    // dosavadní vlastník, nebo vlastník firmy. Ani projektový, ani firemní
+    // ADMIN to sám nesvede — jinak by si projekt „koupil" kdokoli, kdo ho
+    // spravuje, a postoupení by přestalo něco znamenat.
+    //
+    // Chybí-li pole (všechny stavby z doby před fází 3), je odvozeným
+    // vlastníkem zakladatel prostoru — proto ho smí poprvé nastavit on.
+    function dataOwnerUnchanged() {
+      return request.resource.data.get('dataOwner', {}) == resource.data.get('dataOwner', {});
+    }
+
+    function canTransferDataOwner() {
+      return resource.data.get('dataOwner', {}).get('principal', '') == principal()
+        || isWsOwner(resource.data.get('workspaceId', ''));
+    }
+
     match /projects/{pid} {
       // Direct field access keeps the rule provable for both query shapes:
       // where('memberIds','array-contains', principal) and
@@ -1114,7 +1145,10 @@ service cloud.firestore {
       allow create: if isRealUser()
         && isWsAdmin(request.resource.data.workspaceId)
         && principal() in request.resource.data.memberIds
-        && request.resource.data.roles.get(principal(), '') == 'admin';
+        && request.resource.data.roles.get(principal(), '') == 'admin'
+        // Zakladatel smí projekt založit jako VLASTNÍ (typicky projektant
+        // v přípravě), ne rovnou cizí. Postoupení je samostatný úkon.
+        && request.resource.data.get('dataOwner', {}).get('principal', principal()) == principal();
       // Workspace owner/admin: full project doc control incl. membership.
       // Project admin: may edit project content but MUST NOT touch
       // memberIds/roles (membership changes only via wsAdmin or invite flow),
@@ -1123,12 +1157,29 @@ service cloud.firestore {
           isRealUser()
           && isWsAdmin(resource.data.get('workspaceId', ''))
           && request.resource.data.workspaceId == resource.data.workspaceId
+          // Vlastnictví dat je výjimka z „ws admin smí všechno": postoupit ho
+          // smí jen dosavadní vlastník nebo vlastník firmy (viz komentář výš).
+          && (dataOwnerUnchanged() || canTransferDataOwner())
+        ) || (
+          // Postoupení vlastnictví DOSAVADNÍM vlastníkem — i když projekt vůbec
+          // nespravuje. Přesně to je scénář „projektant založí projekt v přípravě
+          // a později ho postoupí investorovi": projektant je na stavbě běžný
+          // koordinátor, ale data jsou jeho, dokud je nepředá.
+          //
+          // `hasOnly` (ne `!hasAny`): touhle větví se smí měnit VÝHRADNĚ
+          // vlastnictví. Kdyby to byl denylist, měl by vlastník bez `manage`
+          // najednou plný zápis do project docu.
+          isRealUser()
+          && resource.data.get('dataOwner', {}).get('principal', '') == principal()
+          && request.resource.data.workspaceId == resource.data.workspaceId
+          && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['dataOwner', 'updatedAt'])
         ) || (
           isRealUser()
           && resource.data.get('roles', {}).get(principal(), '') == 'admin'
           && request.resource.data.workspaceId == resource.data.workspaceId
           && !request.resource.data.diff(resource.data).affectedKeys()
-              .hasAny(['memberIds', 'roles'])
+              .hasAny(['memberIds', 'roles', 'dataOwner'])
         ) || (
           // Značka „stavba žije" — `lastActivityAt`
           // (docs/BILLING_IMPLEMENTATION.md kap. 2.2, návrh
@@ -1270,7 +1321,10 @@ service cloud.firestore {
         && request.resource.data.diff({}).affectedKeys().hasOnly([
              'token', 'workspaceId', 'workspaceName', 'apiKey', 'authExchangeUrl',
              'projectId', 'projectName', 'role', 'inviteeEmail',
-             'inviterName', 'inviterEmail', 'status', 'createdAt', 'expiresAt'
+             'inviterName', 'inviterEmail', 'status', 'createdAt', 'expiresAt',
+             // #506 fáze 3: popisná profese, aby adresát v Hubu viděl, KAM ho
+             // zvou („jako TDI"), ne jen surovou roli. Oprávnění neurčuje.
+             'profession'
            ])
         && request.resource.data.get('status', '') == 'pending'
         && request.resource.data.get('inviteeEmail', '') is string

@@ -3,15 +3,19 @@ import test from "node:test";
 import {
   collectPlanFileReferences,
   deletableVersionObjectPaths,
+  describeSweepRun,
   isVersionFileUsedByPlan,
   photoStorageObjectPaths,
   sweepExpiredTrash,
   usageDeltaForVersions,
   versionStorageObjectPaths,
   createBucketTrashStorage,
+  SWEEP_LOG_EVENT,
   type ExpiredItem,
   type PlanFileReferences,
   type ProjectRef,
+  type SweepLogRecord,
+  type SweepSummary,
   type TrashStore,
   type TrashStorage,
   type UsageDelta,
@@ -257,6 +261,125 @@ test("nedostupný seznam projektů doběh nezhavaruje, jen ohlásí", async () =
 
   assert.equal(summary.failures, 1);
   assert.equal(summary.scannedProjects, 0);
+});
+
+// ── hlášení o běhu ──────────────────────────────────────────────────────────
+
+function summaryOf(overrides: Partial<SweepSummary> = {}): SweepSummary {
+  return {
+    scannedProjects: 12,
+    purged: { task: 0, photo: 0, document: 0 },
+    storageObjectsDeleted: 0,
+    failures: 0,
+    reachedLimit: false,
+    ...overrides,
+  };
+}
+
+test("běh bez práce a běh, který mazal, NEJSOU v logu k nerozeznání", () => {
+  const idle = describeSweepRun(summaryOf());
+  const busy = describeSweepRun(
+    summaryOf({ purged: { task: 1, photo: 2, document: 0 }, storageObjectsDeleted: 5 })
+  );
+
+  // Přesně ta vada, kvůli které tohle vzniklo: dřív obě věty zněly „sweepExpiredTrash".
+  assert.notEqual(idle.message, busy.message);
+  assert.match(idle.message, /prošel 12 projektů/);
+  assert.match(idle.message, /nebylo co mazat/);
+  assert.match(busy.message, /smazal 3 položky \(úkoly 1, fotky 2, dokumenty 0\) a 5 objektů/);
+
+  assert.equal(idle.payload.purgedTotal, 0);
+  assert.equal(busy.payload.purgedTotal, 3);
+  assert.equal(busy.payload.storageObjectsDeleted, 5);
+  // Značka pro filtr v Cloud Loggingu musí být na KAŽDÉM záznamu, i na tom nudném.
+  assert.equal(idle.payload.event, SWEEP_LOG_EVENT);
+  assert.equal(busy.payload.event, SWEEP_LOG_EVENT);
+});
+
+test("klidný běh je INFO, chyby a došlý strop jsou VÝŠ", () => {
+  assert.equal(describeSweepRun(summaryOf()).severity, "info");
+  // Nedodělaný úklid = část dat leží dál. Přesně to, co má funkce řešit.
+  assert.equal(describeSweepRun(summaryOf({ reachedLimit: true })).severity, "warning");
+  assert.equal(describeSweepRun(summaryOf({ failures: 2 })).severity, "error");
+  // Když nastane obojí, vyhrává vyšší závažnost.
+  assert.equal(describeSweepRun(summaryOf({ failures: 1, reachedLimit: true })).severity, "error");
+});
+
+test("chyby i došlý strop jsou vidět i ve větě, ne jen v poli", () => {
+  const record = describeSweepRun(summaryOf({ failures: 2, reachedLimit: true }));
+
+  assert.match(record.message, /Chyby: 2/);
+  assert.match(record.message, /DOŠEL STROP BĚHU/);
+  assert.equal(record.payload.failures, 2);
+  assert.equal(record.payload.reachedLimit, true);
+});
+
+test("české číslovky: „smazal 3 položek“ se do logu nedostane", () => {
+  assert.match(describeSweepRun(summaryOf({ purged: { task: 1, photo: 0, document: 0 } })).message, /smazal 1 položku/);
+  assert.match(describeSweepRun(summaryOf({ purged: { task: 2, photo: 0, document: 0 } })).message, /smazal 2 položky/);
+  assert.match(describeSweepRun(summaryOf({ purged: { task: 5, photo: 0, document: 0 } })).message, /smazal 5 položek/);
+  assert.match(describeSweepRun(summaryOf({ scannedProjects: 1 })).message, /prošel 1 projekt,/);
+});
+
+test("doběh souhrn opravdu ohlásí — právě jednou a s tím, co udělal", async () => {
+  const { store, storage } = makeStore({
+    expired: [
+      {
+        type: "photo",
+        id: "photo-1",
+        storagePath: "workspaces/ws_demo/projects/p1/photos/foto.jpg",
+        sizeBytes: 2048,
+      },
+    ],
+  });
+  const records: SweepLogRecord[] = [];
+
+  await sweepExpiredTrash(store, storage, { now: NOW, onSummary: (record) => records.push(record) });
+
+  assert.equal(records.length, 1);
+  assert.equal(records[0].severity, "info");
+  assert.equal(records[0].payload.purgedPhotos, 1);
+  assert.equal(records[0].payload.storageObjectsDeleted, 2);
+});
+
+test("i běh, který se ani nerozjel, o sobě dá vědět — a jako ERROR", async () => {
+  const { store, storage } = makeStore();
+  const broken: TrashStore = {
+    ...store,
+    listProjects: async () => {
+      throw new Error("offline");
+    },
+  };
+  const records: SweepLogRecord[] = [];
+
+  await sweepExpiredTrash(broken, storage, { now: NOW, onSummary: (record) => records.push(record) });
+
+  // Tichý návrat na téhle větvi byl původní stav: doběh se přeskočil a nikdo nic nevěděl.
+  assert.equal(records.length, 1);
+  assert.equal(records[0].severity, "error");
+  assert.equal(records[0].payload.scannedProjects, 0);
+});
+
+test("v souhrnu nejsou identifikátory ani cesty k souborům", async () => {
+  const { store, storage } = makeStore({
+    expired: [
+      {
+        type: "photo",
+        id: "photo-tajne-jmeno",
+        storagePath: "workspaces/ws_demo/projects/p1/photos/pepa-novak.jpg",
+        sizeBytes: 10,
+      },
+    ],
+  });
+  const records: SweepLogRecord[] = [];
+
+  await sweepExpiredTrash(store, storage, { now: NOW, onSummary: (record) => records.push(record) });
+
+  // Log doběhu je agregát. Konkrétní projekt patří jen k chybě (onError), osobní údaje nikam.
+  const dumped = JSON.stringify(records[0]);
+  for (const leak of ["photo-tajne-jmeno", "pepa-novak", "ws_demo", "projects/p1"]) {
+    assert.equal(dumped.includes(leak), false, `souhrn nesmí obsahovat "${leak}"`);
+  }
 });
 
 // ── adaptér nad bucketem ────────────────────────────────────────────────────

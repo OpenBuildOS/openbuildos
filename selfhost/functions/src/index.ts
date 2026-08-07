@@ -15,6 +15,7 @@ import {
   createBucketTrashStorage,
   createFirestoreTrashStore,
   sweepExpiredTrash as runTrashSweep,
+  type SweepLogRecord,
 } from "./trashSweep";
 
 // Odesílání pozvánek e-mailem (samostatný modul, viz sendProjectInvite.ts).
@@ -805,6 +806,29 @@ export const promoteApprovedDrawingToPlan = onDocumentUpdated(
 );
 
 /**
+ * Souhrn doběhu koše → JEDEN záznam v Cloud Loggingu.
+ *
+ * ⚠️ ZÁVAŽNOST URČUJE `describeSweepRun`, ne tenhle přepínač. Do 8/2026 tu stálo
+ * `logger.info("sweepExpiredTrash", summary)` — a protože `gcloud functions logs
+ * read` ukazuje jen textovou hlášku, dalo se z logu přečíst pouze jméno funkce:
+ * běh, který smazal padesát položek, vypadal stejně jako běh, který neudělal nic,
+ * i jako běh, kterému se všechno rozsypalo. U funkce, která MAŽE DATA, je tichý
+ * log to samé jako žádný. Věta jde do hlášky, čísla do `jsonPayload`
+ * (filtr `jsonPayload.event="trash_sweep_finished"`).
+ */
+function logSweepSummary(record: SweepLogRecord): void {
+  if (record.severity === "error") {
+    logger.error(record.message, record.payload);
+    return;
+  }
+  if (record.severity === "warning") {
+    logger.warn(record.message, record.payload);
+    return;
+  }
+  logger.info(record.message, record.payload);
+}
+
+/**
  * `sweepExpiredTrash` — po 30 dnech se smazaný obsah OPRAVDU smaže (B3).
  *
  * ⭐ PROČ NAPLÁNOVANÁ FUNKCE. Do 8/2026 dělal doběh koše prohlížeč správce
@@ -838,13 +862,16 @@ export const sweepExpiredTrash = onSchedule(
   },
   async () => {
     const firestore = getFirestore(getLocalApp());
-    const summary = await runTrashSweep(
+    await runTrashSweep(
       createFirestoreTrashStore(firestore),
       createBucketTrashStorage(getStorage(getLocalApp()).bucket(), (message, error) =>
         logger.warn(message, { error })
       ),
-      { onError: (message, error) => logger.warn(message, { error }) }
+      {
+        onError: (message, error) => logger.warn(message, { error }),
+        // Jediná stopa, kterou po sobě běh nechá — návratovou hodnotu tu nikdo nečte.
+        onSummary: logSweepSummary,
+      }
     );
-    logger.info("sweepExpiredTrash", summary);
   }
 );

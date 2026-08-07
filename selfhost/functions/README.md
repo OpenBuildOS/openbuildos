@@ -91,6 +91,16 @@ vlastníka firmy.
   po schválení jednostránkového výkresu ho povýší do Plánů. Běží na serveru
   schválně — zápis do `plans` vyžaduje editační práva, která schvalovatel
   (TDI, projektant) mít nemusí. Viz `src/planPromotion.ts`.
+- `sweepExpiredTrash` — **naplánovaná funkce** (jediná v balíčku), denně 3:20
+  Europe/Prague: obsah, který je v Koši déle než 30 dní, smaže natrvalo —
+  Firestore záznam **i objekt ve Storage** — a odečte spotřebu. Bez ní plnil slib
+  „po 30 dnech se smaže natrvalo" jen prohlížeč správce, a to jen když si otevřel
+  stránku Koš. Viz `src/trashSweep.ts` (**sdílený soubor** s hlavním repem).
+  ⚠️ Potřebuje **Cloud Scheduler API** (`cloudscheduler.googleapis.com`).
+  `firebase deploy` si ho na Blaze projektu zapne sám; na čerstvém projektu může
+  první pokus spadnout na propagaci — setup CLI deploy opakuje (20/40/80 s).
+  Firestore TTL policy tuhle roli převzít **nesmí**: smazala by jen dokument
+  a soubor by ve Storage zůstal osiřelý.
 
 ## Přenos projektu mezi backendy (#291)
 

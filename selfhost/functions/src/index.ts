@@ -5,11 +5,17 @@ import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
 import { HttpsError, onCall, onRequest, type Request } from "firebase-functions/v2/https";
 import { onDocumentUpdated } from "firebase-functions/v2/firestore";
+import { onSchedule } from "firebase-functions/v2/scheduler";
 import * as logger from "firebase-functions/logger";
 import type { Response } from "express";
 
 // Serverové povýšení schválené revize výkresu do Plánů (viz planPromotion.ts).
 import { isApprovalTransition, promoteApprovedDrawing } from "./planPromotion";
+import {
+  createBucketTrashStorage,
+  createFirestoreTrashStore,
+  sweepExpiredTrash as runTrashSweep,
+} from "./trashSweep";
 
 // Odesílání pozvánek e-mailem (samostatný modul, viz sendProjectInvite.ts).
 export { sendProjectInvite } from "./sendProjectInvite";
@@ -795,5 +801,50 @@ export const promoteApprovedDrawingToPlan = onDocumentUpdated(
         .catch(() => undefined);
       throw error;
     }
+  }
+);
+
+/**
+ * `sweepExpiredTrash` — po 30 dnech se smazaný obsah OPRAVDU smaže (B3).
+ *
+ * ⭐ PROČ NAPLÁNOVANÁ FUNKCE. Do 8/2026 dělal doběh koše prohlížeč správce
+ * (`sweepExpiredTrash` v `src/services/trash.ts`), a to jen v okamžiku, kdy si
+ * někdo s právy otevřel stránku Koš. Na stavbě, kde do Koše nikdo nechodí, se
+ * doběh nespustil nikdy — přestože UI i zásady ochrany osobních údajů slibují
+ * „po 30 dnech se smaže natrvalo". Slib, který plní náhodné klikání, není slib.
+ *
+ * ⚠️ PROČ NE FIRESTORE TTL. TTL policy nad `purgeAt` by smazala jen Firestore
+ * dokument. Objekt ve Storage by nechala osiřelý (fotky s osobními údaji, na
+ * které už nic neukazuje) a počítadlo spotřeby by neodečetla. Doběh proto musí
+ * mazat záznam I blob — to umí jen kód, viz `trashSweep.ts`.
+ *
+ * Klientský doběh v `src/services/trash.ts` ZŮSTÁVÁ jako druhá kolej: uklidí
+ * hned, co správce v Koši vidí, a kryje projekty, kde tahle funkce (ještě)
+ * neběží — třeba self-host, který nespustil setup CLI. Obě cesty používají
+ * totéž pořadí (záznam → objekt) a jsou idempotentní, takže si nepřekáží.
+ *
+ * ⚠️ ŽÁDNÝ `retry`. Stejný důvod jako u `promoteApprovedDrawingToPlan`: failure
+ * policy jde nasadit jen s `--force`, které v self-host setupu nesmí padnout.
+ * Nevadí to — běh je denní a co nestihne (strop `SWEEP_MAX_ITEMS_PER_RUN`),
+ * dobere zítra.
+ */
+export const sweepExpiredTrash = onSchedule(
+  {
+    // 03:20 místního času: mimo špičku na stavbě a mimo okno týdenního exportu.
+    schedule: "20 3 * * *",
+    timeZone: "Europe/Prague",
+    region: "europe-west1",
+    timeoutSeconds: 540,
+  },
+  async () => {
+    const firestore = getFirestore(getLocalApp());
+    const summary = await runTrashSweep(
+      createFirestoreTrashStore(firestore),
+      createBucketTrashStorage(getStorage(getLocalApp()).bucket(), (message, error) =>
+        logger.warn(message, { error })
+      ),
+      { onError: (message, error) => logger.warn(message, { error }) }
+    );
+    logger.info("sweepExpiredTrash", summary);
   }
 );

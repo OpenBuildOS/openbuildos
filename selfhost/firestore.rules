@@ -589,6 +589,23 @@ service cloud.firestore {
         || request.resource.data.get('role', '') == resource.data.get('role', '');
     }
 
+    // Přeřazení v ZRCADLE musí říkat přesně totéž co větev na
+    // `projects/{pid}.roles` (#507, viz `roleChangeOk` níž). Do teď se ty dvě
+    // cesty rozcházely OPAČNĚ, než by člověk čekal: zrcadlo pouštělo
+    // projektového správce i na `admin` a i sám na sebe, kdežto vynucovaná
+    // `roles` mapa mu nedovolila nic. Zobrazovaná role tak šla nastavit tam,
+    // kam vynucená ne — a to je horší stav než oba zákazy dohromady.
+    //
+    // Beze změny role (flagy `canApprove`/`canPublishOfficial`, displayName,
+    // profese, firma) tahle branka nic neomezuje — ty smí projektový správce
+    // dál (#506, nález R3).
+    function mirrorRoleChangeOk(memberUid) {
+      return request.resource.data.get('role', '') == resource.data.get('role', '')
+        || (memberUid != principal()
+            && resource.data.get('role', '') != 'admin'
+            && request.resource.data.get('role', '') in ['reader', 'viewer', 'editor']);
+    }
+
     match /workspaces/{wid}/projects/{pid}/members/{memberUid} {
       allow get, list: if isProjectMember(wid, pid);
       allow create: if (
@@ -611,7 +628,12 @@ service cloud.firestore {
           canManageAfter(wid, pid)
           && roleAssignable(request.resource.data.get('role', ''))
         );
-      allow update: if canManageAfter(wid, pid) && roleWriteOk();
+      // Vlastník/admin FIRMY má zrcadlo celé (včetně `admin` a sebe sama);
+      // projektový správce jen tolik, kolik mu dává `roleChangeOk` na
+      // `projects/{pid}.roles` — jinak by obě cesty říkaly každá něco jiného.
+      allow update: if canManageAfter(wid, pid)
+        && roleWriteOk()
+        && (isWsAdmin(wid) || mirrorRoleChangeOk(memberUid));
       allow delete: if canManage(wid, pid);
     }
 
@@ -1135,6 +1157,62 @@ service cloud.firestore {
         || isWsOwner(resource.data.get('workspaceId', ''));
     }
 
+    // -------------------------------------------------------------------
+    // Přeřazení UŽ PŘIJATÉHO člena správcem stavby (#507).
+    //
+    // Do teď uměl roli změnit jedině vlastník/admin FIRMY (`isWsAdmin`).
+    // Správce stavby zvenčí — generální dodavatel na investorově stavbě — tedy
+    // směl zvát vlastní lidi i subdodavatele, ale nesměl nikomu přidat práva:
+    // musel ho odebrat a pozvat znovu. Denní úkon, který se dělal oklikou.
+    //
+    // Rozšíření je ÚZKÉ a stojí vedle stávajících větví, žádnou nemění.
+    // Držitel `manage` na projektu smí přesně jedno: změnit roli JEDNOHO
+    // CIZÍHO člena na `reader` / `viewer` / `editor`. Nesmí:
+    //   · povýšit kohokoli (ani sebe) na `admin` — jinak by byl allowlist
+    //     `roleAssignable` i strop rolí v pozvánkách k ničemu a eskalace by
+    //     vedla tudy,
+    //   · sáhnout na SVOU roli (ani nahoru, ani dolů),
+    //   · degradovat jiného `admin`a — dva správci na stavbě by si jinak mohli
+    //     navzájem brát práva (přesně to hlídala poznámka u větve výš),
+    //   · hnout `memberIds` (přidání/odebrání člena zůstává u firmy a pozvánek)
+    //     ani `dataOwner` (ten přepíše jen dosavadní vlastník / vlastník firmy,
+    //     #506 osa 3) — ani jedno není v `hasOnly` allowlistu.
+    //
+    // 🔑 Proč deklarované `roleChangeTarget`: rules NEUMÍ vytáhnout klíč ze
+    // Setu, který vrací `diff().affectedKeys()`. Bez znalosti toho klíče nejde
+    // přečíst starou ani novou hodnotu role, takže „nepovyšuj na admin" by se
+    // nedalo vynutit VŮBEC. Zápis proto musí sám deklarovat, koho mění,
+    // a pravidla tu deklaraci porovnají s tím, co se v mapě opravdu hnulo
+    // (`hasOnly([target])`). Lhát se nedá: kdyby se změnil kdokoli jiný,
+    // `hasOnly` neprojde. Deklarace stojí NULA dalších čtení dokumentů — a to
+    // je tu ta vzácná surovina (`redeemOk` sám vytěžuje 7 z 10).
+    //
+    // Pole zůstane na dokumentu jako drobek do historie („poslední přeřazení
+    // se týkalo tohohle člověka"). Žádné oprávnění z něj neplyne a nikdo ho
+    // nečte — je to VSTUP pravidla, ne stav.
+    //
+    // ⚠️ Zrcadlo členů má vlastní branku `mirrorRoleChangeOk` se STEJNÝMI
+    // podmínkami. Měň obojí naráz, jinak se cesty rozejdou.
+    function roleChangeOk(target) {
+      return target is string
+        && target != ''
+        && target != principal()
+        && target in resource.data.get('memberIds', [])
+        && resource.data.get('roles', {}).get(target, '') != 'admin'
+        && request.resource.data.get('roles', {}).get(target, '') in ['reader', 'viewer', 'editor']
+        && request.resource.data.get('roles', {})
+            .diff(resource.data.get('roles', {}))
+            .affectedKeys().hasOnly([target]);
+    }
+
+    // `manage` odvozené PŘÍMO z role na project docu, bez `permsOf()`. Jsme
+    // uvnitř `/projects/{pid}`, kde `resource.data` už v ruce máme — `permsOf()`
+    // by tu znamenalo tři čtení dokumentů navíc kvůli údaji, který leží přímo
+    // před námi. Vlastník/admin firmy sem nespadá, ten má vlastní větev výš.
+    function projectRoleHasManage() {
+      return rolePermissions(resource.data.get('roles', {}).get(principal(), '')).hasAny(['manage']);
+    }
+
     match /projects/{pid} {
       // Direct field access keeps the rule provable for both query shapes:
       // where('memberIds','array-contains', principal) and
@@ -1151,8 +1229,10 @@ service cloud.firestore {
         && request.resource.data.get('dataOwner', {}).get('principal', principal()) == principal();
       // Workspace owner/admin: full project doc control incl. membership.
       // Project admin: may edit project content but MUST NOT touch
-      // memberIds/roles (membership changes only via wsAdmin or invite flow),
-      // preventing one admin from demoting/removing other admins or the owner.
+      // memberIds/dataOwner (kdo je členem se mění jen přes wsAdmin nebo
+      // pozvánku). Na `roles` sáhne jen úzkou větví #507 níž — přeřazení
+      // JEDNOHO cizího ne-admin člena na ne-admin roli; degradovat jiného
+      // admina ani sebe povýšit tou cestou nejde.
       allow update: if (
           isRealUser()
           && isWsAdmin(resource.data.get('workspaceId', ''))
@@ -1180,6 +1260,21 @@ service cloud.firestore {
           && request.resource.data.workspaceId == resource.data.workspaceId
           && !request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['memberIds', 'roles', 'dataOwner'])
+        ) || (
+          // Přeřazení JEDNOHO cizího člena správcem stavby (#507) — jediná
+          // cesta, kterou se `roles` mění bez vlastníka/admina firmy.
+          // Podmínky a důvody viz `roleChangeOk` výš.
+          //
+          // Uzavřené `hasOnly` (ne denylist): touhle větví smí projít VÝHRADNĚ
+          // role + deklarace + časové razítko. `memberIds` ani `dataOwner`
+          // v seznamu nejsou, takže se přes ni nedají hnout — a nedají se hnout
+          // ani pole, která na project docu teprve přibudou.
+          isRealUser()
+          && projectRoleHasManage()
+          && request.resource.data.workspaceId == resource.data.workspaceId
+          && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['roles', 'roleChangeTarget', 'updatedAt'])
+          && roleChangeOk(request.resource.data.get('roleChangeTarget', ''))
         ) || (
           // Značka „stavba žije" — `lastActivityAt`
           // (docs/BILLING_IMPLEMENTATION.md kap. 2.2, návrh

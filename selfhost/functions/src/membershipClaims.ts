@@ -83,6 +83,66 @@ export const CLAIMS_BYTE_BUDGET = 900;
  */
 const FULL_WRITE_ROLES = new Set(["editor", "admin", "company_lead"]);
 
+/**
+ * Značka pro filtr v Cloud Loggingu: `jsonPayload.event="membership_project_skipped"`.
+ *
+ * ⭐ PROČ TOHLE EXISTUJE. Projekt bez pole `workspaceId` se z podkladů ZAHODIT
+ * musí — claim má tvar `{wid}/{pid}` a holý `pid` by autorizoval
+ * `workspaces/CIZI-FIRMA/projects/MUJ-PROJEKT/…`. Do 8/2026 se ale zahazoval
+ * TIŠE: uživatel je v `memberIds`, takže projekt ve Firestore vidí, jenže ve
+ * Storage se ke svým souborům nedostane — a v logu po tom nezůstal ani řádek.
+ * Po nasazení `storage.rules` na produkci je ztráta claimu ztráta souborů, a
+ * legacy data bez `workspaceId` reálně existují (`src/services/workspaceProjects.ts`
+ * s tím polem počítá jako s volitelným). Tichý fail-closed se nedá odladit;
+ * hlášený ano.
+ */
+export const SKIPPED_PROJECT_LOG_EVENT = "membership_project_skipped";
+
+/**
+ * Pole záznamu. ZÁMĚRNĚ jen identifikátory a TYP vadné hodnoty — do logu nepatří
+ * obsah dokumentu (název stavby, adresa, jména členů). K dohledání stačí
+ * `projectId`: podle něj se dokument najde v konzoli, kde na něj práva jsou.
+ */
+export interface SkippedProjectLogPayload {
+  severity: "WARNING";
+  event: typeof SKIPPED_PROJECT_LOG_EVENT;
+  /** Věta, kterou uvidí člověk v `gcloud functions logs read`. */
+  message: string;
+  principal: string;
+  projectId: string;
+  /** `"undefined"` / `"number"` / `"empty-string"` — nikdy samotná hodnota. */
+  workspaceIdType: string;
+}
+
+function describeSkippedProject(
+  principal: string,
+  projectId: string,
+  workspaceId: unknown
+): SkippedProjectLogPayload {
+  return {
+    severity: "WARNING",
+    event: SKIPPED_PROJECT_LOG_EVENT,
+    message:
+      `Projekt ${projectId} nemá použitelné pole workspaceId, takže se do claims `
+      + "nepromítl: uživatel ho ve Firestore vidí, ale ve Storage se ke svým "
+      + "souborům nedostane. Doplnit workspaceId na dokumentu projektu.",
+    principal,
+    projectId,
+    workspaceIdType: workspaceId === "" ? "empty-string" : typeof workspaceId,
+  };
+}
+
+/**
+ * Jeden řádek do Cloud Loggingu. `console.warn` ZÁMĚRNĚ, ne `firebase-functions/logger`:
+ * tenhle modul importují i rules testy hlavního repa (`tests/rules/helpers.ts`),
+ * aby fixtura nemohla „opravit" to, co produkční kód počítá jinak — a tam
+ * `firebase-functions` nainstalované není. Payload jde jako JEDEN JSON řetězec,
+ * ať ho Cloud Logging načte jako `jsonPayload` včetně závažnosti.
+ */
+function warnSkippedProject(principal: string, projectId: string, workspaceId: unknown): void {
+  console.warn(JSON.stringify(describeSkippedProject(principal, projectId, workspaceId)));
+}
+
 export interface WorkspaceFacts {
   id: string;
   ownerId?: string | null;
@@ -231,6 +291,9 @@ export async function loadMembershipInput(
   for (const doc of projectSnap.docs) {
     const workspaceId = doc.get("workspaceId");
     if (typeof workspaceId !== "string" || !workspaceId) {
+      // Zahodit se musí (bez wid není claim, který by šel bezpečně vydat), ale
+      // ne mlčky — viz SKIPPED_PROJECT_LOG_EVENT.
+      warnSkippedProject(principal, doc.id, workspaceId);
       continue;
     }
     projects.push({

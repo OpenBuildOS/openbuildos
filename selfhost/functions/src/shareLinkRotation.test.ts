@@ -1,10 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { Firestore } from "firebase-admin/firestore";
+import type { Storage } from "firebase-admin/storage";
 import {
   ShareLinkRotationError,
+  buildDownloadUrl,
   canEditProjectContent,
+  createFirestoreShareLinkStore,
   parseStorageObjectFromDownloadUrl,
+  pointsAtStorageObject,
+  refreshedUrlFields,
+  refreshedUrlsInArray,
   revokeShareLinkAndRotate,
+  type RefreshStoredDownloadUrlsInput,
   type ShareLinkRecord,
   type ShareLinkRotationStore,
 } from "./shareLinkRotation";
@@ -15,15 +23,25 @@ const FILE_URL =
   "https://firebasestorage.googleapis.com/v0/b/obos.firebasestorage.app/o/" +
   "workspaces%2Fws_1%2Fprojects%2Fp1%2Fphotos%2Fph1%2Ffoto.jpg?alt=media&token=old-token";
 
+const OBJECT = {
+  bucket: "obos.firebasestorage.app",
+  objectPath: "workspaces/ws_1/projects/p1/photos/ph1/foto.jpg",
+};
+
 interface FakeStoreOptions {
   workspace?: { ownerId?: string; adminIds?: string[] } | null;
   project?: { workspaceId?: string; roles?: Record<string, string> } | null;
   shareLink?: ShareLinkRecord | null;
   rotateThrows?: Error;
+  refreshThrows?: Error;
 }
 
 function fakeStore(options: FakeStoreOptions = {}) {
-  const calls = { rotated: [] as string[], revoked: [] as string[] };
+  const calls = {
+    rotated: [] as string[],
+    revoked: [] as string[],
+    refreshed: [] as RefreshStoredDownloadUrlsInput[],
+  };
   const store: ShareLinkRotationStore = {
     loadWorkspace: async () =>
       options.workspace === undefined ? { ownerId: "owner-1" } : options.workspace,
@@ -39,6 +57,14 @@ function fakeStore(options: FakeStoreOptions = {}) {
         throw options.rotateThrows;
       }
       calls.rotated.push(`${bucket}::${objectPath}`);
+      return "novy-token";
+    },
+    refreshStoredDownloadUrls: async (input) => {
+      if (options.refreshThrows) {
+        throw options.refreshThrows;
+      }
+      calls.refreshed.push(input);
+      return 2;
     },
   };
   return { store, calls };
@@ -78,6 +104,59 @@ test("parseStorageObjectFromDownloadUrl odmítne cizí i rozbitou adresu", () =>
   }
 });
 
+test("buildDownloadUrl skládá adresu, kterou jde zpátky rozebrat", () => {
+  const url = buildDownloadUrl(OBJECT, "t-2");
+  assert.deepEqual(parseStorageObjectFromDownloadUrl(url), OBJECT);
+  assert.equal(new URL(url).searchParams.get("token"), "t-2");
+});
+
+test("pointsAtStorageObject porovnává objekt, ne token v adrese", () => {
+  // Jádro celé obnovy: po rotaci má uložená adresa JINÝ token, ale je to pořád
+  // týž soubor. Kdyby se porovnávaly celé adresy, druhá rotace za sebou by už
+  // uloženou adresu nenašla a nechala by ji mrtvou.
+  assert.equal(pointsAtStorageObject(buildDownloadUrl(OBJECT, "jiny"), OBJECT), true);
+  assert.equal(pointsAtStorageObject(FILE_URL, OBJECT), true);
+  assert.equal(
+    pointsAtStorageObject(buildDownloadUrl({ ...OBJECT, objectPath: "jina/cesta.jpg" }, "x"), OBJECT),
+    false
+  );
+  for (const value of [undefined, null, "", "blob:https://app/abc", 42]) {
+    assert.equal(pointsAtStorageObject(value, OBJECT), false, String(value));
+  }
+});
+
+test("refreshedUrlFields přepíše jen pole, která na ten objekt ukazují", () => {
+  const thumbnail = buildDownloadUrl({ ...OBJECT, objectPath: "…/thumb_foto.jpg" }, "t");
+  const fresh = buildDownloadUrl(OBJECT, "novy");
+  assert.deepEqual(
+    refreshedUrlFields({ url: FILE_URL, thumbnailUrl: thumbnail }, ["url", "thumbnailUrl"], OBJECT, fresh),
+    { url: fresh }
+  );
+  // Nic k přepsání = null, aby volající dokument vůbec nezapisoval.
+  assert.equal(refreshedUrlFields({ url: fresh }, ["url"], OBJECT, fresh), null);
+  assert.equal(refreshedUrlFields({}, ["url"], OBJECT, fresh), null);
+});
+
+test("refreshedUrlsInArray přepíše jen dotčenou položku pole a jinak vrátí null", () => {
+  const fresh = buildDownloadUrl(OBJECT, "novy");
+  const versions = [
+    { id: "v1", fileUrl: "https://example.com/jiny.pdf" },
+    { id: "v2", fileUrl: FILE_URL, revisionLabel: "R02" },
+  ];
+  assert.deepEqual(refreshedUrlsInArray(versions, ["fileUrl"], OBJECT, fresh), [
+    { id: "v1", fileUrl: "https://example.com/jiny.pdf" },
+    // Ostatní pole verze musí přežít — přepisuje se CELÉ pole, ne jedna hodnota.
+    { id: "v2", fileUrl: fresh, revisionLabel: "R02" },
+  ]);
+  assert.equal(refreshedUrlsInArray([{ id: "v1" }], ["fileUrl"], OBJECT, fresh), null);
+  assert.equal(refreshedUrlsInArray(undefined, ["fileUrl"], OBJECT, fresh), null);
+  // Přílohy úkolu jsou totéž pole, jen jiná jména polí.
+  assert.deepEqual(
+    refreshedUrlsInArray([{ id: "a1", url: FILE_URL, name: "foto.jpg" }], ["url"], OBJECT, fresh),
+    [{ id: "a1", url: fresh, name: "foto.jpg" }]
+  );
+});
+
 test("canEditProjectContent: vlastník i admin firmy smí, cizí stavba ne", () => {
   const ws = { ownerId: "owner-1", adminIds: ["admin-1"] };
   const project = { workspaceId: "ws_1", roles: {} };
@@ -106,11 +185,40 @@ test("canEditProjectContent: chybějící firma nebo stavba = ne", () => {
 test("revokeShareLinkAndRotate přerazí token a označí záznam", async () => {
   const { store, calls } = fakeStore();
   const result = await revokeShareLinkAndRotate(store, INPUT);
-  assert.deepEqual(result, { revoked: true, tokenRotated: true, wasAlreadyRevoked: false });
+  assert.deepEqual(result, {
+    revoked: true,
+    tokenRotated: true,
+    wasAlreadyRevoked: false,
+    refreshedUrls: 2,
+  });
   assert.deepEqual(calls.rotated, [
     "obos.firebasestorage.app::workspaces/ws_1/projects/p1/photos/ph1/foto.jpg",
   ]);
   assert.deepEqual(calls.revoked, ["ws_1/p1/t1"]);
+});
+
+test("po rotaci se uložené adresy obnoví adresou s NOVÝM tokenem", async () => {
+  const { store, calls } = fakeStore();
+  await revokeShareLinkAndRotate(store, INPUT);
+
+  assert.equal(calls.refreshed.length, 1);
+  const [refresh] = calls.refreshed;
+  assert.deepEqual(refresh.target, OBJECT);
+  assert.equal(refresh.staleUrl, FILE_URL);
+  assert.equal(refresh.revokedToken, "t1");
+  // Nová adresa musí být tatáž, jakou by klientovi vrátilo `getDownloadURL` —
+  // tedy TÝŽ objekt, jen s novým tokenem.
+  assert.deepEqual(parseStorageObjectFromDownloadUrl(refresh.freshUrl), OBJECT);
+  assert.equal(new URL(refresh.freshUrl).searchParams.get("token"), "novy-token");
+  assert.notEqual(refresh.freshUrl, FILE_URL);
+});
+
+test("selhání obnovy adres se NEPOLYKÁ a nekončí zápisem `revoked`", async () => {
+  // Spolknutá chyba by znamenala „odkaz zneplatněn" a fotku, která se v appce
+  // nenačte — přesně to, kvůli čemu obnova vznikla.
+  const { store, calls } = fakeStore({ refreshThrows: new Error("Firestore nedostupné") });
+  await assert.rejects(revokeShareLinkAndRotate(store, INPUT), /Firestore nedostupné/);
+  assert.deepEqual(calls.revoked, []);
 });
 
 test("opakované zneplatnění projde a rotuje znovu (idempotence)", async () => {
@@ -146,4 +254,163 @@ test("selhání rotace NESMÍ skončit zápisem `revoked` — jinak by appka lha
   const { store, calls } = fakeStore({ rotateThrows: new Error("Storage nedostupné") });
   await assert.rejects(revokeShareLinkAndRotate(store, INPUT), /Storage nedostupné/);
   assert.deepEqual(calls.revoked, []);
+});
+
+// ───────────────────────────────────────────────────────────────────────────
+// Napojení na Firestore. Čistá logika výš by prošla i tehdy, kdyby se hledalo
+// ve špatné kolekci nebo podle pole, které se tam nejmenuje — a obnova by pak
+// mlčky nepřepsala nic. Proto se store zkouší proti falešnému Firestoru.
+// ───────────────────────────────────────────────────────────────────────────
+
+const BASE = "workspaces/ws_1/projects/p1";
+const FRESH_URL = buildDownloadUrl(OBJECT, "novy-token");
+
+interface FakeDoc {
+  id: string;
+  data: Record<string, unknown>;
+}
+
+function fakeFirestore(collections: Record<string, FakeDoc[]>) {
+  const writes: Array<{ path: string; patch: Record<string, unknown> }> = [];
+  const reads: string[] = [];
+  let commits = 0;
+
+  const asQuery = (path: string, docs: FakeDoc[]) => ({
+    where: (field: string, _op: string, value: unknown) =>
+      asQuery(
+        path,
+        docs.filter((entry) => entry.data[field] === value)
+      ),
+    get: async () => {
+      reads.push(path);
+      return {
+        docs: docs.map((entry) => ({
+          id: entry.id,
+          ref: { path: `${path}/${entry.id}` },
+          data: () => entry.data,
+        })),
+      };
+    },
+  });
+
+  const firestore = {
+    collection: (path: string) => asQuery(path, collections[path] ?? []),
+    batch: () => ({
+      update: (ref: { path: string }, patch: Record<string, unknown>) => {
+        writes.push({ path: ref.path, patch });
+      },
+      commit: async () => {
+        commits += 1;
+      },
+    }),
+  } as unknown as Firestore;
+
+  const storage = {} as unknown as Storage;
+  return { store: createFirestoreShareLinkStore(firestore, storage), writes, reads, commits: () => commits };
+}
+
+const REFRESH_INPUT = {
+  workspaceId: "ws_1",
+  projectId: "p1",
+  target: OBJECT,
+  staleUrl: FILE_URL,
+  freshUrl: FRESH_URL,
+  revokedToken: "t1",
+};
+
+test("obnova najde fotku podle `storagePath` i legacy fotku podle staré adresy", async () => {
+  const { store, writes } = fakeFirestore({
+    [`${BASE}/photos`]: [
+      { id: "ph1", data: { storagePath: OBJECT.objectPath, url: FILE_URL } },
+      // Fotka nahraná před zavedením `storagePath` — dohledatelná jen adresou.
+      { id: "legacy", data: { url: FILE_URL } },
+      { id: "jina", data: { storagePath: "jina/cesta.jpg", url: "https://example.com/x.jpg" } },
+    ],
+  });
+
+  const refreshed = await store.refreshStoredDownloadUrls(REFRESH_INPUT);
+
+  assert.equal(refreshed, 2);
+  assert.deepEqual(writes, [
+    { path: `${BASE}/photos/ph1`, patch: { url: FRESH_URL } },
+    { path: `${BASE}/photos/legacy`, patch: { url: FRESH_URL } },
+  ]);
+});
+
+test("obnova sáhne na revizi dokumentu, verzi výkresu i přílohu úkolu", async () => {
+  const { store, writes } = fakeFirestore({
+    // Revize se hledá podle `fileId` — tam upload ukládá cestu k objektu.
+    [`${BASE}/documentVersions`]: [{ id: "v1", data: { fileId: OBJECT.objectPath, filePath: FILE_URL } }],
+    // TÝŽ objekt visí i v Plánech (povýšená revize) — musí se přepsat obojí.
+    [`${BASE}/plans`]: [{ id: "pl1", data: { versions: [{ id: "pv1", fileUrl: FILE_URL }] } }],
+    [`${BASE}/photos`]: [{ id: "ph1", data: { storagePath: OBJECT.objectPath, url: FILE_URL } }],
+    [`${BASE}/tasks`]: [
+      { id: "t-1", data: { relations: { attachments: [{ id: "a1", url: FILE_URL }] } } },
+      { id: "t-2", data: { relations: { attachments: [] } } },
+    ],
+  });
+
+  const refreshed = await store.refreshStoredDownloadUrls(REFRESH_INPUT);
+
+  assert.equal(refreshed, 4);
+  assert.deepEqual(
+    writes.map((write) => write.path),
+    [`${BASE}/photos/ph1`, `${BASE}/documentVersions/v1`, `${BASE}/plans/pl1`, `${BASE}/tasks/t-1`]
+  );
+  assert.deepEqual(writes[2].patch, { versions: [{ id: "pv1", fileUrl: FRESH_URL }] });
+  assert.deepEqual(writes[3].patch, { "relations.attachments": [{ id: "a1", url: FRESH_URL }] });
+});
+
+test("úkoly se čtou jen kvůli fotce — u sdíleného dokumentu se vynechají", async () => {
+  // Sdílený dokument (nejčastější případ, QR verifikace revize): do příloh
+  // úkolu se kopírují jen knihovní fotky, takže průchod stovkami úkolů by
+  // tady byl zbytečný.
+  const documentObject = {
+    bucket: OBJECT.bucket,
+    objectPath: "workspaces/ws_1/projects/p1/documents/d1/v1/vykres.pdf",
+  };
+  const documentUrl = buildDownloadUrl(documentObject, "stary");
+  const { store, reads, writes } = fakeFirestore({
+    [`${BASE}/documentVersions`]: [
+      { id: "v1", data: { fileId: documentObject.objectPath, filePath: documentUrl } },
+    ],
+    [`${BASE}/tasks`]: [{ id: "t-1", data: { relations: { attachments: [] } } }],
+  });
+
+  await store.refreshStoredDownloadUrls({
+    ...REFRESH_INPUT,
+    target: documentObject,
+    staleUrl: documentUrl,
+  });
+
+  assert.deepEqual(
+    writes.map((write) => write.path),
+    [`${BASE}/documentVersions/v1`]
+  );
+  assert.equal(reads.includes(`${BASE}/tasks`), false);
+});
+
+test("ostatní ŽIVÝ odkaz na týž soubor se obnoví, zneplatňovaný a mrtvý ne", async () => {
+  const { store, writes } = fakeFirestore({
+    [`${BASE}/shareLinks`]: [
+      { id: "t1", data: { fileUrl: FILE_URL, revoked: false } },
+      { id: "t2", data: { fileUrl: FILE_URL, revoked: false } },
+      { id: "t3", data: { fileUrl: FILE_URL, revoked: true } },
+    ],
+  });
+
+  const refreshed = await store.refreshStoredDownloadUrls(REFRESH_INPUT);
+
+  assert.equal(refreshed, 1);
+  assert.deepEqual(writes, [{ path: `${BASE}/shareLinks/t2`, patch: { fileUrl: FRESH_URL } }]);
+});
+
+test("když není co přepsat, nezapisuje se vůbec nic", async () => {
+  const { store, writes, commits } = fakeFirestore({
+    [`${BASE}/photos`]: [{ id: "ph1", data: { storagePath: "jina/cesta.jpg", url: "https://example.com/x.jpg" } }],
+  });
+
+  assert.equal(await store.refreshStoredDownloadUrls(REFRESH_INPUT), 0);
+  assert.deepEqual(writes, []);
+  assert.equal(commits(), 0);
 });

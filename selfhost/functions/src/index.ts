@@ -511,6 +511,12 @@ function principalFromAuth(auth: { uid: string; token: Record<string, unknown> }
  * `updateDoc({ revoked: true })` — zneplatnění tam mlčky nedělalo nic
  * podstatného. Modul se proto MUSÍ držet identický v obou repech
  * (viz docs/REPO_BOUNDARIES.md), ať se ta dvě prostředí nemůžou znovu rozejít.
+ *
+ * Součástí rotace je úklid po ní: download token je vlastnost OBJEKTU, takže
+ * přeražení zabije i adresu uloženou u položky (`photos.url`,
+ * `documentVersions.filePath`, `plans.versions[].fileUrl`). Modul ji proto
+ * přepíše novou — jinak by zneplatnění odkazu shodilo zobrazení té položky
+ * v aplikaci.
  */
 export const revokeShareLinkAndRotateToken = onCall<
   { wid?: string; pid?: string; token?: string }
@@ -537,8 +543,15 @@ export const revokeShareLinkAndRotateToken = onCall<
       projectId: request.data?.pid,
       principal,
       wasAlreadyRevoked: result.wasAlreadyRevoked,
+      // Kolik uložených adres se po rotaci přepsalo na novou. Trvalá 0 u fotek
+      // a dokumentů je signál, že se obnova nechytá (viz `STORED_URL_COLLECTIONS`).
+      refreshedUrls: result.refreshedUrls,
     });
-    return { revoked: result.revoked, tokenRotated: result.tokenRotated };
+    return {
+      revoked: result.revoked,
+      tokenRotated: result.tokenRotated,
+      refreshedUrls: result.refreshedUrls,
+    };
   } catch (error) {
     if (error instanceof ShareLinkRotationError) {
       throw new HttpsError(error.code, error.message);

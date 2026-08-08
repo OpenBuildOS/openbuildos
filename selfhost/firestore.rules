@@ -8,6 +8,41 @@ rules_version = '2';
 // nesmí rozhodovat podle názvu role. Klientské zrcadlo modelu žije v
 // `src/lib/permissions/projectPermissions.ts`.
 //
+// ---------------------------------------------------------------------------
+// 🔴 PRINCIP „PRŮKAZNÉHO VÝPISU" (nález A1, #535) — ČTI, NEŽ PŘIDÁŠ ČTECÍ BRÁNU
+//
+// `get` a `list` jsou DVĚ RŮZNÉ OTÁZKY. `get` se ptá skutečného dokumentu;
+// `list` se vyhodnocuje SYMBOLICKY proti omezením dotazu — pole, na které se
+// dotaz neptá, je pro pravidla neznámé. A tady je ta past:
+//
+//   · `resource.data.pole`           … neznámé pole = CHYBA výrazu  → deny  ✅
+//   · `resource.data.get('pole', d)` … neznámé pole = VÝCHOZÍ `d`   → allow ❌
+//
+// Zápis s výchozí hodnotou tedy ve výpisu selhává OTEVŘENĚ. Dokud tohle platilo,
+// šla KAŽDÁ čtecí brána postavená na `.get()` obejít tím, že si útočník místo
+// dokumentu vyžádal výpis kolekce: interní úkoly firmy (#358), fotky a piny na
+// ně navázané, soukromý markup v Plánech i celý registr `pendingInvites`.
+//
+// PRAVIDLA, KTERÁ Z TOHO PLYNOU (platí i pro pole, která teprve přibudou):
+//
+//   1. Kde viditelnost závisí na OBSAHU dokumentu, se `allow read` NEPOUŽÍVÁ.
+//      Rozděl na `allow get` (plná brána, klidně přes `.get()` i cizí dokumenty)
+//      a `allow list` (vlastní, průkazná brána).
+//   2. Ve `list` větvi se pole čtou VÝHRADNĚ PŘÍMÝM PŘÍSTUPEM (`resource.data.x`).
+//      `resource.data.get(x, default)` je tam ZAKÁZANÝ. Důsledek: dotaz, který
+//      to pole nezúží, se odmítne — a klient musí posílat tvar, který brána umí
+//      dokázat. (Na `request.resource.data` je `.get()` dál v pořádku: u zápisu
+//      je celý dokument známý.)
+//   3. Když brána potřebuje CIZÍ dokument (`get()` jinam), z dotazu se dokázat
+//      NEDÁ. Pak rozhodující údaj musí být DENORMALIZOVANÝ na dokumentu samotném
+//      a ověřený při zápisu — jinak citlivá data do listovatelné kolekce nepatří.
+//
+// Nositelem bodu 3 je pole `visibility` (viz helper `visibleInList` níž):
+// `''` = vidí celá stavba, `<companyId>` = vidí jen ta firma. Nese ho `tasks`,
+// `photos` a `photoPins`; zapisovat se smí jen pravdivě (viz `taskVisibilityOk`
+// a `linkedVisibilityOk`).
+// ---------------------------------------------------------------------------
+//
 // Membership source of truth lives on the top-level /projects/{pid} document:
 //   { workspaceId: string, memberIds: string[], roles: { [uid]: reader|viewer|editor|admin } }
 // Workspace-level admins live on /workspaces/{wid}: { ownerId, adminIds }.
@@ -233,6 +268,21 @@ service cloud.firestore {
       return projectData(pid).get('companies', {}).get(who, '');
     }
 
+    // ---------------------------------------------------------------------
+    // PRŮKAZNÁ VIDITELNOST PRO `list` (nález A1 — viz hlavička souboru)
+    //
+    // `visibility` je JEDINÉ pole, kterým se uvnitř stavby rozlišuje, kdo obsah
+    // vidí. Čte se PŘÍMO (ne přes `.get()`), takže dotaz, který ho nezúží,
+    // skončí chybou → deny. Klient proto posílá dva dotazy: `visibility == ''`
+    // (obsah celé stavby) a `visibility == <moje firma>` (interní).
+    //
+    // Prázdná firma volajícího splyne s první větví — nic navíc mu to nedá.
+    // ---------------------------------------------------------------------
+    function visibleInList(pid) {
+      return resource.data.visibility == ''
+        || resource.data.visibility == memberCompany(pid, principal());
+    }
+
     function isSameProjectCompany(wid, pid, companyId) {
       return companyId != ''
         && isProjectMember(wid, pid)
@@ -440,28 +490,72 @@ service cloud.firestore {
     }
 
     // ---------------------------------------------------------------------
-    // Companies (firm-level company directory)
+    // ÚČASTNÍK FIRMY (nález E, #535)
     //
-    // Any real user (firm member) may read the company list; only workspace
-    // admins manage entries.
+    // Firemní adresář i seznam firem měly `allow read: if isRealUser()` —
+    // komentář nad nimi říkal „any real user (firm member)", ale ta závorka se
+    // do podmínky nikdy nedostala. V per-firma nasazení to bylo neškodné (cizí
+    // do projektu nedosáhl vůbec); v HOSTOVANÉM modelu jsou všechny firmy
+    // v jednom Firebase projektu, takže to byl únik PŘES HRANICI ZÁKAZNÍKA:
+    // kdokoli přihlášený si vypsal jména a e-maily lidí libovolné firmy.
+    //
+    // Bránou je teď adresářový záznam. Ten do #535 nic nedokazoval (zapsal si
+    // ho kdokoli sám na sebe — nález E2), proto se opravuje SPOLU se zápisem
+    // níž: založit ho smí jen člen některé stavby té firmy. Teprve tím se
+    // z „existuje záznam" stává použitelný fakt.
+    //
+    // ⚠️ Odebrání ze STAVBY tenhle záznam neruší (člověk může být na dalších
+    // stavbách firmy) — do adresáře tedy vidí, dokud ho firma nesmaže. To je
+    // záměr: „odebrat z firmy" = smazat adresářový záznam, což smí jen
+    // vlastník/admin firmy.
     // ---------------------------------------------------------------------
 
+    function firmDirectoryPath(wid, who) {
+      return /databases/$(database)/documents/workspaces/$(wid)/members/$(who);
+    }
+
+    function isFirmParticipant(wid) {
+      return isRealUser()
+        && (isWsAdmin(wid) || exists(firmDirectoryPath(wid, principal())));
+    }
+
     match /workspaces/{wid}/companies/{companyId} {
-      allow read: if isRealUser();
+      allow read: if isFirmParticipant(wid);
       allow create, update, delete: if isWsAdmin(wid);
     }
 
     // ---------------------------------------------------------------------
     // Firm member directory (workspace-level, keyed by principal)
     //
-    // Any real user (firm member) may read the directory; workspace admins
-    // manage entries, and a user may upsert ONLY their own entry (e.g. on
-    // invite redeem to record their displayName/companyId).
+    // Čte účastník firmy (viz výš); spravuje vlastník/admin firmy. Vlastní
+    // záznam si člověk smí ZALOŽIT jen tehdy, když opravdu je členem některé
+    // stavby té firmy — a musí tu stavbu DEKLAROVAT polem `viaProjectId`.
+    //
+    // 🔑 Proč deklarace: rules neumí zjistit „je členem NĚJAKÉ stavby tohohle
+    // workspace" (nejde iterovat kolekci). Stejný vzor jako `roleChangeTarget`
+    // u #530: zápis sám řekne, o kterou stavbu se opírá, a pravidla tu
+    // deklaraci ověří. Lhát se nedá — na cizí stavbě členem není.
+    // Stojí to jedno čtení navíc, a jen při ZALOŽENÍ záznamu (redeem).
+    //
+    // `update` deklaraci nepotřebuje: existující záznam už jednou touto branou
+    // prošel, takže si vlastní jméno/profil smí měnit dál (`voiceUserConsent`,
+    // `joinConsent`, přejmenování).
+    //
+    // ⚠️ `membershipKind`/`workspaceRole` v záznamu zůstávají POPISNÉ a
+    // falšovatelné — žádné pravidlo se jich neptá (viz membershipClaims.ts).
     // ---------------------------------------------------------------------
 
+    function directorySelfCreateOk(wid, memberPrincipal) {
+      return principal() == memberPrincipal
+        && request.resource.data.get('viaProjectId', '') != ''
+        && isProjectMember(wid, request.resource.data.get('viaProjectId', ''));
+    }
+
     match /workspaces/{wid}/members/{memberPrincipal} {
-      allow read: if isRealUser();
-      allow create, update: if isWsAdmin(wid) || principal() == memberPrincipal;
+      allow read: if isFirmParticipant(wid);
+      allow create: if isWsAdmin(wid) || directorySelfCreateOk(wid, memberPrincipal);
+      allow update: if isWsAdmin(wid)
+        || (isRealUser() && principal() == memberPrincipal);
       allow delete: if isWsAdmin(wid);
     }
 
@@ -512,15 +606,36 @@ service cloud.firestore {
 
     // The members/{uid} self-join create is only valid when the same batch
     // claims the referenced invite (getAfter forces atomicity).
+    // ⚠️ STROP 1000 VÝRAZŮ. Dokumentový přístup se v rámci požadavku kešuje,
+    // ale KAŽDÉ opsané `get(invitePath(...))` se pořád VYHODNOCUJE — včetně
+    // sestavení cesty ze dvou interpolací. Šest opisů tady stálo šest průchodů.
+    // Redeem přitom jede jako JEDNA dávka (pozvánka + členství + zrcadlo +
+    // `projects/{pid}`) a rozpočet je společný pro celou dávku, takže se
+    // vyčerpal dřív, než došlo na poslední dokument. Proto `let`: jedna vazba,
+    // stejná sémantika, výrazně nižší cena.
     function redeemOk(wid, pid, inviteId, role) {
-      return get(invitePath(wid, inviteId)).data.projectId == pid
-        && get(invitePath(wid, inviteId)).data.usedBy == null
-        && request.time < get(invitePath(wid, inviteId)).data.expiresAt
-        && role == get(invitePath(wid, inviteId)).data.role
+      let invite = get(invitePath(wid, inviteId)).data;
+      return invite.projectId == pid
+        && invite.usedBy == null
+        && request.time < invite.expiresAt
+        && role == invite.role
         // Only APPROVED invites are redeemable. Missing field == approved
         // (backward compat with pre-#367 invites).
-        && get(invitePath(wid, inviteId)).data.get('approvalStatus', 'approved') == 'approved'
+        && invite.get('approvalStatus', 'approved') == 'approved'
         && getAfter(invitePath(wid, inviteId)).data.usedBy == principal();
+    }
+
+    // Firma z pozvánky, normalizovaná na řetězec. `redeemInvite` posílá
+    // `companyId: null`, když pozvánka firmu nenese — bez normalizace by se
+    // `null` neporovnalo s chybějícím polem na zrcadle a redeem by spadl.
+    function inviteCompanyId(wid, inviteId) {
+      let companyId = get(invitePath(wid, inviteId)).data.get('companyId', '');
+      return companyId is string ? companyId : '';
+    }
+
+    // Táž normalizace na straně zrcadla členů.
+    function stringOrEmpty(value) {
+      return value is string ? value : '';
     }
 
     // Kdo smí pozvánku NAVRHNOUT: člen s `edit` (typicky Koordinátor / vedoucí
@@ -561,7 +676,20 @@ service cloud.firestore {
         )
         // Approve/reject + revoke: project admin / ws admin may edit the invite
         // (this also covers flipping approvalStatus pending_approval -> approved).
-        || canManage(wid, resource.data.projectId);
+        //
+        // 🔴 Nález B (#535): tahle větev se ptala na `resource.data.projectId`,
+        // tedy na stavbu, ze které pozvánka ODCHÁZÍ — nikdy na tu, KAM po
+        // zápisu míří. Zatímco `create` je gatovaný správně na CÍL, `update`
+        // kontroloval opačný konec: správce stavby A si vystavil pozvánku na A,
+        // přepsal `projectId` na B a uplatnil ji sám na sebe.
+        //
+        // `projectId` je proto u update ZMRAZENÝ. Je to levnější než
+        // `canManage` na cíl (nula čtení navíc — a `redeemOk` sám vytěžuje
+        // 7 z 10 dokumentových přístupů) a přesnější: pozvánka zůstane na
+        // stavbě, pro kterou ji `create` schválil. Přesměrování není úkon,
+        // který by kdokoli potřeboval — vystaví se nová.
+        || (canManage(wid, resource.data.projectId)
+            && request.resource.data.projectId == resource.data.projectId);
       allow delete: if canManage(wid, resource.data.projectId);
     }
 
@@ -622,6 +750,14 @@ service cloud.firestore {
               .hasOnly(['role', 'displayName', 'email', 'inviteId', 'joinedAt', 'companyId', 'profession'])
           && request.resource.data.role in ['reader', 'viewer', 'editor']
           && request.resource.data.get('profession', '') is string
+          // 🔴 Nález C (#535): `companyId` tu bylo bez podmínky, takže si ho
+          // sebe-připojující se vyplnil sám — a `inviteSelfJoin` z něj pak
+          // odvozoval `projects/{pid}.companies`, tedy klíč k firemnímu
+          // prostoru i interním úkolům. Firma se proto MUSÍ shodovat
+          // s pozvánkou. `invitePath` už čte `redeemOk`, takže je to nula
+          // dokumentových přístupů navíc.
+          && stringOrEmpty(request.resource.data.get('companyId', ''))
+              == inviteCompanyId(wid, request.resource.data.inviteId)
           && redeemOk(wid, pid, request.resource.data.inviteId,
               request.resource.data.role)
         ) || (
@@ -763,10 +899,15 @@ service cloud.firestore {
         && request.resource.data.recipientIds is list;
       // Provable for queries shaped
       // where('recipientIds', 'array-contains', currentPrincipal).
-      allow get, list: if isRealUser()
+      //
+      // 🔴 Nález D (#535): brána se ptala VÝHRADNĚ na `recipientIds`, bez
+      // jediného slova o členství. Odebraný člověk si tedy své staré
+      // notifikace četl dál — a ty nesou názvy úkolů a dokumentů i jména lidí.
+      // Notifikace je obsah stavby; končí s členstvím, ne s adresou.
+      allow get, list: if isProjectMember(wid, pid)
         && principal() in resource.data.recipientIds;
       // Recipients may only append themselves to readBy.
-      allow update: if isRealUser()
+      allow update: if isProjectMember(wid, pid)
         && principal() in resource.data.recipientIds
         && request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(['readBy'])
@@ -838,6 +979,16 @@ service cloud.firestore {
       return request.resource.data.get('ownerCompanyId', '') != ''
         && request.resource.data.get('ownerCompanyId', '') == memberCompany(pid, principal());
     }
+    // Denormalizovaná viditelnost úkolu (nález A1). MUSÍ odpovídat rozsahu:
+    // interní úkol nese `visibility == ownerCompanyId`, projektový prázdný
+    // řetězec. Bez toho by si zakladatel interního úkolu mohl zapsat
+    // `visibility: ''` a vystavit ho výpisem celé stavbě.
+    function taskVisibilityOk() {
+      return taskIsInternal(request.resource.data)
+        ? request.resource.data.get('visibility', '')
+            == request.resource.data.get('ownerCompanyId', '')
+        : request.resource.data.get('visibility', '') == '';
+    }
     // scope i ownerCompanyId jsou po vzniku neměnné — rozsah nelze „přepnout".
     function taskScopeImmutable() {
       return request.resource.data.get('scope', 'project_official')
@@ -877,7 +1028,7 @@ service cloud.firestore {
     // úkolu). Interní úkol: člen zakládá do své firmy a nesmí vzniknout rovnou
     // jako 'verified'.
     function taskCreateOk(perms, pid) {
-      return canCreateWith(perms) && (
+      return canCreateWith(perms) && taskVisibilityOk() && (
         taskIsInternal(request.resource.data)
           ? (validInternalTaskCreate(pid)
              && request.resource.data.get('status', '') != 'verified')
@@ -913,8 +1064,13 @@ service cloud.firestore {
     match /workspaces/{wid}/projects/{pid}/tasks/{docId} {
       // Interní úkol (scope=company_internal) čte jen člen vlastnící firmy;
       // projektový úkol kterýkoli člen projektu.
-      allow read: if isProjectMember(wid, pid)
+      allow get: if isProjectMember(wid, pid)
         && (!taskIsInternal(resource.data) || taskCompanyMember(pid, resource.data));
+      // 🔴 Nález A1: `read` (tedy i `list`) tu stálo na `data.get('scope', …)`
+      // s výchozí hodnotou, která ve výpisu VŽDY vyjde `project_official` —
+      // interní úkoly firmy tak vypsal kterýkoli člen stavby, i z jiné firmy.
+      // Výpis proto stojí na PŘÍMÉM `resource.data.visibility` (viz hlavička).
+      allow list: if isProjectMember(wid, pid) && visibleInList(pid);
       // Nový úkol nesmí rovnou vzniknout jako completed/verified bez příslušné role
       // (jinak by šel guard na update obejít vytvořením už-hotového úkolu).
       // Interní úkol: člen zakládá do své firmy a nesmí vzniknout rovnou jako 'verified'.
@@ -923,6 +1079,7 @@ service cloud.firestore {
       // vlastnící firmy (na 'verified' jen vedoucí); projektový dle stávajících pravidel.
       allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
         && taskScopeImmutable()
+        && taskVisibilityOk()
         && (
           taskIsInternal(resource.data)
             ? (taskCompanyMember(pid, resource.data) && internalTaskStatusOk(wid, pid))
@@ -943,15 +1100,34 @@ service cloud.firestore {
       allow delete: if canModifyContent(wid, pid);
     }
 
+    // Denormalizovaná viditelnost fotky/pinu (nález A1). Vazba na úkol se
+    // z výpisu dokázat NEDÁ — brána by musela sáhnout na CIZÍ dokument, a to
+    // symbolické vyhodnocení neumí. Rozhodující údaj proto leží na fotce samotné
+    // a při zápisu se ověřuje proti úkolu, na který se váže: nedá se vymyslet.
+    function linkedVisibilityOk(wid, pid, taskId) {
+      return (taskId == ''
+              || !exists(taskPath(wid, pid, taskId))
+              || !taskIsInternal(get(taskPath(wid, pid, taskId)).data))
+        ? request.resource.data.get('visibility', '') == ''
+        : request.resource.data.get('visibility', '')
+            == get(taskPath(wid, pid, taskId)).data.get('ownerCompanyId', '');
+    }
+
     match /workspaces/{wid}/projects/{pid}/photos/{docId} {
       // #358 leak fix: fotka navázaná na interní úkol (Photo.taskId) je čitelná
       // jen členům firmy vlastnící ten úkol — jinak by prozradila jeho existenci
       // a evidence URL mimo tasks gate výše.
-      allow read: if isProjectMember(wid, pid)
+      allow get: if isProjectMember(wid, pid)
         && taskLinkReadOk(wid, pid, resource.data.get('taskId', ''));
-      allow create: if canCreateContent(wid, pid);
+      // 🔴 Nález A1: ve výpisu `resource.data.get('taskId','')` vyšlo prázdné,
+      // takže `taskLinkReadOk` propustilo i evidenční fotky interních úkolů
+      // včetně URL. Výpis proto jede přes `visibility` (viz hlavička souboru).
+      allow list: if isProjectMember(wid, pid) && visibleInList(pid);
+      allow create: if canCreateContent(wid, pid)
+        && linkedVisibilityOk(wid, pid, request.resource.data.get('taskId', ''));
       allow update: if canModifyContent(wid, pid)
-        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
+        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')  // author immutable
+        && linkedVisibilityOk(wid, pid, request.resource.data.get('taskId', ''));
       allow delete: if canModifyContent(wid, pid);
     }
 
@@ -960,11 +1136,14 @@ service cloud.firestore {
     match /workspaces/{wid}/projects/{pid}/photoPins/{docId} {
       // #358 leak fix: stejná gate jako u /photos, jen taskId čteme z
       // PhotoPin.context.taskId (vnořené pole).
-      allow read: if isProjectMember(wid, pid)
+      allow get: if isProjectMember(wid, pid)
         && taskLinkReadOk(wid, pid, resource.data.get('context', {}).get('taskId', ''));
-      allow create: if canCreateContent(wid, pid);
+      allow list: if isProjectMember(wid, pid) && visibleInList(pid);
+      allow create: if canCreateContent(wid, pid)
+        && linkedVisibilityOk(wid, pid, request.resource.data.get('context', {}).get('taskId', ''));
       allow update: if canModifyContent(wid, pid)
-        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
+        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')  // author immutable
+        && linkedVisibilityOk(wid, pid, request.resource.data.get('context', {}).get('taskId', ''));
       allow delete: if canModifyContent(wid, pid);
     }
 
@@ -989,9 +1168,16 @@ service cloud.firestore {
     match /workspaces/{wid}/projects/{pid}/planAnnotations/{docId} {
       // Soukromý markup (isPrivate) vidí JEN jeho autor (ownerPrincipal == principal);
       // veřejné vidí každý člen. Klient čte dvěma dotazy (veřejné + vlastní soukromé).
-      allow read: if isProjectMember(wid, pid)
+      allow get: if isProjectMember(wid, pid)
         && (resource.data.get('isPrivate', false) == false
             || resource.data.get('ownerPrincipal', '') == principal());
+      // 🔴 Nález A1: ve výpisu `data.get('isPrivate', false)` vyšlo `false`,
+      // takže cizí soukromý markup vydal obyčejný dotaz na `planVersionId` —
+      // přesně ten, který posílá appka. Přímý přístup tenhle tvar odmítne
+      // a vynutí dvojici dotazů (veřejné + vlastní), kterou klient stejně umí.
+      allow list: if isProjectMember(wid, pid)
+        && (resource.data.isPrivate == false
+            || resource.data.ownerPrincipal == principal());
       allow create, update, delete: if canEdit(wid, pid);
     }
 
@@ -1116,6 +1302,23 @@ service cloud.firestore {
     // Invite self-join on the project doc: only adds the caller to
     // memberIds/roles, with the role copied from the members doc created in
     // the same batch (which itself requires a valid invite claim).
+    //
+    // 🔴 Nález C (#535): `companies` bylo v `hasOnly` allowlistu BEZ JAKÉKOLI
+    // podmínky — na rozdíl od `memberIds` (přesně +1 prvek, jen já) a `roles`
+    // (jen můj klíč, hodnota ze zrcadla). `projects/{pid}.companies` přitom
+    // není popisné pole: čte ho `memberCompany` → `isSameProjectCompany` →
+    // firemní prostory (#361) i interní úkoly (#358). Kdo přijímal pozvánku,
+    // přiřkl si tím libovolnou firmu na té stavbě — a mohl přitom PŘEPSAT
+    // zařazení všech ostatních.
+    //
+    // Teď platí totéž co pro `roles`: smí se hnout JEN můj klíč a JEN na
+    // hodnotu, kterou nese pozvánka (přes `companyId` na zrcadle člena, které
+    // je na invite doc navázané o pár řádků výš). Bez firmy v pozvánce vyjde
+    // obojí `''` a klíč se vůbec neobjeví.
+    function selfJoinMirrorPath(pid) {
+      return /databases/$(database)/documents/workspaces/$(resource.data.workspaceId)/projects/$(pid)/members/$(principal());
+    }
+
     function inviteSelfJoin(pid) {
       return isRealUser()
         && !(principal() in resource.data.get('memberIds', []))
@@ -1128,8 +1331,13 @@ service cloud.firestore {
         && principal() in request.resource.data.memberIds
         && request.resource.data.roles.diff(resource.data.get('roles', {}))
             .affectedKeys().hasOnly([principal()])
+        && request.resource.data.get('companies', {})
+            .diff(resource.data.get('companies', {}))
+            .affectedKeys().hasOnly([principal()])
+        && stringOrEmpty(request.resource.data.get('companies', {}).get(principal(), ''))
+            == stringOrEmpty(getAfter(selfJoinMirrorPath(pid)).data.get('companyId', ''))
         && request.resource.data.roles[principal()]
-            == getAfter(/databases/$(database)/documents/workspaces/$(resource.data.workspaceId)/projects/$(pid)/members/$(principal())).data.role;
+            == getAfter(selfJoinMirrorPath(pid)).data.role;
     }
 
     // -------------------------------------------------------------------
@@ -1255,11 +1463,16 @@ service cloud.firestore {
           && request.resource.data.diff(resource.data).affectedKeys()
               .hasOnly(['dataOwner', 'updatedAt'])
         ) || (
+          // 🔴 Nález C2 (#535): `companies` v tomhle denylistu CHYBĚLO, takže si
+          // správce stavby kdykoli přiřkl libovolnou firmu — a otevřel si tím
+          // její interní prostor i interní úkoly, které #358 výslovně skrývá
+          // i před ním. Přiřazení k firmě je úkon vlastníka/admina FIRMY
+          // (`setProjectMemberCompany`), ne správce stavby.
           isRealUser()
           && resource.data.get('roles', {}).get(principal(), '') == 'admin'
           && request.resource.data.workspaceId == resource.data.workspaceId
           && !request.resource.data.diff(resource.data).affectedKeys()
-              .hasAny(['memberIds', 'roles', 'dataOwner'])
+              .hasAny(['memberIds', 'roles', 'dataOwner', 'companies'])
         ) || (
           // Přeřazení JEDNOHO cizího člena správcem stavby (#507) — jediná
           // cesta, kterou se `roles` mění bez vlastníka/admina firmy.
@@ -1394,12 +1607,23 @@ service cloud.firestore {
       // zvacích e-mailů, který dokument čte JMÉNEM přihlášeného uživatele, takže
       // oprávnění vynutí tahle rule. Rozšířit i `list` by dovolilo enumeraci
       // cizích pozvánek, proto výpis zůstává jen adresátovi.
+      //
+      // 🔴 Nález A1 (#535): obě větve stály na `.get(…, '')` NA OBOU STRANÁCH.
+      // Ve výpisu vyšel `inviteeEmail` prázdný a token bez claimu `email` taky —
+      // `'' == ''` → kdokoli přihlášený BEZ e-mailu si vypsal CELÝ registr:
+      // tokeny, `apiKey`, `authExchangeUrl`, e-maily i názvy staveb napříč
+      // všemi firmami. V hostovaném modelu únik přes hranici zákazníka.
+      //
+      // Token se proto čte PŘÍMO (`request.auth.token.email`): chybí-li claim,
+      // výraz skončí chybou a požadavek se odmítne — nikdy se neporovnají dvě
+      // prázdné hodnoty. `get` si předsadí ještě explicitní kontrolu, ať je
+      // fail-closed čitelný i bez znalosti sémantiky chyb.
       allow get: if isRealUser()
-        && (resource.data.get('inviteeEmail', '') == request.auth.token.get('email', '')
-            || (resource.data.get('inviterEmail', '') != ''
-                && resource.data.get('inviterEmail', '') == request.auth.token.get('email', '')));
+        && request.auth.token.get('email', '') != ''
+        && (resource.data.get('inviteeEmail', '') == request.auth.token.email
+            || resource.data.get('inviterEmail', '') == request.auth.token.email);
       allow list: if isRealUser()
-        && resource.data.get('inviteeEmail', '') == request.auth.token.get('email', '');
+        && resource.data.inviteeEmail == request.auth.token.email;
       // POZOR (bezpečnost): tento create dovoluje LIBOVOLNÉMU reálnému uživateli
       // vytvořit pozvánku s libovolným authExchangeUrl/apiKey mířícím na cizí
       // backend. hasOnly níže zamezuje injektáži cizích polí a inviterEmail se

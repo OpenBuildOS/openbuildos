@@ -654,7 +654,21 @@ service cloud.firestore {
         // Pozvánkou nejde udělit `admin` (eskalace) — jen role bez `manage`.
         && request.resource.data.role in ['reader', 'viewer', 'editor']
         && request.resource.data.usedBy == null
+        // 🔑 Platnost je vlastnost SYSTÉMU, ne zvyk klienta. `createInvite()`
+        // slibuje 14 dní (`INVITE_TTL_DAYS`) a `redeemOk` na `expiresAt` stojí
+        // (`request.time < invite.expiresAt`) — jenže dokud rozsah nikdo
+        // nekontroloval, směl si správce firmy vystavit pozvánku platnou do
+        // roku 2099. Bearer token, který nikdy neztratí platnost, je přesně to,
+        // před čím TTL má chránit: uniklý odkaz ze staré fotky chatu otevře
+        // stavbu i za tři roky.
+        //
+        // Okno je totéž jako u centrálního registru (#549/#551), ať pozvánka a
+        // její zrcadlo nemají každé jinou pravdu o téže expiraci. Den vůle nad
+        // TTL je tam schválně — hodnotu počítá klient ze SVÝCH hodin a tvrdší
+        // okno by u rozjetých hodin nechalo zvaní padat na permission-denied.
         && request.resource.data.expiresAt is timestamp
+        && request.resource.data.expiresAt > request.time
+        && request.resource.data.expiresAt < request.time + duration.value(15, 'd')
         && request.resource.data.createdBy == principal()
         && (
             // Direct: project admin / workspace admin issues a live invite.
@@ -688,8 +702,16 @@ service cloud.firestore {
         // 7 z 10 dokumentových přístupů) a přesnější: pozvánka zůstane na
         // stavbě, pro kterou ji `create` schválil. Přesměrování není úkon,
         // který by kdokoli potřeboval — vystaví se nová.
+        //
+        // 🔑 Strop platnosti drží i tady, jinak by okno u `create` bylo ovladač
+        // nad ničím: založ pozvánku na 14 dní, hned ji updatni na rok 2099.
+        // Je to JEN strop, ne okno — zkrácení expirace do minulosti pozvánku
+        // zneplatňuje, a to musí zůstat průchozí (klient dnes ruší mazáním,
+        // ale zavírat cestu, která bezpečnost jen zvyšuje, nedává smysl).
         || (canManage(wid, resource.data.projectId)
-            && request.resource.data.projectId == resource.data.projectId);
+            && request.resource.data.projectId == resource.data.projectId
+            && request.resource.data.expiresAt is timestamp
+            && request.resource.data.expiresAt < request.time + duration.value(15, 'd'));
       allow delete: if canManage(wid, resource.data.projectId);
     }
 

@@ -4,6 +4,7 @@ import type { Firestore } from "firebase-admin/firestore";
 import {
   CLAIMS_BYTE_LIMIT,
   ClaimsTooLargeError,
+  SKIPPED_PROJECT_LOG_EVENT,
   assertClaimsFit,
   belongsToWorkspace,
   buildMembershipClaims,
@@ -347,26 +348,28 @@ test("projekt bez pole roles dostane čtecí claim, ne výjimku", async () => {
   assert.deepEqual(buildMembershipClaims(input), { p: ["W1/P1"] });
 });
 
-// 🔴 ZNÁMÁ MEZERA, kterou tenhle test POPISUJE, ne schvaluje.
-//
-// Projekt bez `workspaceId` se zahodí tichým `continue`. Zahodit ho je správně:
+// 🔴 REGRESE. Projekt bez `workspaceId` se z podkladů zahodí — a to je správně:
 // claim má tvar `{wid}/{pid}` a holý `pid` by autorizoval
-// `workspaces/CIZI-FIRMA/projects/MUJ-PROJEKT/…`. Špatně je, že se to NIKDE
-// neohlásí — uživatel je členem projektu (je v `memberIds`), ale ve Storage se
-// ke svým souborům nedostane a v logu po tom nezůstane ani řádek. Legacy data
-// bez `workspaceId` reálně existují (`src/services/workspaceProjects.ts` s tím
-// polem počítá jako s volitelným).
-//
-// ⚠️ Doplnit hlášení = změna zdroje (`membershipClaims.ts` je sdílený soubor,
-// docs/REPO_BOUNDARIES.md) a patří do samostatné dávky. Až se to stane, tenhle
-// test se MUSÍ upravit — `lines` přestane být prázdné. To je záměr: ať je fix
-// vědomý, ne mimochodem.
-test("🔴 projekt bez workspaceId se zahodí — a dnes se to NIKDE neohlásí", async () => {
+// `workspaces/CIZI-FIRMA/projects/MUJ-PROJEKT/…`. Do 8. 8. 2026 se ale zahazoval
+// TIŠE: uživatel je členem projektu (je v `memberIds`), takže ho ve Firestore
+// vidí, jenže ve Storage se ke svým souborům nedostane a v logu po tom nezůstal
+// ani řádek. Po nasazení `storage.rules` na produkci je ztráta claimu ztráta
+// souborů, a legacy data bez `workspaceId` reálně existují
+// (`src/services/workspaceProjects.ts` s tím polem počítá jako s volitelným).
+// Tichý fail-closed se nedá odladit; hlášený ano.
+test("projekt bez workspaceId se zahodí — a řekne se to nahlas", async () => {
+  const tajnyNazev = "Rezidence Na Vyhlídce";
   const { db } = fakeFirestore({
     projects: [
-      { id: "P-legacy", data: { memberIds: ["u1"], roles: { u1: "editor" } } },
-      { id: "P-prazdny", data: { workspaceId: "", memberIds: ["u1"], roles: { u1: "editor" } } },
-      { id: "P-cislo", data: { workspaceId: 42, memberIds: ["u1"], roles: { u1: "editor" } } },
+      { id: "P-legacy", data: { name: tajnyNazev, memberIds: ["u1"], roles: { u1: "editor" } } },
+      {
+        id: "P-prazdny",
+        data: { workspaceId: "", name: tajnyNazev, memberIds: ["u1"], roles: { u1: "editor" } },
+      },
+      {
+        id: "P-cislo",
+        data: { workspaceId: 42, name: tajnyNazev, memberIds: ["u1"], roles: { u1: "editor" } },
+      },
       { id: "P-ok", data: { workspaceId: "W1", memberIds: ["u1"], roles: { u1: "editor" } } },
     ],
   });
@@ -377,8 +380,52 @@ test("🔴 projekt bez workspaceId se zahodí — a dnes se to NIKDE neohlásí"
   assert.deepEqual(input.projects.map((project) => project.id), ["P-ok"]);
   assert.deepEqual(buildMembershipClaims(input), { pw: ["W1/P-ok"] });
 
-  // A tady je ta mezera: tři projekty zmizely bez jediného slova.
-  assert.deepEqual(lines, [], "dnešní stav — až se hlášení doplní, tenhle assert se změní");
+  // Každý zahozený projekt = jeden dohledatelný řádek, ne ticho.
+  assert.equal(lines.length, 3, "tři zahozené projekty = tři hlášení");
+  const payloads = lines.map((line) => {
+    assert.ok(line.startsWith("warn: "), `hlášení musí mít závažnost warn: ${line}`);
+    return JSON.parse(line.slice("warn: ".length)) as Record<string, unknown>;
+  });
+
+  assert.deepEqual(payloads.map((payload) => payload.projectId), [
+    "P-legacy",
+    "P-prazdny",
+    "P-cislo",
+  ]);
+  for (const payload of payloads) {
+    // Filtr v Cloud Loggingu: `jsonPayload.event="membership_project_skipped"`.
+    assert.equal(payload.event, SKIPPED_PROJECT_LOG_EVENT);
+    assert.equal(payload.severity, "WARNING");
+    assert.equal(payload.principal, "u1", "bez principala se nedá dohledat, komu to chybí");
+    assert.match(String(payload.message), /workspaceId/);
+  }
+
+  // Typ vadné hodnoty ANO (podle něj se pozná, co se s dokumentem stalo)…
+  assert.deepEqual(payloads.map((payload) => payload.workspaceIdType), [
+    "undefined",
+    "empty-string",
+    "number",
+  ]);
+
+  // …obsah dokumentu NE. Do logu nepatří název stavby ani nic z těla dokumentu.
+  for (const line of lines) {
+    assert.ok(!line.includes(tajnyNazev), `hlášení nesmí nést obsah dokumentu: ${line}`);
+    assert.ok(!line.includes("roles"), `hlášení nesmí nést obsah dokumentu: ${line}`);
+    assert.ok(!line.includes("memberIds"), `hlášení nesmí nést obsah dokumentu: ${line}`);
+  }
+});
+
+// 🔴 REGRESE. Hlášení o zahozeném projektu je výjimečný stav. Kdyby se vypisovalo
+// i u zdravých podkladů, zapadne v šumu přesně ve chvíli, kdy na něm záleží.
+test("zdravé podklady neřeknou do logu nic", async () => {
+  const { db } = fakeFirestore({
+    workspaces: [{ id: "W1", data: { ownerId: "u1", adminIds: [] } }],
+    projects: [{ id: "P1", data: { workspaceId: "W1", memberIds: ["u1"], roles: { u1: "editor" } } }],
+  });
+
+  const { lines } = await captureConsole(() => loadMembershipInput(db, "u1"));
+
+  assert.deepEqual(lines, []);
 });
 
 test("hostovaný prostor (`ws_…` wid) se do claims vejde i s podtržítkem", async () => {

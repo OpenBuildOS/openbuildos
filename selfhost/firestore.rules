@@ -1713,6 +1713,21 @@ service cloud.firestore {
         && request.resource.data.get('status', '') == 'pending'
         && request.resource.data.get('inviteeEmail', '') is string
         && request.resource.data.get('inviteeEmail', '') != ''
+        // 🔑 #549 nález A: Hub schovává „Přijmout" u PROŠLÉ pozvánky podle
+        // `expiresAt`. Aby to nebyl „ovladač nad mechanismem, který nic nedělá"
+        // (jako `usage` nebo `membershipKind`), musí být to pole průkazné —
+        // jinak by si klient zapsal expiraci v roce 2099 a Hub by dál nabízel
+        // akci, kterou firemní `redeemOk` (`request.time < expiresAt`) odmítne.
+        //
+        // Proto se `expiresAt` váže na SERVEROVÝ čas: nesmí být v minulosti (to
+        // by byla mrtvá pozvánka) ani dál než TTL + den vůle. Den vůle je tam
+        // schválně — hodnotu počítá klient ze SVÝCH hodin, a tvrdší okno by u
+        // rozjetých hodin nechalo publikaci padat na permission-denied a
+        // adresát by pozvánku v Hubu nikdy neuviděl (regrese po #396).
+        && request.resource.data.expiresAt is timestamp
+        && request.resource.data.expiresAt > request.time
+        && request.resource.data.expiresAt < request.time + duration.value(15, 'd')
+        && request.resource.data.createdAt is timestamp
         // inviterEmail smí být buď prázdný/null (admin bez e-mailu), nebo se MUSÍ
         // shodovat s e-mailem odesílatele — nelze se vydávat za konkrétního kolegu.
         && (request.resource.data.get('inviterEmail', null) == null

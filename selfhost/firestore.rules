@@ -917,6 +917,71 @@ service cloud.firestore {
     }
 
     // ---------------------------------------------------------------------
+    // SCHRÁNKA POZORNOSTI (docs/ai/us-signal-druha-firma.md)
+    //
+    // „Ve firmě X na tebe čekají 2 věci." Signál, který člověka patřícího do
+    // více firem dotáhne do prostoru té druhé. NENÍ to notifikace a nenese
+    // ŽÁDNÝ TEXT — jen druh, stavbu a id předmětu.
+    //
+    // PROČ NA ÚROVNI FIRMY, ne stavby: jediný dotaz na firmu místo jednoho na
+    // KAŽDOU stavbu. Egress je 63 % účtu; signál, který při každém načtení Hubu
+    // přečte N staveb napříč firmami, je drahý napořád. Tady cena neroste
+    // s počtem staveb ani s historií — vyřešená položka se MAŽE.
+    //
+    // 🔑 ČTECÍ BRÁNA SE NEPTÁ DOKUMENTU. Stojí výhradně na proměnných z cesty
+    // (`inboxPrincipal`, `wid`), takže `list` je průkazný bez ohledu na tvar
+    // dotazu a celá třída vad z #537 (`resource.data.get(pole, výchozí)`
+    // selhávající OTEVŘENĚ ve výpisu) tu nemá kam se vejít.
+    //
+    // 🔴 Nález D (#539) obdobně: `isFirmParticipant` = signál končí s ČLENSTVÍM
+    // ve firmě, ne s adresou. Kdo je z firmy odebrán (adresářový záznam smaže
+    // vlastník/admin firmy), přestane schránku vidět. Mezistav „už nejsem na
+    // stavbě, ale jsem ve firmě" nic neprozradí, protože v položce není text.
+    // ---------------------------------------------------------------------
+
+    function attentionKindOk(kind) {
+      return kind == 'task.assigned'
+        || kind == 'task.mentioned'
+        || kind == 'approval.pending';
+    }
+
+    // Zapisovatel musí být členem TÉ STAVBY, kterou položka deklaruje — o
+    // projektu tedy lhát nejde (deklarace a předmět jsou totéž pole; stejný vzor
+    // jako `viaProjectId` u firemního adresáře). Že je členem i ADRESÁT ověřit
+    // nejde bez dalšího čtení cizího členství; důsledek je nejhorší takový, že
+    // člen firmy vyrobí odznak na stavbu, kterou adresát neotevře (UI ji zahodí).
+    // Novou třídu zneužití to nezavádí — `notificationQueue` už dnes dovolí
+    // členovi stavby zapsat notifikaci s libovolnými `recipientIds`, a to i s textem.
+    function attentionWriteOk(wid) {
+      return isProjectMember(wid, request.resource.data.get('projectId', ''))
+        && request.resource.data.keys().hasOnly(['kind', 'projectId', 'refId', 'createdAt'])
+        && attentionKindOk(request.resource.data.get('kind', ''))
+        && request.resource.data.get('refId', '') is string
+        && request.resource.data.get('refId', '') != ''
+        && request.resource.data.get('createdAt', '') is string;
+    }
+
+    match /workspaces/{wid}/inbox/{inboxPrincipal}/items/{itemId} {
+      allow get, list: if isRealUser()
+        && principal() == inboxPrincipal
+        && isFirmParticipant(wid);
+      allow create: if attentionWriteOk(wid);
+      // Id položky je deterministické (`kind:projectId:refId`), aby opakovaná
+      // událost nad tou samou věcí schránku nenafoukla. Přepis proto musí projít
+      // — ale smí obnovit jen `createdAt`, identita položky je immutable.
+      allow update: if attentionWriteOk(wid)
+        && request.resource.data.kind == resource.data.kind
+        && request.resource.data.projectId == resource.data.projectId
+        && request.resource.data.refId == resource.data.refId;
+      // Vyřešit smí JEN adresát (a vlastník/admin firmy při úklidu). Pustit sem
+      // kteréhokoli člena stavby by insiderovi dovolilo tiše zhasnout signál
+      // o práci, která na někoho čeká. Falešně svítící odznak je nepříjemnost,
+      // zhasnutý odznak je ztracená práce.
+      allow delete: if (isRealUser() && principal() == inboxPrincipal)
+        || isWsAdmin(wid);
+    }
+
+    // ---------------------------------------------------------------------
     // Project content collections (explicit enumeration -- no catch-all so
     // members/notificationQueue/invites can never be reached through these).
     // ---------------------------------------------------------------------

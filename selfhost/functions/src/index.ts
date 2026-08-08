@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { initializeApp, getApps, getApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
@@ -36,6 +35,13 @@ import {
   computeMembershipClaims,
   type MembershipClaims,
 } from "./membershipClaims";
+// Zneplatnění sdílecího odkazu vč. rotace download tokenu — SDÍLENÝ modul
+// s hlavním repem (viz docs/REPO_BOUNDARIES.md).
+import {
+  ShareLinkRotationError,
+  createFirestoreShareLinkStore,
+  revokeShareLinkAndRotate,
+} from "./shareLinkRotation";
 
 /**
  * Token-exchange Cloud Function `authExchange` pro OpenBuildOS federaci.
@@ -491,74 +497,21 @@ function principalFromAuth(auth: { uid: string; token: Record<string, unknown> }
   return auth.uid;
 }
 
-async function canEditProjectContent(workspaceId: string, projectId: string, principal: string): Promise<boolean> {
-  const db = getFirestore(getLocalApp());
-  const [workspaceSnap, projectSnap] = await Promise.all([
-    db.doc(`workspaces/${workspaceId}`).get(),
-    db.doc(`projects/${projectId}`).get(),
-  ]);
-
-  if (!workspaceSnap.exists || !projectSnap.exists) {
-    return false;
-  }
-
-  const workspace = workspaceSnap.data() as {
-    ownerId?: string;
-    adminIds?: string[];
-  };
-  const project = projectSnap.data() as {
-    workspaceId?: string;
-    roles?: Record<string, string>;
-  };
-
-  if (project.workspaceId !== workspaceId) {
-    return false;
-  }
-
-  if (workspace.ownerId === principal || workspace.adminIds?.includes(principal)) {
-    return true;
-  }
-
-  const role = project.roles?.[principal] ?? "";
-  return role === "editor" || role === "admin";
-}
-
-function parseStorageObjectFromDownloadUrl(fileUrl: string): { bucket: string; objectPath: string } {
-  const url = new URL(fileUrl);
-  const firebaseApiMatch = url.pathname.match(/^\/v0\/b\/([^/]+)\/o\/(.+)$/);
-  if (firebaseApiMatch) {
-    return {
-      bucket: decodeURIComponent(firebaseApiMatch[1]),
-      objectPath: decodeURIComponent(firebaseApiMatch[2]),
-    };
-  }
-
-  const directMatch = url.pathname.match(/^\/([^/]+)\/(.+)$/);
-  if (url.hostname === "storage.googleapis.com" && directMatch) {
-    return {
-      bucket: decodeURIComponent(directMatch[1]),
-      objectPath: decodeURIComponent(directMatch[2]),
-    };
-  }
-
-  throw new HttpsError(
-    "failed-precondition",
-    "Sdílený soubor nemá podporovaný Firebase Storage download URL."
-  );
-}
-
-async function rotateDownloadToken(fileUrl: string): Promise<void> {
-  const { bucket, objectPath } = parseStorageObjectFromDownloadUrl(fileUrl);
-  const file = getStorage(getLocalApp()).bucket(bucket).file(objectPath);
-  const [metadata] = await file.getMetadata();
-  await file.setMetadata({
-    metadata: {
-      ...(metadata.metadata ?? {}),
-      firebaseStorageDownloadTokens: randomUUID(),
-    },
-  });
-}
-
+/**
+ * `revokeShareLinkAndRotateToken` — „Zneplatnit odkaz" opravdu zneplatní odkaz.
+ *
+ * Sdílecí odkaz vede přes `/share/{wid}/{token}` na PŘÍMOU download URL souboru.
+ * Kdo si tu adresu zkopíroval, tomu `revoked = true` ve Firestoru nevezme nic —
+ * Storage servíruje objekt podle tokenu v URL, mimo rules. Zneplatnit jde tedy
+ * jen rotací `firebaseStorageDownloadTokens`.
+ *
+ * 🔴 Logika je od 8. 8. 2026 ve SDÍLENÉM `shareLinkRotation.ts`, protože ji do
+ * té doby měl JEN tenhle (firemní) backend. Klient hostovaného zákazníka dostal
+ * z centrálního projektu `functions/not-found` a spadl na
+ * `updateDoc({ revoked: true })` — zneplatnění tam mlčky nedělalo nic
+ * podstatného. Modul se proto MUSÍ držet identický v obou repech
+ * (viz docs/REPO_BOUNDARIES.md), ať se ta dvě prostředí nemůžou znovu rozejít.
+ */
 export const revokeShareLinkAndRotateToken = onCall<
   { wid?: string; pid?: string; token?: string }
 >({ region: "europe-west1" }, async (request) => {
@@ -566,42 +519,41 @@ export const revokeShareLinkAndRotateToken = onCall<
     throw new HttpsError("unauthenticated", "Chybí přihlášení do workspace.");
   }
 
-  const workspaceId = typeof request.data?.wid === "string" ? request.data.wid : "";
-  const projectId = typeof request.data?.pid === "string" ? request.data.pid : "";
-  const token = typeof request.data?.token === "string" ? request.data.token : "";
-  if (!workspaceId || !projectId || !token) {
-    throw new HttpsError("invalid-argument", "Chybí wid, pid nebo token.");
-  }
-
   const principal = principalFromAuth(request.auth);
-  if (!(await canEditProjectContent(workspaceId, projectId, principal))) {
-    throw new HttpsError("permission-denied", "Nemáš oprávnění zneplatnit sdílecí odkaz.");
+  const store = createFirestoreShareLinkStore(
+    getFirestore(getLocalApp()),
+    getStorage(getLocalApp())
+  );
+
+  try {
+    const result = await revokeShareLinkAndRotate(store, {
+      workspaceId: typeof request.data?.wid === "string" ? request.data.wid : "",
+      projectId: typeof request.data?.pid === "string" ? request.data.pid : "",
+      token: typeof request.data?.token === "string" ? request.data.token : "",
+      principal,
+    });
+    logger.info("revokeShareLinkAndRotateToken OK", {
+      workspaceId: request.data?.wid,
+      projectId: request.data?.pid,
+      principal,
+      wasAlreadyRevoked: result.wasAlreadyRevoked,
+    });
+    return { revoked: result.revoked, tokenRotated: result.tokenRotated };
+  } catch (error) {
+    if (error instanceof ShareLinkRotationError) {
+      throw new HttpsError(error.code, error.message);
+    }
+    // Rotace selhala z jiného důvodu (Storage, IAM). Klient NESMÍ spadnout na
+    // „jen Firestore" fallback — `functions/internal` mezi fallbackové kódy
+    // nepatří, takže se chyba dostane až k uživateli.
+    logger.error("revokeShareLinkAndRotateToken selhalo", {
+      workspaceId: request.data?.wid,
+      projectId: request.data?.pid,
+      principal,
+      error,
+    });
+    throw new HttpsError("internal", "Zneplatnění odkazu se nepodařilo dokončit.");
   }
-
-  const db = getFirestore(getLocalApp());
-  const shareRef = db.doc(`workspaces/${workspaceId}/projects/${projectId}/shareLinks/${token}`);
-  const shareSnap = await shareRef.get();
-  if (!shareSnap.exists) {
-    throw new HttpsError("not-found", "Sdílecí odkaz neexistuje.");
-  }
-
-  const shareDoc = shareSnap.data() as { fileUrl?: string; revoked?: boolean };
-  if (typeof shareDoc.fileUrl !== "string" || shareDoc.fileUrl.length === 0) {
-    throw new HttpsError("failed-precondition", "Sdílecí odkaz neobsahuje URL souboru.");
-  }
-
-  await rotateDownloadToken(shareDoc.fileUrl);
-  await shareRef.update({ revoked: true });
-
-  logger.info("revokeShareLinkAndRotateToken OK", {
-    workspaceId,
-    projectId,
-    token,
-    principal,
-    wasAlreadyRevoked: Boolean(shareDoc.revoked),
-  });
-
-  return { revoked: true, tokenRotated: true };
 });
 
 async function isWorkspaceAdmin(workspaceId: string, principal: string): Promise<boolean> {

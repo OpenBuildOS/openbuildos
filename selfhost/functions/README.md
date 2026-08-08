@@ -82,8 +82,11 @@ vlastníka firmy.
 - `companyFile` — autorizovaný přístup k interním firemním souborům
   (`companySpaces`), které jsou v pravidlech úložiště zakázané napřímo.
 - `revokeShareLinkAndRotateToken` — callable funkce pro skutečnou revokaci
-  veřejného share linku: označí Firestore záznam jako `revoked` a zároveň
-  zrotuje Firebase Storage download token souboru.
+  veřejného share linku: zrotuje Firebase Storage download token souboru
+  a teprve pak označí Firestore záznam jako `revoked`. Logika je ve **sdíleném**
+  `src/shareLinkRotation.ts` (identický soubor v hlavním repu) — do 8. 8. 2026
+  tuhle funkci měl jen firemní backend, takže hostovanému zákazníkovi
+  „zneplatnění odkazu" mlčky nerotovalo nic.
 - `sendProjectInvite` — odeslání pozvánky e-mailem (SMTP/Resend).
 - **Přenos projektu (#291)** — `exportProjectBackup`, `prepareProjectBackupImport`,
   `importProjectBackup`, `deleteProjectPermanently` (viz níže).

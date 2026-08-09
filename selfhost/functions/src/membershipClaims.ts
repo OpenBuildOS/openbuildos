@@ -26,12 +26,13 @@ import type { Firestore } from "firebase-admin/firestore";
  * prefix. Klíč mapy JE workspace, takže tu vazbu drží ze své podstaty (dřív ji
  * držela jen konvence uvnitř řetězce `"{wid}/{pid}"`).
  *
- * 📦 PROČ MAPA A NE SEZNAM (#565 → tenhle PR). Plochý seznam opakoval `wid`
+ * 📦 PROČ MAPA A NE SEZNAM (#565 → #566). Plochý seznam opakoval `wid`
  * u KAŽDÉHO projektu. Hostovaný prostor má `wid` s prefixem `ws_` (23 znaků),
  * takže se do rozpočtu vešlo jen 17 staveb (`docs/ai/token-ceiling-staging.md`,
  * měřeno proti běžícímu stagingu). Seskupení podle firmy platí `wid` jednou za
- * firmu místo jednou za projekt — strop se tím zvedl na 35 (test níž ho drží
- * jako přesné číslo, protože je to údaj pro produkt, ne implementační detail).
+ * firmu místo jednou za projekt — strop se tím zvedl na 34 (test v
+ * `membershipClaims.test.ts` ho drží jako přesné číslo, protože je to údaj pro
+ * produkt, ne implementační detail).
  *
  * ⚠️ Změna tvaru claims se musí stát NARÁZ v claims, ve `storage.rules` a v obou
  * repech (docs/REPO_BOUNDARIES.md) — asymetrie mezi nimi je díra na jednu nebo

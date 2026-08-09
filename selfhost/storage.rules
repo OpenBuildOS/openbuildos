@@ -27,7 +27,7 @@ rules_version = '2';
 // opakovaly `wid` u každého projektu. Hostovaný prostor má `wid` s prefixem
 // `ws_` (23 znaků), takže se do tokenu vešlo jen 17 staveb a na 18. přestalo
 // fungovat Storage (`docs/ai/token-ceiling-staging.md`, měřeno na stagingu).
-// Seskupení podle firmy platí `wid` jednou za firmu → 35 staveb.
+// Seskupení podle firmy platí `wid` jednou za firmu → 34 staveb.
 //
 // ⭐ Claims zrcadlí `isProjectMember` z firestore.rules jedna ku jedné:
 //     principal in projects/{pid}.memberIds || isWsAdmin(wid)
@@ -82,7 +82,7 @@ service firebase.storage {
     // tvar. Bez téhle větve by v tom okně přišli o Storage všichni přihlášení.
     // Klient si podle `cv` přepočet vynutí (`refreshMembershipClaims`), takže
     // okno je krátké — až budou v provozu jen tokeny s `cv >= 2`, legacy část
-    // odsud pryč (issue „odstranit legacy tvar claims").
+    // odsud pryč (issue #569).
     //
     // Chybějící claim vrací `claim()` jako prázdný SEZNAM, takže se test typu
     // vyhodnotí na legacy větev a `'wid/pid' in []` je false. Fail-closed.

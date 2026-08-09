@@ -17,10 +17,17 @@ rules_version = '2';
 // `selfhost/functions/src/membershipClaims.ts`) spočítá členství z Firestore
 // a orazí ho do custom claims:
 //
-//   wsa: [wid, …]           vlastník / admin firmy → všechny projekty té firmy
-//   pw:  ["{wid}/{pid}", …] oprávnění `edit` na projektu → plná práva
-//   p:   ["{wid}/{pid}", …] ostatní členství (contribute / read)
-//                           → čtení + ZALOŽENÍ nového objektu
+//   wsa: [wid, …]              vlastník / admin firmy → všechny projekty té firmy
+//   pw:  {wid: [pid, …], …}    oprávnění `edit` na projektu → plná práva
+//   p:   {wid: [pid, …], …}    ostatní členství (contribute / read)
+//                              → čtení + ZALOŽENÍ nového objektu
+//   cv:  2                     verze TVARU claims (viz CLAIMS_VERSION)
+//
+// 📦 `p`/`pw` byly do 8/2026 PLOCHÉ seznamy `["{wid}/{pid}", …]`, které
+// opakovaly `wid` u každého projektu. Hostovaný prostor má `wid` s prefixem
+// `ws_` (23 znaků), takže se do tokenu vešlo jen 17 staveb a na 18. přestalo
+// fungovat Storage (`docs/ai/token-ceiling-staging.md`, měřeno na stagingu).
+// Seskupení podle firmy platí `wid` jednou za firmu → 35 staveb.
 //
 // ⭐ Claims zrcadlí `isProjectMember` z firestore.rules jedna ku jedné:
 //     principal in projects/{pid}.memberIds || isWsAdmin(wid)
@@ -64,21 +71,35 @@ service firebase.storage {
       return wid in claim('wsa');
     }
 
-    // Členské claims jsou ve tvaru `"{wid}/{pid}"`. Cestu si volí volající,
-    // takže holé `pid` by autorizovalo i `workspaces/CIZI-FIRMA/projects/MUJ-
-    // PROJEKT/…` — psaní pod cizí prefix. Workspace musí sedět taky.
-    function projectKey(wid, pid) {
-      return wid + '/' + pid;
+    // Členské claims jsou MAPA `{wid: [pid, …]}`. Cestu si volí volající, takže
+    // holé `pid` bez vazby na firmu by autorizovalo i
+    // `workspaces/CIZI-FIRMA/projects/MUJ-PROJEKT/…` — psaní pod cizí prefix.
+    // Klíč mapy JE workspace, takže tu vazbu drží sám tvar dat; dřív ji držela
+    // jen konvence uvnitř řetězce `"{wid}/{pid}"`.
+    //
+    // ⚠️ PŘECHODNÁ VĚTEV. Firebase ID token platí pevnou hodinu a claims se
+    // přepíšou až při přepočtu, takže po nasazení chvíli koluje starý PLOCHÝ
+    // tvar. Bez téhle větve by v tom okně přišli o Storage všichni přihlášení.
+    // Klient si podle `cv` přepočet vynutí (`refreshMembershipClaims`), takže
+    // okno je krátké — až budou v provozu jen tokeny s `cv >= 2`, legacy část
+    // odsud pryč (issue „odstranit legacy tvar claims").
+    //
+    // Chybějící claim vrací `claim()` jako prázdný SEZNAM, takže se test typu
+    // vyhodnotí na legacy větev a `'wid/pid' in []` je false. Fail-closed.
+    function projectGrant(name, wid, pid) {
+      return claim(name) is map
+        ? pid in claim(name).get(wid, [])
+        : (wid + '/' + pid) in claim(name);
     }
 
     // Člen projektu s právem zápisu (editor / admin).
     function projectWriteGrant(wid, pid) {
-      return projectKey(wid, pid) in claim('pw');
+      return projectGrant('pw', wid, pid);
     }
 
     // Člen projektu bez práva mazat (contribute / read, tedy bez `edit`).
     function projectReadGrant(wid, pid) {
-      return projectKey(wid, pid) in claim('p');
+      return projectGrant('p', wid, pid);
     }
 
     function canReadProject(wid, pid) {

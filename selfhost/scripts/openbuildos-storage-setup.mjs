@@ -106,9 +106,19 @@ function run(cmd, args, opts = {}) {
  * Gatují lokální `storage.rules` na custom claims? Kontrola je odvozená ze
  * SOUBORU, ne z data vydání: kdyby se pravidla někdy vrátila na `isRealUser()`,
  * brána zmizí sama a nebude nikomu překážet.
+ *
+ * ⚠️ POZNÁVÁ SE I NEPŘÍMÉ ČTENÍ (`request.auth.token.get(name, …)` uvnitř
+ * pomocné funkce), ne jen doslovné `claim('p')`. Když se claims seskupily podle
+ * firmy, přešly `p`/`pw` na společný pomocník s názvem claimu v PROMĚNNÉ — a
+ * původní vzorec hledal jen literál. Kdyby v pravidlech zbylo jen nepřímé
+ * čtení, brána by tiše zmizela a pravidla by šlo nasadit do projektu bez
+ * funkcí, kde claims nemá nikdo — tedy odříznout od Storage i vlastníka
+ * (docs/REPO_BOUNDARIES.md, Háček 3). Falešně pozitivní být nemůže: bez
+ * `request.auth.token` se nic negatuje.
  */
 export function rulesRequireClaims(source) {
-  return /claim\(\s*['"](wsa|pw|p)['"]\s*\)|request\.auth\.token\.(wsa|pw|p)\b/.test(source ?? "");
+  return /claim\(\s*['"](wsa|pw|p)['"]\s*\)|request\.auth\.token\.(wsa|pw|p)\b|request\.auth\.token\.get\s*\(/
+    .test(source ?? "");
 }
 
 /** ID funkcí (poslední segment `name`) z odpovědi Cloud Functions v2 API; jen běžící. */

@@ -3,6 +3,7 @@ import test from "node:test";
 import type { Firestore } from "firebase-admin/firestore";
 import {
   CLAIMS_BYTE_LIMIT,
+  CLAIMS_VERSION,
   ClaimsTooLargeError,
   SKIPPED_PROJECT_LOG_EVENT,
   assertClaimsFit,
@@ -10,7 +11,13 @@ import {
   buildMembershipClaims,
   claimsByteSize,
   computeMembershipClaims,
+  countProjectGrants,
+  intersectMembershipClaims,
   loadMembershipInput,
+  parseStoredMembershipClaims,
+  projectSlotsLeft,
+  shrinkClaimsToFit,
+  type MembershipClaims,
   type MembershipInput,
 } from "./membershipClaims";
 
@@ -46,9 +53,9 @@ test("člen projektu dostane claim podle role", () => {
   // Plný zápis = oprávnění `edit` (#506 fáze 2). Legacy `company_lead` ho podle
   // migrační tabulky má — dřív dostával jen čtecí claim a mazání záznamu tak po
   // sobě nechávalo soubory (nález F5).
-  assert.deepEqual(claims.pw, ["W9/P2", "W9/P3", "W9/P4"]);
+  assert.deepEqual(claims.pw, { W9: ["P2", "P3", "P4"] });
   // `reader` (jen `read`) sdílí claim s `viewer` — Storage jemnější úroveň nemá.
-  assert.deepEqual(claims.p, ["W9/P1", "W9/P5"]);
+  assert.deepEqual(claims.p, { W9: ["P1", "P5"] });
 });
 
 test("claim nese i workspace, ať neautorizuje cizí prefix", () => {
@@ -56,8 +63,10 @@ test("claim nese i workspace, ať neautorizuje cizí prefix", () => {
     ...base,
     projects: [{ id: "P1", workspaceId: "W1", roles: { u1: "editor" } }],
   });
-  assert.deepEqual(claims.pw, ["W1/P1"]);
-  assert.ok(!claims.pw?.includes("P1"), "holý pid by pustil workspaces/CIZI/projects/P1/…");
+  assert.deepEqual(claims.pw, { W1: ["P1"] });
+  // Vazba wid → pid drží sám tvar: `pid` žije POD klíčem workspace, takže
+  // `workspaces/CIZI/projects/P1/…` se z něj složit nedá.
+  assert.deepEqual(Object.keys(claims.pw ?? {}), ["W1"]);
 });
 
 test("projekty pokryté adminstvím firmy se do claims nepíšou (šetří bajty)", () => {
@@ -70,7 +79,7 @@ test("projekty pokryté adminstvím firmy se do claims nepíšou (šetří bajty
     ],
   });
   assert.deepEqual(claims.wsa, ["W1"]);
-  assert.deepEqual(claims.p, ["W2/P2"]);
+  assert.deepEqual(claims.p, { W2: ["P2"] });
 });
 
 // 🔴 REGRESE. Adresářový záznam `workspaces/{wid}/members/{principal}` zakládá
@@ -84,7 +93,7 @@ test("členství se odvozuje JEN z projektů a adminství, ne z firemního adres
   });
   // Pořadí záleží: `assert.deepEqual` je assertion funkce a typ tu zúží.
   assert.equal(claims.wsa, undefined, "host nesmí dostat workspace-level claim");
-  assert.deepEqual(claims, { p: ["W1/P1"] });
+  assert.deepEqual(claims, { p: { W1: ["P1"] } });
 
   // MembershipInput nemá kam adresářový záznam předat — to je záměr, ne opomenutí.
   assert.deepEqual(Object.keys(base).sort(), ["adminWorkspaces", "principal", "projects"]);
@@ -100,13 +109,13 @@ test("odebrání z projektu vezme claim (claims zrcadlí memberIds)", () => {
       { id: "P2", workspaceId: "W1", roles: { u1: "editor" } },
     ],
   });
-  assert.deepEqual(before.pw, ["W1/P1", "W1/P2"]);
+  assert.deepEqual(before.pw, { W1: ["P1", "P2"] });
 
   const after = buildMembershipClaims({
     ...base,
     projects: [{ id: "P1", workspaceId: "W1", roles: { u1: "editor" } }],
   });
-  assert.deepEqual(after.pw, ["W1/P1"]);
+  assert.deepEqual(after.pw, { W1: ["P1"] });
 });
 
 test("neznámá role spadne do čtecího claimu, ne do zápisového", () => {
@@ -118,7 +127,7 @@ test("neznámá role spadne do čtecího claimu, ne do zápisového", () => {
     ],
   });
   assert.equal(claims.pw, undefined);
-  assert.deepEqual(claims.p, ["W9/P1", "W9/P2"]);
+  assert.deepEqual(claims.p, { W9: ["P1", "P2"] });
 });
 
 test("prázdné členství = prázdné claims (uživatel se nikam nedostane)", () => {
@@ -153,7 +162,7 @@ test("přetečení je TVRDÁ chyba se srozumitelnou hláškou, ne tiché uřízn
     roles: { u1: "viewer" },
   }));
   const claims = buildMembershipClaims({ ...base, projects });
-  assert.equal(claims.p?.length, 60);
+  assert.equal(countProjectGrants(claims), 60);
 
   let thrown: unknown;
   try {
@@ -167,7 +176,7 @@ test("přetečení je TVRDÁ chyba se srozumitelnou hláškou, ne tiché uřízn
   assert.ok(error.bytes > error.limit);
   assert.match(error.message, /60 projektů/);
   // Seznam zůstal celý — nic se tiše neuřízlo.
-  assert.equal(claims.p?.length, 60);
+  assert.equal(countProjectGrants(claims), 60);
 });
 
 test("rozpočet je pod tvrdým limitem Firebase", () => {
@@ -301,7 +310,7 @@ test("claims se odvozují JEN z členství v projektech, ne z firemního adresá
 
   const claims = buildMembershipClaims(await loadMembershipInput(db, "host"));
 
-  assert.deepEqual(claims, { p: ["W2/P9"] });
+  assert.deepEqual(claims, { p: { W2: ["P9"] } });
   assert.ok(
     !queries.some((query) => query.includes("members")),
     "firemní adresář se nesmí čít ani omylem"
@@ -345,7 +354,7 @@ test("projekt bez pole roles dostane čtecí claim, ne výjimku", async () => {
   const input = await loadMembershipInput(db, "u1");
 
   assert.deepEqual(input.projects, [{ id: "P1", workspaceId: "W1", roles: {} }]);
-  assert.deepEqual(buildMembershipClaims(input), { p: ["W1/P1"] });
+  assert.deepEqual(buildMembershipClaims(input), { p: { W1: ["P1"] } });
 });
 
 // 🔴 REGRESE. Projekt bez `workspaceId` se z podkladů zahodí — a to je správně:
@@ -378,7 +387,7 @@ test("projekt bez workspaceId se zahodí — a řekne se to nahlas", async () =>
 
   // Zahození je správně: bez wid není claim, který by šel bezpečně vydat.
   assert.deepEqual(input.projects.map((project) => project.id), ["P-ok"]);
-  assert.deepEqual(buildMembershipClaims(input), { pw: ["W1/P-ok"] });
+  assert.deepEqual(buildMembershipClaims(input), { pw: { W1: ["P-ok"] } });
 
   // Každý zahozený projekt = jeden dohledatelný řádek, ne ticho.
   assert.equal(lines.length, 3, "tři zahozené projekty = tři hlášení");
@@ -440,7 +449,7 @@ test("hostovaný prostor (`ws_…` wid) se do claims vejde i s podtržítkem", a
 
   const claims = await computeMembershipClaims(db, "u1");
 
-  assert.deepEqual(claims, { pw: [`${hostedWid}/P1`], p: [`${hostedWid}/P2`] });
+  assert.deepEqual(claims, { pw: { [hostedWid]: ["P1"] }, p: { [hostedWid]: ["P2"] } });
   assert.equal(belongsToWorkspace(claims, hostedWid), true);
   // Legacy wid, který je prefixem hostovaného, se s ním nesmí splést.
   assert.equal(belongsToWorkspace(claims, "ws"), false);
@@ -477,14 +486,14 @@ test("prázdné členství projde celou cestou až k prázdným claims", async (
 test("hostovaný prostor s mnoha stavbami narazí na strop tokenu, ne na tiché uříznutí", async () => {
   const hostedWid = "ws_abcdefghijklmnopqrst";
   const { db } = fakeFirestore({
-    projects: Array.from({ length: 40 }, (_, index) => ({
+    projects: Array.from({ length: 60 }, (_, index) => ({
       id: `project-uuid-${String(index).padStart(4, "0")}`,
       data: { workspaceId: hostedWid, memberIds: ["u1"], roles: { u1: "viewer" } },
     })),
   });
 
   const claims = await computeMembershipClaims(db, "u1");
-  assert.equal(claims.p?.length, 40);
+  assert.equal(countProjectGrants(claims), 60);
 
   let thrown: unknown;
   try {
@@ -497,27 +506,39 @@ test("hostovaný prostor s mnoha stavbami narazí na strop tokenu, ne na tiché 
   const error = thrown as ClaimsTooLargeError;
   assert.ok(error.bytes > error.limit);
   assert.ok(error.limit < CLAIMS_BYTE_LIMIT, "rozpočet musí mít rezervu pod tvrdým limitem");
-  assert.match(error.message, /40 projektů/);
+  assert.match(error.message, /60 projektů/);
   // Seznam zůstal celý — nic se neuřízlo.
-  assert.equal(claims.p?.length, 40);
+  assert.equal(countProjectGrants(claims), 60);
 });
 
 /**
- * 🔴 STROP PRODUKTU, ZMĚŘENÝ. Hostovaný prostor platí za `ws_…` wid (23 znaků)
- * v KAŽDÉ položce claims, takže se do tokenu vejde MÍŇ staveb než self-hosteru
- * s krátkým wid (`bbfs` = 4 znaky). S realistickými hodnotami — Firestore
- * auto-id projektu (20 znaků) a profilová pole `email` + `name` — je hranice
- * OSMNÁCT staveb: na osmnácté `syncMemberClaims` vyhodí a uživatel se
- * nepřihlásí, dokud ho někdo neudělá adminem firmy (jedna položka na celý
- * prostor).
+ * 🔴 STROP PRODUKTU, ZMĚŘENÝ. Hostovaný prostor platí za `ws_…` wid (23 znaků),
+ * takže se do tokenu vejde MÍŇ staveb než self-hosteru s krátkým wid
+ * (`bbfs` = 4 znaky). S realistickými hodnotami — Firestore auto-id projektu
+ * (20 znaků) a tím, co se do tokenu razí navíc (`src`, `cv`, `email`, `name`) —
+ * je hranice TŘICET ČTYŘI staveb: na 35. `authExchange` vyhodí a uživatel se
+ * do firmy nepřihlásí, dokud ho někdo neudělá správcem firmy (jedna položka na
+ * celý prostor).
+ *
+ * 📈 Bylo to 17. Zvedlo se to seskupením claims podle firmy: plochý seznam
+ * `["{wid}/{pid}", …]` platil 23znakový `wid` u KAŽDÉHO projektu, mapa
+ * `{wid: [pid, …]}` ho platí jednou za firmu. Vzorec i výchozích 17 je změřených
+ * proti běžícímu stagingu v `docs/ai/token-ceiling-staging.md`.
  *
  * Kdyby se tenhle test rozešel, znamená to, že se strop produktu POHNUL —
  * což je zpráva pro produkt, ne jen červený test. Číslo tu proto stojí přesně,
- * ne jako „přibližně".
+ * ne jako „přibližně". Když se pohne záměrně, přepiš ho a napiš sem PROČ.
  */
-test("hostované firmě se do tokenu vejde 17 staveb, na 18. to řekne nahlas", async () => {
+test("hostované firmě se do tokenu vejde 34 staveb, na 35. to řekne nahlas", async () => {
   const hostedWid = `ws_${"a".repeat(20)}`;
-  const profile = { email: "jan.novak@example.cz", name: "Jan Novák" };
+  // Přesně to, co razí `authExchange` — nejpřísnější z obou cest
+  // (`syncMemberClaims` profilová pole nepřidává, takže má o dvě stavby víc).
+  const stamp = {
+    src: "openbuildos",
+    cv: CLAIMS_VERSION,
+    email: "jan.novak@example.cz",
+    name: "Jan Novák",
+  };
 
   async function claimsFor(count: number) {
     const { db } = fakeFirestore({
@@ -531,32 +552,220 @@ test("hostované firmě se do tokenu vejde 17 staveb, na 18. to řekne nahlas", 
   }
 
   let fits = 0;
-  for (let count = 1; count <= 30; count += 1) {
+  for (let count = 1; count <= 60; count += 1) {
     const claims = await claimsFor(count);
-    assert.equal(claims.p?.length, count, "nic se nesmí tiše uříznout");
+    assert.equal(countProjectGrants(claims), count, "nic se nesmí tiše uříznout");
     try {
-      assertClaimsFit({ ...claims, ...profile });
+      assertClaimsFit({ ...stamp, ...claims });
       fits = count;
     } catch {
       break;
     }
   }
 
-  assert.equal(fits, 17, "hranice se pohnula — to je zpráva pro produkt, ne jen červený test");
+  assert.equal(fits, 34, "hranice se pohnula — to je zpráva pro produkt, ne jen červený test");
 
-  // Na 18. stavbě to musí být SROZUMITELNÉ: co se stalo a co s tím.
-  const overflow = await claimsFor(18);
+  // Na 35. stavbě to musí být SROZUMITELNÉ: co se stalo a co s tím.
+  const overflow = await claimsFor(35);
   let thrown: unknown;
   try {
-    assertClaimsFit({ ...overflow, ...profile });
+    assertClaimsFit({ ...stamp, ...overflow });
   } catch (error) {
     thrown = error;
   }
   assert.ok(thrown instanceof ClaimsTooLargeError);
-  assert.match((thrown as ClaimsTooLargeError).message, /18 projektů/);
+  assert.match((thrown as ClaimsTooLargeError).message, /35 projektů/);
   assert.match((thrown as ClaimsTooLargeError).message, /admina firmy/);
 
   // Rozpočet má rezervu pod tvrdým limitem Firebase — token se nesmí utrhnout
   // až u Firebase, kde by z toho byla neurčitá chyba.
-  assert.ok(claimsByteSize({ ...(await claimsFor(17)), ...profile }) < CLAIMS_BYTE_LIMIT);
+  assert.ok(claimsByteSize({ ...stamp, ...(await claimsFor(34)) }) < CLAIMS_BYTE_LIMIT);
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// 🔴 REVOKACE NAD STROPEM (bezpečnostní vada, ne kapacitní mez).
+//
+// Do 8/2026 platilo: uživatel nad tokenovým stropem → `assertClaimsFit` vyhodí →
+// `persistMembershipClaims` se VŮBEC NEZAVOLÁ. Odebrání z projektu se tím do
+// Storage nepromítlo a starý claim přežil až do vypršení refresh tokenu.
+// Firestore odřízl odebraného hned, Storage ne.
+//
+// Testy níž jsou psané tak, aby ROZBITÁ verze spadla: kdyby se nad stropem
+// nezapsalo nic (nebo se zapsal původní stav), odebraná položka by v claims
+// zůstala.
+// ────────────────────────────────────────────────────────────────────────────
+
+/** Claims uživatele na `count` stavbách hostované firmy (tvar jako v produkci). */
+function hostedClaims(count: number, wid = `ws_${"a".repeat(20)}`) {
+  return {
+    p: { [wid]: Array.from({ length: count }, (_, i) => `p${String(i).padStart(19, "0")}`) },
+  };
+}
+
+test("odebrání z projektu se projeví i nad stropem tokenu", () => {
+  const wid = `ws_${"a".repeat(20)}`;
+  // Uložený stav: 34 staveb (přesně strop). Nový výpočet: o jednu MÍŇ (odebrán)
+  // a o dvě VÍC (přidán jinam) → celkem 35, tedy nad strop.
+  const stored = hostedClaims(34, wid);
+  const removed = stored.p[wid][0];
+  const next = {
+    p: {
+      [wid]: [
+        ...stored.p[wid].slice(1),
+        "z-novy-projekt-00001",
+        "z-novy-projekt-00002",
+      ],
+    },
+  };
+
+  const result = shrinkClaimsToFit(next, stored, {
+    email: "jan.novak@example.cz",
+    name: "Jan Novák",
+  });
+
+  assert.equal(result.fits, false, "celý nový stav se nevejde — volající to musí ohlásit");
+  // 🔴 To hlavní: odebraná stavba je pryč. Rozbitá verze by zapsala `stored`
+  // (nebo nic) a tenhle assert by spadl.
+  assert.ok(
+    !(result.claims.p?.[wid] ?? []).includes(removed),
+    "odebraná stavba nesmí v claims přežít"
+  );
+  // A zároveň nesmělo nic přibýt — růst nad strop „zamrzne".
+  assert.ok(!(result.claims.p?.[wid] ?? []).includes("z-novy-projekt-00001"));
+  // Zapisovaná množina se musí vejít, jinak by ji Firebase odmítlo.
+  assert.ok(claimsByteSize({ src: "openbuildos", cv: 2, ...result.claims }) <= 900);
+});
+
+test("odebrání z projektu se projeví i uživateli se STARÝM plochým tvarem claims", () => {
+  const wid = `ws_${"a".repeat(20)}`;
+  // Přesně situace při nasazení: v tokenu leží ještě plochý seznam.
+  const legacy = {
+    src: "openbuildos",
+    p: hostedClaims(34, wid).p[wid].map((pid) => `${wid}/${pid}`),
+  };
+  const stored = parseStoredMembershipClaims(legacy);
+  assert.equal(countProjectGrants(stored), 34, "starý tvar se musí přečíst, ne zahodit");
+
+  const removed = stored.p?.[wid]?.[0] as string;
+  const next = { p: { [wid]: (stored.p?.[wid] ?? []).slice(1) } };
+
+  const result = shrinkClaimsToFit(next, stored);
+  assert.ok(!(result.claims.p?.[wid] ?? []).includes(removed));
+});
+
+test("dokud se claims vejdou, zapisuje se PŘESNĚ to, co říká Firestore", () => {
+  const stored = { wsa: ["W1"], p: { W1: ["P1", "P2"] } };
+  const next: MembershipClaims = { p: { W1: ["P1", "P3"] } };
+
+  const { claims, fits } = shrinkClaimsToFit(next, stored);
+  assert.equal(fits, true);
+  // Ořezávat se smí JEN nad stropem — jinak by se nová stavba nikdy neprojevila.
+  assert.deepEqual(claims, next);
+});
+
+test("nad stropem se nikdy nezapíše víc, než co je v novém výpočtu", () => {
+  const stored = { wsa: ["W1"], p: { W1: ["P1", "P2"] }, pw: { W2: ["P9"] } };
+  // Uživatel přišel o adminství W1 i o P2; přibylo mu P3.
+  const next: MembershipClaims = { p: { W1: ["P1", "P3"] }, pw: { W2: ["P9"] } };
+
+  // Rozpočet nastavený PŘESNĚ na velikost průniku: `next` se nevejde, průnik ano.
+  // Miniaturní čísla zastupují 900 B, poměry jsou stejné.
+  const limit = claimsByteSize({
+    src: "openbuildos",
+    cv: CLAIMS_VERSION,
+    p: { W1: ["P1"] },
+    pw: { W2: ["P9"] },
+  });
+
+  const { claims, fits } = shrinkClaimsToFit(next, stored, {}, limit);
+  assert.equal(fits, false, "volající musí dostat signál, že se celý stav nevešel");
+  // Pořadí záleží: `assert.deepEqual` je assertion funkce a typ tu zúží.
+  assert.equal(claims.wsa, undefined, "zaniklé adminství firmy nesmí přežít");
+  assert.equal(claims.p?.W1?.includes("P3") ?? false, false, "růst nad strop zamrzne");
+  assert.equal(claims.p?.W1?.includes("P2") ?? false, false, "odebraná stavba nesmí přežít");
+  assert.deepEqual(claims, { p: { W1: ["P1"] }, pw: { W2: ["P9"] } });
+});
+
+test("shrinkClaimsToFit se v krajním případě propadne až na fail-closed prázdno", () => {
+  // Uložený stav sám přetekl (nemělo by nastat) — pak nezbývá než neudělit nic.
+  const huge = hostedClaims(80);
+  const { claims, fits } = shrinkClaimsToFit(huge, huge);
+  assert.equal(fits, false);
+  assert.deepEqual(claims, {}, "radši bez Storage než s claimem, který už neplatí");
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Produktová zarážka: kapacita se počítá ze SKUTEČNÝCH identifikátorů.
+// ────────────────────────────────────────────────────────────────────────────
+
+test("projectSlotsLeft sedí na tomtéž čísle jako assertClaimsFit", async () => {
+  const wid = `ws_${"a".repeat(20)}`;
+  const sample = { workspaceId: wid, projectId: `p${"0".repeat(19)}` };
+
+  // Bez rezervy na profil musí volných míst přesně doplnit strop 36
+  // (`syncMemberClaims`, tedy bez `email`/`name`).
+  const empty = projectSlotsLeft({}, sample, 900) ?? 0;
+  const half = projectSlotsLeft(hostedClaims(10, wid), sample, 900) ?? 0;
+  assert.equal(empty - half, 10, "každá obsazená stavba ubere právě jedno místo");
+
+  const claims = hostedClaims(empty, wid);
+  assert.doesNotThrow(() => assertClaimsFit({ src: "openbuildos", cv: 2, ...claims }));
+  assert.throws(
+    () => assertClaimsFit({ src: "openbuildos", cv: 2, ...hostedClaims(empty + 1, wid) }),
+    ClaimsTooLargeError
+  );
+});
+
+test("delší identifikátory zarážku samy přitáhnou (číslo není konstanta)", () => {
+  const short = projectSlotsLeft({}, { workspaceId: "bbfs", projectId: "proj-1785900000000" });
+  const long = projectSlotsLeft({}, { workspaceId: `ws_${"a".repeat(20)}`, projectId: `p${"0".repeat(35)}` });
+  assert.ok((short ?? 0) > (long ?? 0), "kratší wid/pid = víc míst");
+});
+
+test("správce firmy strop nemá — projectSlotsLeft vrátí null", () => {
+  const wid = `ws_${"a".repeat(20)}`;
+  const claims = { wsa: [wid] };
+  assert.equal(projectSlotsLeft(claims, { workspaceId: wid, projectId: "p1" }), null);
+  // Ale v CIZÍ firmě strop platí i pro něj — je tam obyčejný host.
+  assert.notEqual(projectSlotsLeft(claims, { workspaceId: "jina-firma", projectId: "p1" }), null);
+});
+
+test("strop se počítá napříč firmami dohromady, ne per firma", () => {
+  const wid = `ws_${"a".repeat(20)}`;
+  const sample = { workspaceId: wid, projectId: `p${"0".repeat(19)}` };
+  const alone = projectSlotsLeft({}, sample) ?? 0;
+
+  // Deset staveb v ÚPLNĚ JINÉ firmě musí ubrat místa i tady — jinak by host na
+  // projektech víc firem zarážku obešel.
+  const elsewhere = projectSlotsLeft(hostedClaims(10, `ws_${"b".repeat(20)}`), sample) ?? 0;
+  assert.ok(elsewhere < alone, "cizí firma nesmí být „zadarmo“");
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// Čtení uloženého tvaru (přechodné období po nasazení).
+// ────────────────────────────────────────────────────────────────────────────
+
+test("parseStoredMembershipClaims přečte starý plochý i nový mapový tvar", () => {
+  assert.deepEqual(
+    parseStoredMembershipClaims({ src: "openbuildos", p: ["W1/P1", "W1/P2", "W2/P3"] }),
+    { p: { W1: ["P1", "P2"], W2: ["P3"] } }
+  );
+  assert.deepEqual(
+    parseStoredMembershipClaims({ cv: 2, pw: { W1: ["P1"] }, wsa: ["W9"] }),
+    { wsa: ["W9"], pw: { W1: ["P1"] } }
+  );
+  // Zmetky (chybějící wid, prázdný pid, cizí typy) se zahodí, ne aby z nich
+  // vznikl claim bez vazby na firmu.
+  assert.deepEqual(parseStoredMembershipClaims({ p: ["/P1", "W1/", "P1", 42] }), {});
+  assert.deepEqual(parseStoredMembershipClaims(undefined), {});
+  assert.deepEqual(parseStoredMembershipClaims({ p: "nesmysl" }), {});
+});
+
+test("intersectMembershipClaims nikdy nerozšíří práva", () => {
+  const next = { wsa: ["W1", "W2"], p: { W1: ["P1", "P2"] } };
+  const stored = { wsa: ["W2"], p: { W1: ["P2", "P3"] }, pw: { W5: ["P9"] } };
+  assert.deepEqual(intersectMembershipClaims(next, stored), {
+    wsa: ["W2"],
+    p: { W1: ["P2"] },
+  });
 });

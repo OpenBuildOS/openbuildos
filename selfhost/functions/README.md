@@ -104,6 +104,18 @@ vlastníka firmy.
   první pokus spadnout na propagaci — setup CLI deploy opakuje (20/40/80 s).
   Firestore TTL policy tuhle roli převzít **nesmí**: smazala by jen dokument
   a soubor by ve Storage zůstal osiřelý.
+- `generatePhotoThumbnail`, `generateDocumentThumbnail` — **triggery nad vznikem**
+  fotky / verze dokumentu: když záznam dorazí bez `thumbnailUrl`, funkce miniaturu
+  dogeneruje serverově (WebP) a adresu zapíše zpátky. Do 8/2026 vznikala miniatura
+  **jen v prohlížeči** při nahrávání a její selhání bylo nefatální — mřížka pak tiše
+  ukázala ORIGINÁL, tedy stonásobek přenesených dat při každém zobrazení. Náhled tak
+  závisel na verzi prohlížeče, velikosti souboru a paměti telefonu; na stavbě je to
+  nejhorší možná závislost. Viz `src/thumbnails.ts` (**sdílený soubor** s hlavním
+  repem — nese i hlavičku `cacheControl`, bez které Storage servíruje
+  `private, max-age=0`).
+  ⚠️ PDF funkce nerasterizuje (`sharp` je bez PDFia neotevře) — náhledy výkresů
+  dělá dál klient. Klientská cesta zůstává i u fotek jako rychlá: dá náhled hned
+  a funguje offline, kde žádný trigger neběží.
 
 ## Přenos projektu mezi backendy (#291)
 

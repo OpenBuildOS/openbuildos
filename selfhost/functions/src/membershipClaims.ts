@@ -20,9 +20,25 @@ import type { Firestore } from "firebase-admin/firestore";
  * asymetrie mezi Firestore a Storage — a ta je vždycky díra na jednu nebo
  * druhou stranu.
  *
- * ⚠️ Položky `p`/`pw` jsou ve tvaru `"{wid}/{pid}"`, ne holé `pid`. Cestu ve
- * Storage si volí volající, takže holý `pid` by autorizoval
- * `workspaces/CIZI-FIRMA/projects/MUJ-PROJEKT/…` — psaní pod cizí prefix.
+ * ⚠️ `p`/`pw` jsou MAPY `{ "{wid}": ["{pid}", …] }`, ne ploché seznamy holých
+ * `pid`. Cestu ve Storage si volí volající, takže holý `pid` bez vazby na firmu
+ * by autorizoval `workspaces/CIZI-FIRMA/projects/MUJ-PROJEKT/…` — psaní pod cizí
+ * prefix. Klíč mapy JE workspace, takže tu vazbu drží ze své podstaty (dřív ji
+ * držela jen konvence uvnitř řetězce `"{wid}/{pid}"`).
+ *
+ * 📦 PROČ MAPA A NE SEZNAM (#565 → #566). Plochý seznam opakoval `wid`
+ * u KAŽDÉHO projektu. Hostovaný prostor má `wid` s prefixem `ws_` (23 znaků),
+ * takže se do rozpočtu vešlo jen 17 staveb (`docs/ai/token-ceiling-staging.md`,
+ * měřeno proti běžícímu stagingu). Seskupení podle firmy platí `wid` jednou za
+ * firmu místo jednou za projekt — strop se tím zvedl na 34 (test v
+ * `membershipClaims.test.ts` ho drží jako přesné číslo, protože je to údaj pro
+ * produkt, ne implementační detail).
+ *
+ * ⚠️ Změna tvaru claims se musí stát NARÁZ v claims, ve `storage.rules` a v obou
+ * repech (docs/REPO_BOUNDARIES.md) — asymetrie mezi nimi je díra na jednu nebo
+ * druhou stranu. Tokeny navíc žijí hodinu, takže po nasazení chvíli koluje
+ * obojí: `storage.rules` mají přechodnou větev na starý tvar a klient si podle
+ * `cv` (viz `CLAIMS_VERSION`) vynutí přepočet.
  *
  * 🔴 PROČ TU NENÍ CLAIM „ZAMĚSTNANEC FIRMY" (`ws`)
  *
@@ -58,6 +74,40 @@ export const CLAIMS_BYTE_LIMIT = 1000;
  * chybu místo srozumitelné hlášky.
  */
 export const CLAIMS_BYTE_BUDGET = 900;
+
+/**
+ * Verze TVARU claims. Razí se do tokenu jako `cv`, aby klient poznal, že drží
+ * token ze starého kódu, a vynutil si přepočet (`refreshMembershipClaims`).
+ *
+ * Bez toho by se starý tvar nikdy nepřepsal sám: `setCustomUserClaims` zapisuje
+ * jen backend a `getIdToken(true)` jen vyzvedne, co tam už leží. Uživatel by
+ * tedy zůstal na plochém seznamu (a tím i na starém stropu) libovolně dlouho.
+ *
+ * 1 = plochý seznam `["{wid}/{pid}", …]` (do 8/2026, bez `cv`)
+ * 2 = mapa `{ "{wid}": ["{pid}", …] }`
+ */
+export const CLAIMS_VERSION = 2;
+
+/**
+ * Rezerva na profilová pole, která do tokenu razí `authExchange` navíc oproti
+ * `syncMemberClaims` (`email` + `name`). Strop se tím liší podle TOPOLOGIE
+ * firmy — federovaný tenant má o dva projekty míň než hostovaný prostor.
+ *
+ * Produktová zarážka nesmí být na jedno číslo v jedné topologii; počítá proto
+ * vždy s tou přísnější. 120 B je s přehledem nad naměřenými 51 B pro
+ * `jan.novak@example.cz` + `Jan Novák` (docs/ai/token-ceiling-staging.md).
+ */
+export const CLAIMS_PROFILE_RESERVE = 120;
+
+/**
+ * Kolik volných míst musí zbýt, aby šlo člověka pozvat na další stavbu.
+ *
+ * NENÍ to magické číslo vedle stropu — strop se počítá `projectSlotsLeft()` ze
+ * skutečných identifikátorů, tohle je jen polštář na to, co při zvaní ještě
+ * nevíme: `pid` příští stavby může být delší, uživatel může mezitím přijmout
+ * jinou pozvánku, a `authExchange` si ukousne podle délky jména a e-mailu.
+ */
+export const PROJECT_SLOT_RESERVE = 2;
 
 /**
  * Role, které na projektu znamenají plný zápis do Storage (přepis i mazání).
@@ -165,10 +215,17 @@ export interface MembershipInput {
 
 // Záměrně `type`, ne `interface` — jen tak je struktura přiřaditelná do
 // `Record<string, unknown>`, což potřebuje payload tokenu (claims + email/name).
+/**
+ * Projektová oprávnění seskupená podle firmy: `{ "{wid}": ["{pid}", …] }`.
+ * `storage.rules` čtou `request.auth.token.p[wid]`, takže vazba `wid` → `pid`
+ * je vynucená tvarem, ne konvencí.
+ */
+export type ProjectGrants = Record<string, string[]>;
+
 export type MembershipClaims = {
   wsa?: string[];
-  pw?: string[];
-  p?: string[];
+  pw?: ProjectGrants;
+  p?: ProjectGrants;
 };
 
 /** Členství + profilová pole, jak se posílají do tokenu. */
@@ -190,6 +247,27 @@ function sortedUnique(values: Iterable<string>): string[] {
   return Array.from(new Set(values)).filter((value) => value.length > 0).sort();
 }
 
+/** Deterministické pořadí klíčů i hodnot — jinak by se claims „měnily" bez změny. */
+function toGrants(grouped: Map<string, Set<string>>): ProjectGrants {
+  const grants: ProjectGrants = {};
+  for (const workspaceId of Array.from(grouped.keys()).sort()) {
+    const projectIds = sortedUnique(grouped.get(workspaceId) ?? []);
+    if (projectIds.length) {
+      grants[workspaceId] = projectIds;
+    }
+  }
+  return grants;
+}
+
+function addGrant(grouped: Map<string, Set<string>>, workspaceId: string, projectId: string): void {
+  const existing = grouped.get(workspaceId);
+  if (existing) {
+    existing.add(projectId);
+    return;
+  }
+  grouped.set(workspaceId, new Set([projectId]));
+}
+
 /**
  * Čistá část výpočtu — bez Firestore, ať jde otestovat unit testem.
  * Tuhle funkci používají i rules testy (`tests/rules/helpers.ts`), aby fixtura
@@ -208,26 +286,130 @@ export function buildMembershipClaims(input: MembershipInput): MembershipClaims 
     }
   }
 
-  const pw = new Set<string>();
-  const p = new Set<string>();
+  const pw = new Map<string, Set<string>>();
+  const p = new Map<string, Set<string>>();
   for (const project of input.projects) {
     if (wsa.has(project.workspaceId)) {
       // Admin firmy má celý workspace — per-projektový claim by byl jen bajty navíc.
       continue;
     }
-    const role = project.roles?.[principal] ?? "";
-    const scoped = `${project.workspaceId}/${project.id}`;
-    if (FULL_WRITE_ROLES.has(role)) {
-      pw.add(scoped);
-    } else {
-      p.add(scoped);
+    if (!project.workspaceId || !project.id) {
+      // Bez obou složek není co orazítkovat — holý `pid` (nebo prázdný `wid`)
+      // by ve Storage ukázal na cizí prefix. Viz SKIPPED_PROJECT_LOG_EVENT.
+      continue;
     }
+    const role = project.roles?.[principal] ?? "";
+    addGrant(FULL_WRITE_ROLES.has(role) ? pw : p, project.workspaceId, project.id);
   }
 
   const claims: MembershipClaims = {};
   if (wsa.size) claims.wsa = sortedUnique(wsa);
-  if (pw.size) claims.pw = sortedUnique(pw);
-  if (p.size) claims.p = sortedUnique(p);
+  if (pw.size) claims.pw = toGrants(pw);
+  if (p.size) claims.p = toGrants(p);
+  return claims;
+}
+
+/** Kolik projektů claims nesou (napříč firmami — strop je společný). */
+export function countProjectGrants(claims: MembershipClaims): number {
+  return [claims.p, claims.pw].reduce(
+    (total, grants) =>
+      total + Object.values(grants ?? {}).reduce((sum, ids) => sum + ids.length, 0),
+    0
+  );
+}
+
+/**
+ * Přečte claims uložené na uživateli. Tolerantně: zvládne i STARÝ plochý tvar
+ * `["{wid}/{pid}", …]` a převede ho na mapu.
+ *
+ * Musí to umět, protože `shrinkClaimsToFit()` porovnává nově spočítané claims
+ * s tím, co na uživateli reálně leží — a v přechodném období tam leží starý
+ * tvar. Kdyby se starý tvar četl jako „nic", vypadalo by odebrání z projektu
+ * jako „nebylo co odebrat" a zůstal by v platnosti (přesně ta vada, kterou
+ * tenhle PR zavírá).
+ */
+export function parseStoredMembershipClaims(raw: unknown): MembershipClaims {
+  const source = (raw ?? {}) as Record<string, unknown>;
+  const claims: MembershipClaims = {};
+
+  const wsa = Array.isArray(source.wsa)
+    ? sortedUnique(source.wsa.filter((value): value is string => typeof value === "string"))
+    : [];
+  if (wsa.length) claims.wsa = wsa;
+
+  for (const key of ["p", "pw"] as const) {
+    const value = source[key];
+    const grouped = new Map<string, Set<string>>();
+
+    if (Array.isArray(value)) {
+      // Legacy tvar: `"{wid}/{pid}"`. `pid` může teoreticky obsahovat lomítko,
+      // takže dělíme na PRVNÍM — `wid` je vždycky jeden segment.
+      for (const entry of value) {
+        if (typeof entry !== "string") continue;
+        const slash = entry.indexOf("/");
+        if (slash <= 0 || slash === entry.length - 1) continue;
+        addGrant(grouped, entry.slice(0, slash), entry.slice(slash + 1));
+      }
+    } else if (value && typeof value === "object") {
+      for (const [workspaceId, ids] of Object.entries(value as Record<string, unknown>)) {
+        if (!workspaceId || !Array.isArray(ids)) continue;
+        for (const id of ids) {
+          if (typeof id === "string" && id) addGrant(grouped, workspaceId, id);
+        }
+      }
+    }
+
+    const grants = toGrants(grouped);
+    if (Object.keys(grants).length) claims[key] = grants;
+  }
+
+  return claims;
+}
+
+function intersectGrants(next: ProjectGrants, stored: ProjectGrants): ProjectGrants {
+  const grouped = new Map<string, Set<string>>();
+  for (const [workspaceId, ids] of Object.entries(next)) {
+    const storedIds = new Set(stored[workspaceId] ?? []);
+    for (const id of ids) {
+      if (storedIds.has(id)) addGrant(grouped, workspaceId, id);
+    }
+  }
+  return toGrants(grouped);
+}
+
+/**
+ * Průnik nově spočítaných a už uložených claims.
+ *
+ * 🔴 K ČEMU TO JE. Když se claims nevejdou do rozpočtu, `assertClaimsFit` je
+ * odmítne a DO 8/2026 se pak nezapsalo NIC. U uživatele nad stropem tím přestala
+ * fungovat REVOKACE: `syncMemberClaims(revoke)` po odebrání z projektu skončil
+ * na `resource-exhausted`, starý claim přežil až do vypršení refresh tokenu a
+ * odebraný člověk měl dál přístup ke Storage té stavby. Firestore ho odřízl
+ * hned, Storage ne — takže to nebyla jen kapacitní mez, ale bezpečnostní vada.
+ *
+ * Průnik ji zavírá a nemůže přitom nic přidat:
+ *  - ⊆ `next`   → nikdy nepustí dál, než kam uživatel podle Firestore patří,
+ *  - ⊆ `stored` → nikdy nepřidá nic, co v tokenu ještě není (růst nad strop
+ *                 zůstane „zamrzlý", což je bezpečné směrem nahoru),
+ *  - a protože `stored` se do rozpočtu kdysi vešly, vejde se i průnik.
+ *
+ * Odebrání z projektu tedy dopadne i nad stropem: odebraná položka v `next`
+ * není, takže z průniku vypadne.
+ */
+export function intersectMembershipClaims(
+  next: MembershipClaims,
+  stored: MembershipClaims
+): MembershipClaims {
+  const claims: MembershipClaims = {};
+
+  const wsa = (next.wsa ?? []).filter((id) => (stored.wsa ?? []).includes(id));
+  if (wsa.length) claims.wsa = wsa;
+
+  for (const key of ["p", "pw"] as const) {
+    const grants = intersectGrants(next[key] ?? {}, stored[key] ?? {});
+    if (Object.keys(grants).length) claims[key] = grants;
+  }
+
   return claims;
 }
 
@@ -249,7 +431,7 @@ export function assertClaimsFit(
     return;
   }
 
-  const projectCount = (claims.p?.length ?? 0) + (claims.pw?.length ?? 0);
+  const projectCount = countProjectGrants(claims);
   throw new ClaimsTooLargeError(
     `Seznam přístupů se nevejde do přihlašovacího tokenu (${bytes} B, limit ${limit} B; `
       + `${projectCount} projektů). Firebase dovoluje nejvýš ${CLAIMS_BYTE_LIMIT} B. `
@@ -258,6 +440,94 @@ export function assertClaimsFit(
     bytes,
     limit
   );
+}
+
+/** Claims tak, jak se reálně razí do tokenu — velikost se měří VČETNĚ režie. */
+function stamped(claims: MembershipClaims, extra: Record<string, unknown> = {}): TokenClaims {
+  return { src: "openbuildos", cv: CLAIMS_VERSION, ...claims, ...extra };
+}
+
+/**
+ * Kolik DALŠÍCH staveb se uživateli ještě vejde do tokenu.
+ *
+ * ⭐ Odvozuje se ze SKUTEČNÝCH identifikátorů, ne z konstanty: měří se tak, že
+ * se do claims zkusmo přidávají projekty té délky, jakou má `sample.projectId`,
+ * dokud se vejdou. Když se změní tvar `pid` nebo `wid` (a strop se tím pohne —
+ * naměřeno v `docs/ai/token-ceiling-staging.md`), pohne se s ním i tohle číslo.
+ * Zarážka se tedy nemůže rozejít se skutečností.
+ *
+ * ⚠️ Počítá NAPŘÍČ FIRMAMI dohromady, protože strop je společný — v hostovaném
+ * modelu leží projekty všech firem v jednom Firebase projektu a `p`/`pw` je
+ * nesou v jednom tokenu. Per-firma počítání by šlo obejít pozvánkami z různých
+ * firem.
+ *
+ * @returns `null` = bez omezení (admin firmy má `wsa` na celý prostor, takže
+ *   každá další stavba té firmy stojí nula bajtů — proto se strop správce firmy
+ *   netýká; je to i doporučené řešení v hlášce o přetečení).
+ */
+export function projectSlotsLeft(
+  claims: MembershipClaims,
+  sample: { workspaceId: string; projectId: string },
+  budget: number = CLAIMS_BYTE_BUDGET - CLAIMS_PROFILE_RESERVE
+): number | null {
+  if ((claims.wsa ?? []).includes(sample.workspaceId)) {
+    return null;
+  }
+
+  const existing = claims.p?.[sample.workspaceId] ?? [];
+  const added: string[] = [];
+  const width = Math.max(sample.projectId.length, 1);
+
+  // Syntetické `pid` mají DÉLKU vzorku — na obsahu nezáleží, na bajtech ano.
+  // Prefix ` ` nepatří do žádného skutečného id, takže se nemůže potkat
+  // s existující položkou a „zdarma" se zduplikovat.
+  for (let slot = 0; slot < 1000; slot += 1) {
+    const filler = ` ${String(slot)}`.padEnd(width, "0").slice(0, width);
+    const probe: MembershipClaims = {
+      ...claims,
+      p: { ...(claims.p ?? {}), [sample.workspaceId]: [...existing, ...added, filler] },
+    };
+    if (claimsByteSize(stamped(probe)) > budget) {
+      return added.length;
+    }
+    added.push(filler);
+  }
+  return added.length;
+}
+
+/**
+ * Ořeže claims tak, aby se daly bezpečně ZAPSAT, i když se celé nevejdou.
+ *
+ * Vrací vždy množinu, která není širší než `next` ani než `stored` — nikdy tedy
+ * nerozšíří práva. Pořadí pokusů je od nejužitečnějšího k nejbezpečnějšímu:
+ *
+ *  1. `next` celé (běžný případ — vejde se),
+ *  2. průnik `next` × `stored` (nad stropem: růst zamrzne, ODEBRÁNÍ PROJDE),
+ *  3. jen `wsa` (kdyby ani průnik neseděl — stavu, kdy `stored` samo přeteklo),
+ *  4. prázdno (fail-closed: radši bez Storage než s claimem, který už neplatí).
+ *
+ * `fits === false` znamená, že se celé `next` nevešlo — volající to má ohlásit
+ * (`resource-exhausted` / HTTP 413), ale AŽ POTOM, co se ořezaná verze zapsala.
+ */
+export function shrinkClaimsToFit(
+  next: MembershipClaims,
+  stored: MembershipClaims,
+  extra: Record<string, unknown> = {},
+  limit: number = CLAIMS_BYTE_BUDGET
+): { claims: MembershipClaims; fits: boolean } {
+  const candidates: MembershipClaims[] = [
+    next,
+    intersectMembershipClaims(next, stored),
+    next.wsa?.length ? { wsa: next.wsa } : {},
+    {},
+  ];
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    if (claimsByteSize(stamped(candidates[index], extra)) <= limit) {
+      return { claims: candidates[index], fits: index === 0 };
+    }
+  }
+  return { claims: {}, fits: false };
 }
 
 /**
@@ -320,8 +590,12 @@ export async function computeMembershipClaims(
  * DoS napříč tenanty) nebo mu přes `createUser` založit Auth účet.
  */
 export function belongsToWorkspace(claims: MembershipClaims, workspaceId: string): boolean {
-  const prefix = `${workspaceId}/`;
+  if (!workspaceId) {
+    return false;
+  }
+  // Mapa drží workspace jako KLÍČ, takže se tu už nesrovnávají prefixy řetězců:
+  // u plochého seznamu musel test končit lomítkem, aby "W1" neprošel na "W10".
   return (claims.wsa ?? []).includes(workspaceId)
-    || (claims.pw ?? []).some((entry) => entry.startsWith(prefix))
-    || (claims.p ?? []).some((entry) => entry.startsWith(prefix));
+    || Object.prototype.hasOwnProperty.call(claims.pw ?? {}, workspaceId)
+    || Object.prototype.hasOwnProperty.call(claims.p ?? {}, workspaceId);
 }

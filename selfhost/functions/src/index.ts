@@ -29,10 +29,16 @@ export {
 } from "./projectTransfer";
 
 import {
+  CLAIMS_VERSION,
   ClaimsTooLargeError,
+  PROJECT_SLOT_RESERVE,
   assertClaimsFit,
   belongsToWorkspace,
   computeMembershipClaims,
+  countProjectGrants,
+  parseStoredMembershipClaims,
+  projectSlotsLeft,
+  shrinkClaimsToFit,
   type MembershipClaims,
 } from "./membershipClaims";
 // Zneplatnění sdílecího odkazu vč. rotace download tokenu — SDÍLENÝ modul
@@ -149,14 +155,23 @@ export const authExchange = onRequest({ region: "europe-west1" }, async (req, re
     // Členství se razí do tokenu — Storage rules ho jinak nemají jak zjistit
     // (cross-service firestore.get() je nespolehlivý). Viz membershipClaims.ts.
     const membership = await computeMembershipClaims(getFirestore(getLocalApp()), uid);
-    const claims = { email, name, src: "openbuildos", ...membership };
-    assertClaimsFit(claims);
+    const claims = { email, name, src: "openbuildos", cv: CLAIMS_VERSION, ...membership };
 
     // Claims musí přežít i OBNOVU tokenu, ne jen tohle přihlášení. Developer
     // claims z custom tokenu platí pro tuhle session; `setCustomUserClaims` je
     // zapíše na uživatele, takže `getIdToken(true)` po změně členství přinese
     // nové hodnoty (invalidace podle SECURITY_CLAIMS_DESIGN.md kap. 3).
-    await persistMembershipClaims(uid, membership, { email, name }, { allowCreate: true });
+    //
+    // 🔴 POŘADÍ: zapsat DŘÍV, než se přetečení ohlásí. Nad stropem se dřív
+    // nezapsalo nic, takže odebranému uživateli zůstal v platnosti STARÝ claim
+    // až do vypršení refresh tokenu — Firestore ho odřízl hned, Storage ne.
+    // `shrinkClaimsToFit` zapíše nanejvýš průnik nového a uloženého stavu
+    // (nikdy tedy víc práv), takže odebrání projde i nad stropem.
+    const stored = await readStoredMembershipClaims(uid);
+    const persisted = shrinkClaimsToFit(membership, stored, { email, name });
+    await persistMembershipClaims(uid, persisted.claims, { email, name }, { allowCreate: true });
+
+    assertClaimsFit(claims);
 
     const customToken = await getAuth(getLocalApp()).createCustomToken(uid, claims);
 
@@ -164,7 +179,7 @@ export const authExchange = onRequest({ region: "europe-west1" }, async (req, re
       uid,
       hasEmail: Boolean(email),
       adminWorkspaces: membership.wsa?.length ?? 0,
-      projects: (membership.pw?.length ?? 0) + (membership.p?.length ?? 0),
+      projects: countProjectGrants(membership),
     });
     res.status(200).json({ customToken });
   } catch (error) {
@@ -215,7 +230,30 @@ async function persistMembershipClaims(
       return;
     }
   }
-  await auth.setCustomUserClaims(uid, { src: "openbuildos", ...membership });
+  await auth.setCustomUserClaims(uid, {
+    src: "openbuildos",
+    cv: CLAIMS_VERSION,
+    ...membership,
+  });
+}
+
+/**
+ * Členství, které na uživateli LEŽÍ (ne to, co by mu podle Firestore náleželo).
+ *
+ * Potřebuje to `shrinkClaimsToFit`: nad tokenovým stropem se zapisuje průnik
+ * nového a uloženého stavu, aby odebrání z projektu prošlo, ale nic nepřibylo.
+ * Uložený tvar může být ještě PLOCHÝ (token starší než CLAIMS_VERSION 2) —
+ * `parseStoredMembershipClaims` si s ním poradí, protože kdyby se starý tvar
+ * četl jako „nic", vypadalo by každé odebrání jako „nebylo co odebrat".
+ */
+async function readStoredMembershipClaims(uid: string): Promise<MembershipClaims> {
+  try {
+    const user = await getAuth(getLocalApp()).getUser(uid);
+    return parseStoredMembershipClaims(user.customClaims);
+  } catch {
+    // Uživatel ještě neexistuje (první přihlášení) — nic uloženého není.
+    return {};
+  }
 }
 
 type CompanyAccess = {
@@ -592,9 +630,13 @@ async function isWorkspaceAdmin(workspaceId: string, principal: string): Promise
  *    uživatele a vynutí si obnovu tokenu.
  *  - `{ wid, principal, revoke: true }` — navíc `revokeRefreshTokens`, tedy
  *    tvrdé vyhození při odebrání z firmy.
+ *  - `{ wid, principal, probe: true, projectId }` — NIC NEMĚNÍ, jen spočítá,
+ *    kolik dalších staveb se cíli ještě vejde do tokenu. Od toho je produktová
+ *    zarážka při zvaní: kapacita je konečná, tak ať se to dozví TEN, KDO ZVE,
+ *    a ne pozvaný ve chvíli, kdy mu po přihlášení tiše nejede Storage.
  */
 export const syncMemberClaims = onCall<
-  { wid?: string; principal?: string; revoke?: boolean }
+  { wid?: string; principal?: string; revoke?: boolean; probe?: boolean; projectId?: string }
 >({ region: "europe-west1" }, async (request) => {
   if (!request.auth) {
     throw new HttpsError("unauthenticated", "Chybí přihlášení do workspace.");
@@ -607,6 +649,10 @@ export const syncMemberClaims = onCall<
   const workspaceId = typeof request.data?.wid === "string" ? request.data.wid : "";
   const revoke = request.data?.revoke === true;
   const isSelf = target === caller;
+
+  if (request.data?.probe === true) {
+    return probeProjectCapacity({ caller, target, workspaceId, isSelf, request });
+  }
 
   if (!isSelf || revoke) {
     if (!workspaceId) {
@@ -642,17 +688,21 @@ export const syncMemberClaims = onCall<
     }
   }
 
-  const claims = { src: "openbuildos", ...membership };
-  try {
-    assertClaimsFit(claims);
-  } catch (error) {
-    if (error instanceof ClaimsTooLargeError) {
-      throw new HttpsError("resource-exhausted", error.message);
-    }
-    throw error;
-  }
+  // 🔴 POŘADÍ JE TU BEZPEČNOSTNÍ VLASTNOST. Do 8/2026 se nad tokenovým stropem
+  // vyhodilo `resource-exhausted` DŘÍV, než se cokoli zapsalo — takže volání
+  // `syncMemberClaims(revoke)` po odebrání člena neudělalo NIC a jeho starý
+  // claim přežil až do vypršení refresh tokenu. Firestore ho odřízl okamžitě,
+  // Storage vůbec. Revokace tedy u uživatele nad stropem nefungovala.
+  //
+  // Teď se nejdřív provede všechno, co odebrání vynucuje (zápis ořezaných
+  // claims, signální dokument, zneplatnění refresh tokenů), a přetečení se
+  // ohlásí až nakonec. `shrinkClaimsToFit` nikdy nezapíše víc, než co je
+  // ZÁROVEŇ v novém výpočtu a v už uloženém stavu — růst nad strop tedy pořád
+  // „zamrzne", ale odebrání projde.
+  const stored = await readStoredMembershipClaims(target);
+  const persisted = shrinkClaimsToFit(membership, stored);
 
-  await persistMembershipClaims(target, membership, { email: null, name: null });
+  await persistMembershipClaims(target, persisted.claims, { email: null, name: null });
 
   if (workspaceId && !isSelf) {
     // Signál pro klienta dotčeného uživatele — onSnapshot → getIdToken(true).
@@ -677,13 +727,32 @@ export const syncMemberClaims = onCall<
     }
   }
 
+  if (!persisted.fits) {
+    // Až TEĎ, když jsou všechny účinky odebrání na místě. Klient z toho udělá
+    // trvalý banner, ať se to nepozná až ze stížnosti uživatele.
+    try {
+      assertClaimsFit({ src: "openbuildos", cv: CLAIMS_VERSION, ...membership });
+    } catch (error) {
+      if (error instanceof ClaimsTooLargeError) {
+        logger.error("syncMemberClaims: claims se nevejdou do tokenu", {
+          target,
+          bytes: error.bytes,
+          limit: error.limit,
+          projects: countProjectGrants(membership),
+        });
+        throw new HttpsError("resource-exhausted", error.message);
+      }
+      throw error;
+    }
+  }
+
   logger.info("syncMemberClaims OK", {
     caller,
     target,
     workspaceId,
     revoke,
     adminWorkspaces: membership.wsa?.length ?? 0,
-    projects: (membership.pw?.length ?? 0) + (membership.p?.length ?? 0),
+    projects: countProjectGrants(membership),
   });
 
   return { synced: true, revoked: revoke };
@@ -840,3 +909,61 @@ export const sweepExpiredTrash = onSchedule(
     );
   }
 );
+
+/**
+ * Read-only větev `syncMemberClaims`: kolik dalších staveb se cíli vejde do
+ * tokenu. Nic nezapisuje.
+ *
+ * ⚠️ Počítá NAPŘÍČ FIRMAMI — strop je společný pro celý Firebase projekt, takže
+ * per-firma počítání by šlo obejít pozvánkami z různých firem. To je zároveň
+ * jediné, co odpověď prozrazuje: počet staveb cíle v tomhle backendu. Volat ji
+ * proto smí jen ten, kdo do daného workspace sám patří, a jen na někoho, kdo
+ * k tomu workspace má vztah — tedy o lidech, které v adresáři firmy stejně vidí.
+ */
+async function probeProjectCapacity(context: {
+  caller: string;
+  target: string;
+  workspaceId: string;
+  isSelf: boolean;
+  request: { data?: { projectId?: string } };
+}): Promise<{ probe: true; projects: number; slotsLeft: number | null; reserve: number }> {
+  const { caller, target, workspaceId, isSelf, request } = context;
+  if (!workspaceId) {
+    throw new HttpsError("invalid-argument", "Chybí wid.");
+  }
+
+  const db = getFirestore(getLocalApp());
+
+  if (!isSelf) {
+    const callerMembership = await computeMembershipClaims(db, caller);
+    if (!belongsToWorkspace(callerMembership, workspaceId)) {
+      throw new HttpsError(
+        "permission-denied",
+        "Kapacitu přístupů smí zjišťovat jen člen téhle firmy."
+      );
+    }
+  }
+
+  const membership = await computeMembershipClaims(db, target);
+  if (!isSelf) {
+    const associated = belongsToWorkspace(membership, workspaceId)
+      || (await db.doc(`workspaces/${workspaceId}/members/${target}`).get()).exists;
+    if (!associated) {
+      throw new HttpsError("permission-denied", "Uživatel k tomuto workspace nepatří.");
+    }
+  }
+
+  // Vzorek `pid` určuje délku položky, a tím i strop — proto se bere skutečné
+  // id stavby, do které se zve. Bez něj model odhadne dnešní tvar (`proj-` +
+  // 13 číslic), ať se zarážka nerozpadne, jen zhrubne.
+  const projectId = typeof request.data?.projectId === "string" && request.data.projectId
+    ? request.data.projectId
+    : "proj-0000000000000";
+
+  return {
+    probe: true,
+    projects: countProjectGrants(membership),
+    slotsLeft: projectSlotsLeft(membership, { workspaceId, projectId }),
+    reserve: PROJECT_SLOT_RESERVE,
+  };
+}

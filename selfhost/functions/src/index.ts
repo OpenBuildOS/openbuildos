@@ -3,7 +3,7 @@ import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
 import { HttpsError, onCall, onRequest, type Request } from "firebase-functions/v2/https";
-import { onDocumentUpdated } from "firebase-functions/v2/firestore";
+import { onDocumentCreated, onDocumentUpdated } from "firebase-functions/v2/firestore";
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import * as logger from "firebase-functions/logger";
 import type { Response } from "express";
@@ -48,6 +48,15 @@ import {
   createFirestoreShareLinkStore,
   revokeShareLinkAndRotate,
 } from "./shareLinkRotation";
+// Serverové miniatury — SDÍLENÝ modul s hlavním repem (viz docs/REPO_BOUNDARIES.md).
+import {
+  decideThumbnail,
+  generateThumbnail,
+  thumbnailFailureMarker,
+  type ThumbnailDeps,
+  type ThumbnailKind,
+  type ThumbnailSourceRecord,
+} from "./thumbnails";
 
 /**
  * Token-exchange Cloud Function `authExchange` pro OpenBuildOS federaci.
@@ -967,3 +976,189 @@ async function probeProjectCapacity(context: {
     reserve: PROJECT_SLOT_RESERVE,
   };
 }
+
+/**
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Serverové miniatury — `generatePhotoThumbnail`, `generateDocumentThumbnail`
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Rozhodování a kódování je ve SDÍLENÉM `thumbnails.ts` (tam je i odůvodnění,
+ * proč vlastní funkce a ne rozšíření `storage-resize-images`, a proč Firestore
+ * trigger a ne `onObjectFinalized`). Tady zůstává jen napojení na Firestore.
+ *
+ * ⚠️ REGION SE ZÁMĚRNĚ NEURČUJE — stejný důvod jako u
+ * `promoteApprovedDrawingToPlan`: Eventarc trigger musí ležet v lokaci databáze
+ * a firebase-tools si ji zjistí sám. Natvrdo psaný region by se v projektu
+ * s jinak umístěnou databází s triggerem rozešel — a tenhle soubor má
+ * protějšek v companionu, který se nasazuje do ZÁKAZNICKÝCH projektů.
+ *
+ * ⚠️ ŽÁDNÝ `retry: true`. Failure policy jde nasadit jen s `--force`, které
+ * v self-host setupu padnout nesmí (odklepl by smazání funkcí, které v klonu
+ * nejsou — viz `promoteApprovedDrawingToPlan`). Co se nepovede, dožene
+ * `scripts/backfill-thumbnails.mjs`; navíc po sobě selhání nechá marker.
+ *
+ * `memory` je zvednutá schválně: dekódovat fotku z mobilu do bitmapy stojí
+ * násobek velikosti souboru a ve výchozích 256 MiB by to padalo právě na těch
+ * největších snímcích — tedy tam, kde na miniatuře záleží nejvíc.
+ */
+const THUMBNAIL_RUNTIME = { memory: "512MiB", timeoutSeconds: 120 } as const;
+
+/**
+ * `sharp` se načítá až uvnitř běhu (`await import`), ne staticky.
+ *
+ * Je to nativní modul o desítkách MB a načtení stojí čas při STUDENÉM STARTU.
+ * Statický import v `index.ts` by ho natáhl do KAŽDÉ funkce v tomhle souboru —
+ * tedy i do `authExchange`, který je na cestě přihlášení a jehož latenci
+ * uživatel vidí. Takhle ho zaplatí jen ty dvě funkce, které ho opravdu potřebují.
+ */
+async function createThumbnailDeps(): Promise<ThumbnailDeps> {
+  const { default: sharp } = await import("sharp");
+  const storage = getStorage(getLocalApp());
+
+  return {
+    encoder: {
+      async toWebp(input, width, quality) {
+        return sharp(input)
+          // `withoutEnlargement` — malý originál se nenafukuje na 320 px.
+          // Zvětšená miniatura by byla větší než předloha a přitom rozmazaná.
+          .rotate() // respektuj EXIF orientaci, ať náhled neleží na boku
+          .resize({ width, withoutEnlargement: true })
+          .webp({ quality })
+          .toBuffer();
+      },
+    },
+    storage: {
+      async download({ bucket, objectPath }) {
+        const [buffer] = await storage.bucket(bucket).file(objectPath).download();
+        return buffer;
+      },
+      async upload({ bucket, objectPath }, body, meta) {
+        await storage.bucket(bucket).file(objectPath).save(body, {
+          contentType: meta.contentType,
+          metadata: {
+            cacheControl: meta.cacheControl,
+            // Bez tohohle pole nejde objekt přečíst přes download URL — admin
+            // SDK ho na rozdíl od klientského `uploadBytes` sám nepřidá.
+            metadata: { firebaseStorageDownloadTokens: meta.downloadToken },
+          },
+        });
+      },
+    },
+  };
+}
+
+/**
+ * Společné tělo obou triggerů: rozhodni, vyrob, zapiš `thumbnailUrl` zpět.
+ *
+ * Zápis je `merge: true` a týká se JEN `thumbnailUrl` (+ velikosti) — trigger
+ * běží souběžně s uživatelem, který může tentýž dokument zrovna editovat.
+ */
+async function runThumbnailTrigger(
+  kind: ThumbnailKind,
+  documentPath: string,
+  record: ThumbnailSourceRecord,
+  context: Record<string, string>
+): Promise<void> {
+  const firestore = getFirestore(getLocalApp());
+  const defaultBucket = getStorage(getLocalApp()).bucket().name;
+  const decision = decideThumbnail(kind, record, defaultBucket);
+
+  if (decision.action === "skip") {
+    // `already-present` je normální stav (klient svou práci stihl), ne událost.
+    if (decision.reason === "already-present") {
+      return;
+    }
+    logger.warn(`${kind}: miniatura se nevyrobí (${decision.reason})`, { ...context, decision });
+    const marker = thumbnailFailureMarker(
+      decision.reason,
+      String(record.contentType ?? "neznámý typ"),
+      new Date().toISOString()
+    );
+    if (marker) {
+      await firestore.doc(documentPath).set(marker, { merge: true }).catch(() => undefined);
+    }
+    return;
+  }
+
+  try {
+    const result = await generateThumbnail(await createThumbnailDeps(), decision);
+    await firestore.doc(documentPath).set(
+      {
+        thumbnailUrl: result.thumbnailUrl,
+        thumbnailSizeBytes: result.bytes,
+        // Úspěch marker po sobě uklidí — jinak by po opakovaném běhu zůstala
+        // viset stopa po chybě, která už neplatí.
+        thumbnailGeneration: FieldValue.delete(),
+      },
+      { merge: true }
+    );
+    logger.info(`${kind}: miniatura vyrobena serverově`, {
+      ...context,
+      bytes: result.bytes,
+      objectPath: decision.plan.target.objectPath,
+    });
+  } catch (error) {
+    logger.error(`${kind}: výroba miniatury selhala`, { ...context, error });
+    const marker = thumbnailFailureMarker(
+      "error",
+      error instanceof Error ? error.message : String(error),
+      new Date().toISOString()
+    );
+    if (marker) {
+      await firestore.doc(documentPath).set(marker, { merge: true }).catch(() => undefined);
+    }
+    // Nevyhazuj dál: bez `retry` by to stejně nikdo neopakoval a marker
+    // v datech nese víc informace než červený řádek v logu.
+  }
+}
+
+export const generatePhotoThumbnail = onDocumentCreated(
+  {
+    document: "workspaces/{workspaceId}/projects/{projectId}/photos/{photoId}",
+    ...THUMBNAIL_RUNTIME,
+  },
+  async (event) => {
+    const data = event.data?.data();
+    if (!data) {
+      return;
+    }
+    const { workspaceId, projectId, photoId } = event.params;
+    await runThumbnailTrigger(
+      "photo",
+      `workspaces/${workspaceId}/projects/${projectId}/photos/${photoId}`,
+      {
+        sourceUrl: data.url,
+        sourceObjectPath: data.storagePath,
+        thumbnailUrl: data.thumbnailUrl,
+        contentType: data.contentType,
+      },
+      { workspaceId, projectId, photoId }
+    );
+  }
+);
+
+export const generateDocumentThumbnail = onDocumentCreated(
+  {
+    document:
+      "workspaces/{workspaceId}/projects/{projectId}/documentVersions/{versionId}",
+    ...THUMBNAIL_RUNTIME,
+  },
+  async (event) => {
+    const data = event.data?.data();
+    if (!data) {
+      return;
+    }
+    const { workspaceId, projectId, versionId } = event.params;
+    await runThumbnailTrigger(
+      "documentVersion",
+      `workspaces/${workspaceId}/projects/${projectId}/documentVersions/${versionId}`,
+      {
+        sourceUrl: data.filePath,
+        sourceObjectPath: data.fileId,
+        thumbnailUrl: data.thumbnailUrl,
+        contentType: data.contentType,
+      },
+      { workspaceId, projectId, versionId }
+    );
+  }
+);

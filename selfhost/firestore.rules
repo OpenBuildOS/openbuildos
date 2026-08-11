@@ -1535,6 +1535,14 @@ service cloud.firestore {
           // Vlastnictví dat je výjimka z „ws admin smí všechno": postoupit ho
           // smí jen dosavadní vlastník nebo vlastník firmy (viz komentář výš).
           && (dataOwnerUnchanged() || canTransferDataOwner())
+          // 🔴 Druhá výjimka: značku aktivity si nevybírá NIKDO, ani admin firmy.
+          // Bez tohohle by vazba na `request.time` v dedikované větvi níž byla
+          // dekorace — kdo smí do project docu psát cokoli, obejde ji tím, že
+          // `lastActivityAt` zapíše touhle širší cestou. Legitimní zápis jde
+          // dedikovanou větví (`hasOnly` + `== request.time`), která adminy
+          // firmy pouští taky.
+          && !request.resource.data.diff(resource.data).affectedKeys()
+              .hasAny(['lastActivityAt'])
         ) || (
           // Postoupení vlastnictví DOSAVADNÍM vlastníkem — i když projekt vůbec
           // nespravuje. Přesně to je scénář „projektant založí projekt v přípravě
@@ -1555,11 +1563,29 @@ service cloud.firestore {
           // její interní prostor i interní úkoly, které #358 výslovně skrývá
           // i před ním. Přiřazení k firmě je úkon vlastníka/admina FIRMY
           // (`setProjectMemberCompany`), ne správce stavby.
+          //
+          // 🔴 `archived` přibylo do denylistu ze STEJNÉHO důvodu, jen s cenou
+          // v penězích: návrh VOP čl. 4.3 slibuje „archivovaná stavba se
+          // nefakturuje", takže příznak přestal být provozní vlastností a stal
+          // se ovladačem částky. Správce stavby přitom není smluvní strana —
+          // tou je firma (`workspaces/{wid}.ownerId`, rozhodnutí R1 v
+          // docs/ai/fakturace-rozhodnuti.md). Archivace je proto úkon
+          // vlastníka/admina FIRMY; ti mají vlastní větev výš.
+          //
+          // ⚠️ Tohle NENÍ dostatečný podklad k fakturaci. Zúžení bere lateralní
+          // plochu (kterýkoli z N správců staveb), ne motiv — vlastník firmy je
+          // právě ten, kdo by fakturu obcházel. Fakturační veličina proto
+          // nesmí `archived` číst jako pravdu; počítá ji nezávislý měsíční
+          // sweep (tamtéž, kap. 5, varianta b).
           isRealUser()
           && resource.data.get('roles', {}).get(principal(), '') == 'admin'
           && request.resource.data.workspaceId == resource.data.workspaceId
           && !request.resource.data.diff(resource.data).affectedKeys()
-              .hasAny(['memberIds', 'roles', 'dataOwner', 'companies'])
+              .hasAny(['memberIds', 'roles', 'dataOwner', 'companies', 'archived',
+                       // Tentýž důvod jako u admina firmy o dvě větve výš:
+                       // jinak by vazba značky na `request.time` platila jen pro
+                       // ty, kdo do project docu jinak psát nesmí.
+                       'lastActivityAt'])
         ) || (
           // Přeřazení JEDNOHO cizího člena správcem stavby (#507) — jediná
           // cesta, kterou se `roles` mění bez vlastníka/admina firmy.
@@ -1590,14 +1616,34 @@ service cloud.firestore {
           // teprve přibudou. Allowlist přes `!hasAny` by naopak s každým novým
           // polem tiše otevíral díru.
           //
-          // Nejhorší možné zneužití: člen zapíše nepravdivý čas poslední
-          // aktivity na stavbě, kde stejně je členem.
+          // 🔴 Hodnotu určuje SERVER, ne klient. Do 8/2026 tu stálo jen
+          // `is string` (ISO, kvůli shodě s `createdAt`/`updatedAt`) — jenže
+          // řetězec pravidla neumí porovnat s `request.time`, takže si kterýkoli
+          // člen zapsal značku rok starou a stavba přestala vypadat jako živá.
+          // U provozního údaje by to bylo snesitelné; jakmile se ze „žije /
+          // nežije" počítá částka, je to ovladač faktury (`archived` výš má
+          // tentýž problém). Pole je proto TIMESTAMP a musí se rovnat
+          // `request.time` — klient posílá `serverTimestamp()`
+          // (`src/services/projectActivity.ts`), který se právě na `request.time`
+          // vyhodnotí, a to i u offline zápisu, protože sentinel se rozhoduje
+          // až při commitu na serveru.
+          //
+          // ⚠️ Migrace se NEDĚLÁ. Pravidlo omezuje jen NOVOU hodnotu; staré ISO
+          // řetězce na existujících stavbách zůstanou a čtení je snese
+          // (`asDate` v `src/services/workspaceProjects.ts` bere Date, string
+          // i Timestamp). Admin cesty mimo rules (seed) píšou dál ISO záměrně —
+          // seedovaná „spící" stavba potřebuje datum v minulosti, které tahle
+          // větev z principu vytvořit nemůže.
+          // Admin firmy sem patří taky: `isProjectMember` ho na stavbu pouští
+          // i bez `memberIds`, takže fotku nahrát smí — a kdyby značku zapsat
+          // nesměl, byl by to jediný způsob práce, po kterém stavba nevypadá
+          // živá. Hodnotu si přitom nevybere ani on (viz jeho vlastní větev výš).
           isRealUser()
-          && principal() in resource.data.get('memberIds', [])
+          && (principal() in resource.data.get('memberIds', [])
+              || isWsAdmin(resource.data.get('workspaceId', '')))
           && request.resource.data.diff(resource.data).affectedKeys()
               .hasOnly(['lastActivityAt'])
-          // ISO řetězec, shodně s createdAt/updatedAt v src/services/projects.ts.
-          && request.resource.data.lastActivityAt is string
+          && request.resource.data.lastActivityAt == request.time
         ) || inviteSelfJoin(pid);
       allow delete: if isRealUser()
         && (resource.data.get('roles', {}).get(principal(), '') == 'admin'
@@ -1615,10 +1661,21 @@ service cloud.firestore {
     // (`plan`, `amount`, …), ze kterých by někdo mohl začít odvozovat cenu.
     //
     // 🔴 Zápis je klientský, tedy FALŠOVATELNÝ. Vědomě přijaté: tenhle blok
-    // MĚŘÍ, nefakturuje. Až se z čísla bude počítat částka, musí se přepnout na
-    // `allow write: if false` a psát ho Cloud Function — stejně jako
-    // `workspaces/{wid}/billing/current`. Do té doby se z `usage` nesmí
-    // odvozovat žádná částka.
+    // MĚŘÍ, nefakturuje. Z `usage` se NIKDY nesmí odvodit žádná částka.
+    //
+    // ⚠️ Dřív tu stálo, že se blok „až se bude fakturovat" přepne na
+    // `allow write: if false` a bude ho psát Cloud Function. To je past a
+    // rozhodnutí padlo opačně (docs/ai/fakturace-rozhodnuti.md, kap. 5,
+    // varianta b): serverový zápis by sáhl do uploadové cesty, kde platí
+    // nejtvrdší invariant celého modelu — NAFOCENÁ FOTKA SE KVŮLI MĚŘENÍ NIKDY
+    // NEZAHODÍ. Počítadlo proto zůstává klientské a slouží tomu, čemu dnes:
+    // proužku „80 % zaplněno" a návrhu archivace. Na to je falšovatelné číslo
+    // dost dobré — kdo si ho podstřelí, ošidí sám sebe o varování.
+    //
+    // Fakturační veličina vzniká JINDE a nezávisle: měsíčním serverovým
+    // sweepem nad skutečně vzniklým obsahem, se zápisem do
+    // `workspaces/{wid}/billingSnapshots/{YYYY-MM}`. Kdo sem přijde napojit
+    // fakturaci na `usage`, dělá chybu, kterou tenhle odstavec popisuje.
     //
     // Proč je bránou zápisu ČLENSTVÍ, a ne oprávnění `edit`: novou fotku smí
     // založit každý člen projektu VČETNĚ viewera — `photos` gatuje

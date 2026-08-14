@@ -1242,6 +1242,53 @@ service cloud.firestore {
       allow delete: if canModifyContent(wid, pid);
     }
 
+    // ---------------------------------------------------------------------
+    // HLASOVKY DENNÍHO ZÁPISU (docs/ai/denni-zapis-hlasem.md).
+    //
+    // Syrový přepis toho, co člověk nadiktoval — VLASTNÍ kolekce, ne pole
+    // deníkového zápisu. Do deníku jde věcný zápis v jazyce projektu; doslovná
+    // slova mluvčího zůstávají tady a jinam se nekopírují (§9).
+    //
+    // 🔴 ČTE JEN AUTOR. Ani stavbyvedoucí, ani vlastník firmy, ani správce
+    // stavby. Není to detail nastavení soukromí, je to nosná konstrukce celé
+    // funkce (§1, §9): hlasovka má být ŠTÍT MLUVČÍHO, ne oko firmy. Jakmile si
+    // vedení může přečíst, jak kdo o své práci mluví, lidi do týdne přejdou na
+    // alibistické formality („pracovalo se dle harmonogramu") — a tím se
+    // hodnota dat vynuluje i pro tu firmu. Doslovnost plodí autocenzuru;
+    // přestane se říkat to důležité, tedy problémy.
+    //
+    // Vzor `get`/`list` je stejný jako u soukromého markupu (`planAnnotations`)
+    // a ze stejného důvodu: ve výpisu vyjde `data.get('ownerPrincipal', '')`
+    // prázdné, takže by cizí přepisy vydal obyčejný dotaz. Přímý přístup
+    // k poli tenhle tvar odmítne a vynutí dotaz filtrovaný na vlastní záznamy.
+    //
+    // ZAKLÁDAT smí jen `edit`+ (fáze 1 cílí na management — stavbyvedoucí
+    // a mistr, tedy ty role, které deník vést musí ze zákona; § 166 odst. 2
+    // zák. 283/2021 Sb. vyjmenovává zapisovatele taxativně). Až se funkce
+    // otevře řemeslníkům, bude to znamenat i per-projektový seznam osob
+    // oprávněných zapisovat — a teprve tehdy se tenhle práh smí povolit.
+    //
+    // ⚠️ ZVUK SEM NEPATŘÍ a nikam jinam taky ne. Nahrávka nese identitu,
+    // přízvuk, emoci a hlasy třetích osob v pozadí, kterým nikdo nic neřekl.
+    // Ukládá se výhradně přepis (§10).
+    // ---------------------------------------------------------------------
+    match /workspaces/{wid}/projects/{pid}/dailyVoiceNotes/{docId} {
+      allow get: if isProjectMember(wid, pid)
+        && resource.data.get('ownerPrincipal', '') == principal();
+      allow list: if isProjectMember(wid, pid)
+        && resource.data.ownerPrincipal == principal();
+      allow create: if canEdit(wid, pid)
+        && request.resource.data.get('ownerPrincipal', '') == principal();
+      // Okno na opravu (§9) — do konce dne smí autor svůj zápis upravit nebo
+      // smazat. Autorství je přitom neměnné: kdo hlasovku pořídil, ten u ní
+      // zůstane, jinak by šlo cizí slova podepsat sebou (nebo svá někým jiným).
+      allow update: if isProjectMember(wid, pid)
+        && resource.data.get('ownerPrincipal', '') == principal()
+        && request.resource.data.get('ownerPrincipal', '') == resource.data.get('ownerPrincipal', '');
+      allow delete: if isProjectMember(wid, pid)
+        && resource.data.get('ownerPrincipal', '') == principal();
+    }
+
     // Plány: číst smí každý člen (`read`), měnit jen `edit`. Do #506 fáze 2
     // NEMĚL modul Plány na klientu ŽÁDNOU bránu — čtenář dostal celý toolbar
     // včetně markupu a kalibrace měřítka, zápis mu pravidla odmítla a appka ho

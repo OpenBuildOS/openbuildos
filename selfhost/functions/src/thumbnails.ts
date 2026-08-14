@@ -111,9 +111,21 @@ export const DOCUMENT_THUMBNAIL_QUALITY = 72;
  * (`src/modules/documents/services/documentThumbnail.ts`) — viz „Co tenhle
  * modul NEUMÍ" v `docs/SERVER_THUMBNAILS.md`.
  *
- * ⚠️ `image/heic` také ne: prebuilt `sharp` nemá libheif (licence). Fotky
- * z iPhonu chodí přes `<input type=file>` jako JPEG, takže je to okrajové —
- * a když přece dorazí HEIC, skončí to VIDITELNÝM markerem, ne tichým ničím.
+ * ⚠️ `image/heic` také ne: prebuilt `sharp` nemá libheif (licence).
+ *
+ * 🔴 OPRAVA PŘEDPOKLADU (14. 8. 2026): tady stálo „fotky z iPhonu chodí přes
+ * `<input type=file>` jako JPEG, takže je to okrajové". Platí to jen pro
+ * `accept="image/*"` (modul Fotky, „Vyfotit"). Příloha úkolu „Ze zařízení" má
+ * accept SMÍŠENÝ (`src/lib/fileAccept.ts`) a přes něj HEIC projde v původním
+ * formátu. Okrajové to tedy není.
+ *
+ * Nezachraňuje to server, ale KLIENT: `compressImage` (`src/services/photos.ts`)
+ * fotku překóduje na JPEG všude, kde ji prohlížeč umí dekódovat (Safari na iOS
+ * HEIC umí, tedy právě na zařízeních, která ho vyrábějí). Sem pak dorazí JPEG.
+ * Kde konverze neprojde, skončí to VIDITELNÝM markerem, ne tichým ničím.
+ *
+ * ⚠️ Právě proto se `contentType` čte z DOKUMENTU a ne z přípony: po konverzi
+ * se jméno nemění (`IMG_1234.HEIC` nese JPEG). Viz `isSupportedImage`.
  */
 const SUPPORTED_IMAGE_TYPES = new Set([
   "image/jpeg",
@@ -230,7 +242,15 @@ export function resolveSourceObject(
   return null;
 }
 
-/** Umí `sharp` tenhle soubor otevřít? Typ má přednost, přípona je záloha. */
+/**
+ * Umí `sharp` tenhle soubor otevřít? Typ má přednost, přípona je záloha.
+ *
+ * ⚠️ To pořadí není libovůle. Přípona popisuje, co uživatel VYBRAL; `contentType`
+ * popisuje, co v bucketu SKUTEČNĚ leží. Rozcházejí se pokaždé, když klient
+ * fotku překóduje (HEIC → JPEG beze změny jména), a tehdy je pravdivý typ.
+ * Fotky nahrané před 14. 8. 2026 pole `contentType` nemají (`src/types/index.ts`),
+ * takže jim zůstává přípona — proto je záloha, ne mrtvá větev.
+ */
 export function isSupportedImage(contentType: unknown, objectPath: string): boolean {
   const declared = asNonEmptyString(contentType);
   if (declared) {

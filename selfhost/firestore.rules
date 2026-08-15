@@ -207,6 +207,65 @@ service cloud.firestore {
     // Naivní varianta (`canEdit() || canCertify() || canPublish()`) ten strop
     // přerazila hned u prvního složeného pravidla — a selhala jako
     // permission-denied, tedy k nerozeznání od chybějícího práva.
+    // ---------------------------------------------------------------------
+    // ZMRAZENÍ STAVBY PO DOBU PŘEDÁNÍ (`projects/{pid}.handover.state`)
+    //
+    // Předání stavby novému vlastníkovi kopíruje obsah do jiného prostoru
+    // a teprve pak překlopí `workspaceId`. Zápis, který mezitím přistane
+    // v PŮVODNÍM místě, by se do kopie nedostal a po překlopení by zmizel —
+    // proto je stavba po tu dobu JEN KE ČTENÍ.
+    //
+    // ⭐ VISÍ NA ZÁPISOVÝCH TRYCHTÝŘÍCH (`canCreateContent` / `canModifyContent`),
+    // ne na `permsOf()`. Do `permsOf()` to patřilo logicky — je to jediné místo,
+    // kudy prochází všechna obsahová práva — jenže tím by jedno čtení navíc
+    // platila i cesta POZVÁNEK, a ta je na stropu přístupů k dokumentům už dnes
+    // (`redeemOk` výš to popisuje). Dvě pravidla o pozvánkách na to okamžitě
+    // spadla. Tady se zmrazení ptáme AŽ ZA oprávněním, takže čtení navíc zaplatí
+    // jen zápis, který by jinak prošel — a čtení stavby nezdraží vůbec (výkres
+    // na stavbě musí jít otevřít i uprostřed předání).
+    //
+    // ⚠️ NA STORAGE TOHLE NEDOSÁHNE — tam se rozhoduje z claims a Firestore
+    // odtud vidět není. Blob se tedy nahrát může; jeho DOKUMENT ale ne, takže
+    // fotka zůstane v offline frontě a doběhne až po překlopení, do nového
+    // místa. Invariant „nafocená fotka se nikdy nezahodí" tím platí dál.
+    //
+    // 🔴 Pole píše VÝHRADNĚ server (viz denylisty u `projects/{pid}` níž).
+    // Kdyby na něj dosáhl klient, měl by správce stavby vypínač „nikdo tu
+    // nesmí psát" — a naopak by si mohl zmrazení sundat uprostřed kopie.
+    // 🔴 `is map` NENÍ OZDOBA. `.get('handover', {})` vrátí výchozí hodnotu jen
+    // když pole CHYBÍ — když tam leží `null` (typický způsob, jak by ho někdo
+    // „vyprázdnil"), vrátí `null` a `.get('state', …)` nad ním skončí chybou,
+    // tedy zamítnutím. Bez téhle zkoušky by jeden špatně napsaný úklid zamkl
+    // zápisy na stavbě natrvalo — a to je přesně to, co se nesmí stát:
+    // porucha v předání nesmí nikomu zamknout data. Vadné pole proto znamená
+    // NEZMRAZENO, ne „zmrazeno pro jistotu".
+    //
+    // 🔴 A PROTO TU JE I `frozenUntil`. Zmrazení sundává úklid uvnitř funkce,
+    // jenže když runtime funkci ukončí na timeoutu, žádný úklid se nespustí —
+    // a `moving` by zůstalo navždy. Klient to pole přepsat nesmí (denylist
+    // níž), návrh ve stavu `moving` zrušit nejde, takže by stavba byla do
+    // ručního zásahu přes Admin SDK zamrzlá. Pravidla proto zmrazení uznávají
+    // jen DO uvedeného času; potom se na stavbě zase pracuje, i kdyby se
+    // o tom server nikdy nedozvěděl. Chybějící nebo nečasový údaj = nezmrazeno,
+    // ze stejného důvodu jako u `is map`.
+    // ⚠️ `let`, ne čtyři opisy `projectData(pid)`. Každý opis se VYHODNOTÍ jako
+    // další přístup k dokumentu a rozpočet je společný pro celou dávku — přesně
+    // na tom už jednou stála pravidla o pozvánkách (viz `redeemOk` výš).
+    // 🔴 ČTE SE PŘES `get(...)`, NE `projectData(...)`, A JE TO NOSNÉ.
+    // `projectData` sahá rovnou na `.data`, což nad NEEXISTUJÍCÍM dokumentem
+    // skončí chybou — tedy zamítnutím. Jenže členský zrcadlový doklad se
+    // zakládá v TÉŽE DÁVCE jako sama stavba (bootstrap, viz `canManageAfter`),
+    // takže v tu chvíli `projects/{pid}` ještě neexistuje a zakládání stavby by
+    // přestalo jít úplně. Stavba, která ještě není, zmrazená být nemůže.
+    function projectFrozen(pid) {
+      let project = get(projectPath(pid));
+      let handover = project == null ? {} : project.data.get('handover', {});
+      return handover is map
+        && handover.get('state', '') == 'moving'
+        && handover.get('frozenUntil', null) is timestamp
+        && request.time < handover.frozenUntil;
+    }
+
     function permsOf(wid, pid) {
       return isProjectMember(wid, pid)
         ? (isWsAdmin(wid)
@@ -494,7 +553,9 @@ service cloud.firestore {
     }
 
     function canModifyContent(wid, pid) {
-      return canModifyWith(permsOf(wid, pid));
+      // Pořadí je úmyslné: `projectFrozen` stojí jedno čtení navíc, a to se
+      // vyhodnotí jen u zápisu, který by jinak prošel.
+      return canModifyWith(permsOf(wid, pid)) && !projectFrozen(pid);
     }
 
     // Založení obsahu = `contribute`. Author (createdBy) musí být buď
@@ -509,7 +570,7 @@ service cloud.firestore {
     }
 
     function canCreateContent(wid, pid) {
-      return canCreateWith(permsOf(wid, pid));
+      return canCreateWith(permsOf(wid, pid)) && !projectFrozen(pid);
     }
 
     // Anti-spoof atribuce firmě u oficiálních dokumentů: `ownerCompanyId` na create
@@ -874,6 +935,7 @@ service cloud.firestore {
     match /workspaces/{wid}/projects/{pid}/members/{memberUid} {
       allow get, list: if isProjectMember(wid, pid);
       allow create: if (
+          (
           // Self-join via invite redeemed in the same batch.
           // members/{id} doc is keyed by principal (federated subject or uid).
           isRealUser()
@@ -900,14 +962,19 @@ service cloud.firestore {
         ) || (
           canManageAfter(wid, pid)
           && roleAssignable(request.resource.data.get('role', ''))
-        );
+        )
+        ) && !projectFrozen(pid);
       // Vlastník/admin FIRMY má zrcadlo celé (včetně `admin` a sebe sama);
       // projektový správce jen tolik, kolik mu dává `roleChangeOk` na
       // `projects/{pid}.roles` — jinak by obě cesty říkaly každá něco jiného.
-      allow update: if canManageAfter(wid, pid)
+      allow update: if (
+          canManageAfter(wid, pid)
         && roleWriteOk()
-        && (isWsAdmin(wid) || mirrorRoleChangeOk(memberUid));
-      allow delete: if canManage(wid, pid);
+        && (isWsAdmin(wid) || mirrorRoleChangeOk(memberUid))
+        ) && !projectFrozen(pid);
+      allow delete: if (
+          canManage(wid, pid)
+        ) && !projectFrozen(pid);
     }
 
     // Firemní interní pracovní prostory jsou oddělené od oficiálních kolekcí,
@@ -915,44 +982,57 @@ service cloud.firestore {
     match /workspaces/{wid}/projects/{pid}/companySpaces/{companyId} {
       allow get: if isSameProjectCompany(wid, pid, companyId);
       allow list: if false;
-      allow create: if (isSameProjectCompany(wid, pid, companyId) || canManage(wid, pid))
+      allow create: if (
+          (isSameProjectCompany(wid, pid, companyId) || canManage(wid, pid))
         && request.resource.data.get('companyId', '') == companyId
         && request.resource.data.get('projectId', '') == pid
         && request.resource.data.get('workspaceId', '') == wid
         && request.resource.data.get('scope', '') == 'company_internal'
-        && request.resource.data.get('createdBy', '') == principal();
-      allow update: if isCompanySpaceLead(wid, pid, companyId)
+        && request.resource.data.get('createdBy', '') == principal()
+        ) && !projectFrozen(pid);
+      allow update: if (
+          isCompanySpaceLead(wid, pid, companyId)
         && request.resource.data.companyId == resource.data.companyId
         && request.resource.data.projectId == resource.data.projectId
         && request.resource.data.workspaceId == resource.data.workspaceId
-        && request.resource.data.scope == resource.data.scope;
+        && request.resource.data.scope == resource.data.scope
+        ) && !projectFrozen(pid);
       allow delete: if false;
 
       match /folders/{folderId} {
         allow get, list: if hasCompanyResourceAccess(wid, pid, companyId, resource.data);
-        allow create: if isCompanySpaceLead(wid, pid, companyId)
+        allow create: if (
+          isCompanySpaceLead(wid, pid, companyId)
           && validCompanyResourceIdentity(companyId, request.resource.data)
           && request.resource.data.get('folderId', '') == folderId
           && request.resource.data.get('parentId', '') != folderId
-          && validChildCompanyAccess(wid, pid, companyId, request.resource.data.get('parentId', ''), request.resource.data);
-        allow update: if isCompanySpaceLead(wid, pid, companyId)
+          && validChildCompanyAccess(wid, pid, companyId, request.resource.data.get('parentId', ''), request.resource.data)
+        ) && !projectFrozen(pid);
+        allow update: if (
+          isCompanySpaceLead(wid, pid, companyId)
           && request.resource.data.get('scope', '') == resource.data.get('scope', '')
           && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
           && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
           && request.resource.data.get('folderId', '') == resource.data.get('folderId', '')
           && request.resource.data.get('parentId', '') != folderId
-          && validChildCompanyAccess(wid, pid, companyId, request.resource.data.get('parentId', ''), request.resource.data);
-        allow delete: if isCompanySpaceLead(wid, pid, companyId);
+          && validChildCompanyAccess(wid, pid, companyId, request.resource.data.get('parentId', ''), request.resource.data)
+        ) && !projectFrozen(pid);
+        allow delete: if (
+          isCompanySpaceLead(wid, pid, companyId)
+        ) && !projectFrozen(pid);
       }
 
       match /documents/{documentId} {
         allow get, list: if hasCompanyResourceAccess(wid, pid, companyId, resource.data);
-        allow create: if validCompanyResourceIdentity(companyId, request.resource.data)
+        allow create: if (
+          validCompanyResourceIdentity(companyId, request.resource.data)
           && isSameProjectCompany(wid, pid, companyId)
           && request.resource.data.get('documentId', '') == documentId
           && request.resource.data.get('approvalMode', '') == 'none'
-          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
-        allow update: if canWriteCompanyResourceInto(
+          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data)
+        ) && !projectFrozen(pid);
+        allow update: if (
+          canWriteCompanyResourceInto(
             wid, pid, companyId,
             request.resource.data.get('folderId', ''),
             resource.data,
@@ -961,19 +1041,25 @@ service cloud.firestore {
           && request.resource.data.get('scope', '') == resource.data.get('scope', '')
           && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
           && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
-          && request.resource.data.get('approvalMode', '') == 'none';
-        allow delete: if canModifyCompanyResource(wid, pid, companyId, resource.data);
+          && request.resource.data.get('approvalMode', '') == 'none'
+        ) && !projectFrozen(pid);
+        allow delete: if (
+          canModifyCompanyResource(wid, pid, companyId, resource.data)
+        ) && !projectFrozen(pid);
       }
 
       match /documentVersions/{versionId} {
         allow get, list: if hasCompanyResourceAccess(wid, pid, companyId, resource.data);
-        allow create: if validCompanyResourceIdentity(companyId, request.resource.data)
+        allow create: if (
+          validCompanyResourceIdentity(companyId, request.resource.data)
           && isSameProjectCompany(wid, pid, companyId)
           && request.resource.data.get('versionId', '') == versionId
           && request.resource.data.get('status', '') == 'working'
           && request.resource.data.get('workflowMode', '') == 'none'
-          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
-        allow update: if canWriteCompanyResourceInto(
+          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data)
+        ) && !projectFrozen(pid);
+        allow update: if (
+          canWriteCompanyResourceInto(
             wid, pid, companyId,
             request.resource.data.get('folderId', ''),
             resource.data,
@@ -981,17 +1067,23 @@ service cloud.firestore {
           )
           && request.resource.data.get('scope', '') == resource.data.get('scope', '')
           && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
-          && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');
-        allow delete: if canModifyCompanyResource(wid, pid, companyId, resource.data);
+          && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
+        ) && !projectFrozen(pid);
+        allow delete: if (
+          canModifyCompanyResource(wid, pid, companyId, resource.data)
+        ) && !projectFrozen(pid);
       }
 
       match /plans/{planId} {
         allow get, list: if hasCompanyResourceAccess(wid, pid, companyId, resource.data);
-        allow create: if validCompanyResourceIdentity(companyId, request.resource.data)
+        allow create: if (
+          validCompanyResourceIdentity(companyId, request.resource.data)
           && isSameProjectCompany(wid, pid, companyId)
           && request.resource.data.get('planId', '') == planId
-          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
-        allow update: if canWriteCompanyResourceInto(
+          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data)
+        ) && !projectFrozen(pid);
+        allow update: if (
+          canWriteCompanyResourceInto(
             wid, pid, companyId,
             request.resource.data.get('folderId', ''),
             resource.data,
@@ -999,8 +1091,11 @@ service cloud.firestore {
           )
           && request.resource.data.get('scope', '') == resource.data.get('scope', '')
           && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
-          && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');
-        allow delete: if canModifyCompanyResource(wid, pid, companyId, resource.data);
+          && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
+        ) && !projectFrozen(pid);
+        allow delete: if (
+          canModifyCompanyResource(wid, pid, companyId, resource.data)
+        ) && !projectFrozen(pid);
       }
 
       // Sdílené firemní markupy jednoho planVersion. Task piny sem nepatří a
@@ -1012,13 +1107,16 @@ service cloud.firestore {
       match /planAnnotationSets/{versionId} {
         allow get: if hasCompanyResourceAccess(wid, pid, companyId, resource.data);
         allow list: if isCompanySpaceLead(wid, pid, companyId);
-        allow create: if isSameProjectCompany(wid, pid, companyId)
+        allow create: if (
+          isSameProjectCompany(wid, pid, companyId)
           && validCompanyResourceIdentity(companyId, request.resource.data)
           && request.resource.data.get('planVersionId', '') == versionId
           && request.resource.data.get('items', []) is list
           && request.resource.data.get('items', []).size() <= 2000
-          && canUseCompanyPlan(wid, pid, companyId, request.resource.data.get('planId', ''), request.resource.data);
-        allow update: if canWriteCompanyAnnotationsInto(
+          && canUseCompanyPlan(wid, pid, companyId, request.resource.data.get('planId', ''), request.resource.data)
+        ) && !projectFrozen(pid);
+        allow update: if (
+          canWriteCompanyAnnotationsInto(
             wid, pid, companyId,
             request.resource.data.get('planId', ''),
             resource.data,
@@ -1030,7 +1128,8 @@ service cloud.firestore {
           && request.resource.data.get('planId', '') == resource.data.get('planId', '')
           && request.resource.data.get('planVersionId', '') == resource.data.get('planVersionId', '')
           && request.resource.data.get('items', []) is list
-          && request.resource.data.get('items', []).size() <= 2000;
+          && request.resource.data.get('items', []).size() <= 2000
+        ) && !projectFrozen(pid);
         allow delete: if false;
       }
     }
@@ -1040,10 +1139,12 @@ service cloud.firestore {
     // ---------------------------------------------------------------------
 
     match /workspaces/{wid}/projects/{pid}/notificationQueue/{notificationId} {
-      allow create: if isProjectMember(wid, pid)
+      allow create: if (
+          isProjectMember(wid, pid)
         && request.resource.data.workspaceId == wid
         && request.resource.data.projectId == pid
-        && request.resource.data.recipientIds is list;
+        && request.resource.data.recipientIds is list
+        ) && !projectFrozen(pid);
       // Provable for queries shaped
       // where('recipientIds', 'array-contains', currentPrincipal).
       //
@@ -1054,13 +1155,17 @@ service cloud.firestore {
       allow get, list: if isProjectMember(wid, pid)
         && principal() in resource.data.recipientIds;
       // Recipients may only append themselves to readBy.
-      allow update: if isProjectMember(wid, pid)
+      allow update: if (
+          isProjectMember(wid, pid)
         && principal() in resource.data.recipientIds
         && request.resource.data.diff(resource.data).affectedKeys()
             .hasOnly(['readBy'])
         && request.resource.data.readBy.hasAll(resource.data.get('readBy', []))
-        && principal() in request.resource.data.readBy;
-      allow delete: if canManage(wid, pid);
+        && principal() in request.resource.data.readBy
+        ) && !projectFrozen(pid);
+      allow delete: if (
+          canManage(wid, pid)
+        ) && !projectFrozen(pid);
     }
 
     // ---------------------------------------------------------------------
@@ -1286,7 +1391,7 @@ service cloud.firestore {
       // Nový úkol nesmí rovnou vzniknout jako completed/verified bez příslušné role
       // (jinak by šel guard na update obejít vytvořením už-hotového úkolu).
       // Interní úkol: člen zakládá do své firmy a nesmí vzniknout rovnou jako 'verified'.
-      allow create: if taskCreateOk(permsOf(wid, pid), pid);
+      allow create: if taskCreateOk(permsOf(wid, pid), pid) && !projectFrozen(pid);
       // createdBy, scope i ownerCompanyId immutable. Interní úkol upraví člen
       // vlastnící firmy (na 'verified' jen vedoucí); projektový dle stávajících pravidel.
       allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
@@ -1296,12 +1401,15 @@ service cloud.firestore {
           taskIsInternal(resource.data)
             ? (taskCompanyMember(pid, resource.data) && internalTaskStatusOk(wid, pid))
             : taskProjectUpdateOk(permsOf(wid, pid))
-        );
+        )
+        // Zmrazení předáním platí i pro interní úkoly firmy — kopie je kopie.
+        && !projectFrozen(pid);
       // Interní úkol smaže vedoucí firmy nebo autor (z vlastní firmy); projektový dle stávajících.
-      allow delete: if taskIsInternal(resource.data)
+      allow delete: if (taskIsInternal(resource.data)
         ? (taskCompanyMember(pid, resource.data)
            && (isCompanySpaceLead(wid, pid, resource.data.get('ownerCompanyId', '')) || authoredBySelf()))
-        : canModifyContent(wid, pid);
+        : canModifyContent(wid, pid))
+        && !projectFrozen(pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/files/{docId} {
@@ -1402,16 +1510,22 @@ service cloud.firestore {
         && resource.data.get('ownerPrincipal', '') == principal();
       allow list: if isProjectMember(wid, pid)
         && resource.data.ownerPrincipal == principal();
-      allow create: if canEdit(wid, pid)
-        && request.resource.data.get('ownerPrincipal', '') == principal();
+      allow create: if (
+          canEdit(wid, pid)
+        && request.resource.data.get('ownerPrincipal', '') == principal()
+        ) && !projectFrozen(pid);
       // Okno na opravu (§9) — do konce dne smí autor svůj zápis upravit nebo
       // smazat. Autorství je přitom neměnné: kdo hlasovku pořídil, ten u ní
       // zůstane, jinak by šlo cizí slova podepsat sebou (nebo svá někým jiným).
-      allow update: if isProjectMember(wid, pid)
+      allow update: if (
+          isProjectMember(wid, pid)
         && resource.data.get('ownerPrincipal', '') == principal()
-        && request.resource.data.get('ownerPrincipal', '') == resource.data.get('ownerPrincipal', '');
-      allow delete: if isProjectMember(wid, pid)
-        && resource.data.get('ownerPrincipal', '') == principal();
+        && request.resource.data.get('ownerPrincipal', '') == resource.data.get('ownerPrincipal', '')
+        ) && !projectFrozen(pid);
+      allow delete: if (
+          isProjectMember(wid, pid)
+        && resource.data.get('ownerPrincipal', '') == principal()
+        ) && !projectFrozen(pid);
     }
 
     // Plány: číst smí každý člen (`read`), měnit jen `edit`. Do #506 fáze 2
@@ -1421,7 +1535,9 @@ service cloud.firestore {
     // v `PlansPage`/`PlanViewer` a zrcadlí přesně tahle dvě práva.
     match /workspaces/{wid}/projects/{pid}/plans/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEdit(wid, pid);
+      allow create, update, delete: if (
+          canEdit(wid, pid)
+        ) && !projectFrozen(pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/planAnnotations/{docId} {
@@ -1437,27 +1553,30 @@ service cloud.firestore {
       allow list: if isProjectMember(wid, pid)
         && (resource.data.isPrivate == false
             || resource.data.ownerPrincipal == principal());
-      allow create, update, delete: if canEdit(wid, pid);
+      allow create, update, delete: if (
+          canEdit(wid, pid)
+        ) && !projectFrozen(pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documents/{docId} {
       allow read: if isProjectMember(wid, pid);
       // Do OFICIÁLNÍ dokumentace smí zakládat jen `publish`, ne každý člen.
       // Atribuce firmě jen na vlastní firmu (anti-spoof) a autor nesmí být podvržený.
-      allow create: if officialCreateOk(permsOf(wid, pid), pid);
+      allow create: if officialCreateOk(permsOf(wid, pid), pid) && !projectFrozen(pid);
       // Author immutable. Editovat smí běžná práva k obsahu; `certify` nebo
       // `publish` navíc smí jako vedlejší efekt upload/approve transakce
       // přepnout jen platnou revizi (currentVersionId/updatedAt) — i když nemá
       // `edit` ani autorství (schválení revize / nová revize od publikujícího).
       allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
-        && documentUpdateOk(permsOf(wid, pid));
+        && documentUpdateOk(permsOf(wid, pid))
+        && !projectFrozen(pid);
       allow delete: if canModifyContent(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documentVersions/{docId} {
       allow read: if isProjectMember(wid, pid);
       // Nahrát verzi do oficiální dokumentace smí jen `publish` (viz documents).
-      allow create: if officialCreateOk(permsOf(wid, pid), pid);
+      allow create: if officialCreateOk(permsOf(wid, pid), pid) && !projectFrozen(pid);
       // `certify` (schvalovatel) smí zapsat SVÉ ROZHODNUTÍ: `approvals` mapu,
       // odvozený status (i supersede předchozí verze) a razítko recenzenta.
       //
@@ -1472,7 +1591,8 @@ service cloud.firestore {
       // Ostatní (uploader/editor/autor) smí běžné editace, ale NE přechod do
       // rozhodnutí (zákaz self-approve). Audit se v rules nevynucuje.
       allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')  // author immutable
-        && versionUpdateOk(permsOf(wid, pid));
+        && versionUpdateOk(permsOf(wid, pid))
+        && !projectFrozen(pid);
       allow delete: if canModifyContent(wid, pid);
     }
 
@@ -1494,7 +1614,9 @@ service cloud.firestore {
 
     match /workspaces/{wid}/projects/{pid}/transmittals/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEdit(wid, pid);
+      allow create, update, delete: if (
+          canEdit(wid, pid)
+        ) && !projectFrozen(pid);
     }
 
     // Zapečený stav dokumentace na hranici fáze — immutable otisk sady verzí.
@@ -1503,12 +1625,16 @@ service cloud.firestore {
     // vynucená rules (stejný vzor jako share pointer, jen tady i list pro člena).
     match /workspaces/{wid}/projects/{pid}/documentBaselines/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, delete: if canEdit(wid, pid);
+      allow create, delete: if (
+          canEdit(wid, pid)
+        ) && !projectFrozen(pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documentEvents/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEdit(wid, pid);
+      allow create, update, delete: if (
+          canEdit(wid, pid)
+        ) && !projectFrozen(pid);
     }
 
     // ---------------------------------------------------------------------
@@ -1523,7 +1649,9 @@ service cloud.firestore {
     match /workspaces/{wid}/projects/{pid}/shareLinks/{token} {
       allow get: if true;
       allow list: if isProjectMember(wid, pid);
-      allow create, update, delete: if canEdit(wid, pid);
+      allow create, update, delete: if (
+          canEdit(wid, pid)
+        ) && !projectFrozen(pid);
     }
 
     // ---------------------------------------------------------------------
@@ -1550,8 +1678,9 @@ service cloud.firestore {
       allow get: if true;
       allow list: if isProjectMember(wid, pid);
       allow create, update: if permsOf(wid, pid).hasAny(['edit', 'certify', 'publish'])
-        && validDocumentStatus(request.resource.data);
-      allow delete: if canEdit(wid, pid);
+        && validDocumentStatus(request.resource.data)
+        && !projectFrozen(pid);
+      allow delete: if canEdit(wid, pid) && !projectFrozen(pid);
     }
 
     // ---------------------------------------------------------------------
@@ -1693,7 +1822,32 @@ service cloud.firestore {
         && request.resource.data.roles.get(principal(), '') == 'admin'
         // Zakladatel smí projekt založit jako VLASTNÍ (typicky projektant
         // v přípravě), ne rovnou cizí. Postoupení je samostatný úkon.
-        && request.resource.data.get('dataOwner', {}).get('principal', principal()) == principal();
+        && request.resource.data.get('dataOwner', {}).get('principal', principal()) == principal()
+        // 🔴 Serverová pole nesmí jít zapsat ANI PŘI VZNIKU dokumentu.
+        // Do 8/2026 tu denylist chyběl úplně, zatímco obě větve `update` níž
+        // ta samá pole zakazují — a zakládající admin firmy si tak jedním
+        // `set()` zapsal to, co mu druhý den `update` odepře. Nejde o únik
+        // mezi firmami (stavba je vlastní), jde o to, že jinak chráněné pole
+        // má druhou, neuhlídanou cestu dovnitř — přesně ta třída chyby, před
+        // kterou tenhle soubor na jiných místech varuje.
+        //
+        // Seznam je ZÁMĚRNĚ týž jako v denylistu admina firmy níž, protože
+        // zakladatel JE admin firmy; kdo sem přidá pole tam, musí ho přidat
+        // i sem. Konkrétně:
+        //  - `handover`: `{ state: 'moving', frozenUntil: <daleko> }` zapsané
+        //    při zakládání zamkne stavbu natrvalo jen ke čtení a z klienta to
+        //    nejde vrátit — pole už měnit nesmí nikdo, takže by na rozmrazení
+        //    bylo potřeba Admin SDK. Píše ho výhradně `acceptProjectHandover`.
+        //  - `observation`: testovací provoz je plnění smlouvy, zapíná ho
+        //    provozovatel z `/provoz`. Založit stavbu rovnou „ve sběru dat" je
+        //    tentýž obchvat jako zapnout si ho potom.
+        //  - `lastActivityAt`: fakturační veličina vázaná na `request.time`.
+        //    Bez tohohle si jde stavba založit s ročním datem v minulosti,
+        //    tedy rovnou jako „spící".
+        //
+        // `keys()` (ne `diff()`): při create žádné `resource` neexistuje.
+        && !request.resource.data.keys()
+            .hasAny(['handover', 'observation', 'lastActivityAt']);
       // Workspace owner/admin: full project doc control incl. membership.
       // Project admin: may edit project content but MUST NOT touch
       // memberIds/dataOwner (kdo je členem se mění jen přes wsAdmin nebo
@@ -1714,7 +1868,24 @@ service cloud.firestore {
           // dedikovanou větví (`hasOnly` + `== request.time`), která adminy
           // firmy pouští taky.
           && !request.resource.data.diff(resource.data).affectedKeys()
-              .hasAny(['lastActivityAt'])
+              .hasAny(['lastActivityAt',
+                       // 🔴 Stav předání stavby píše VÝHRADNĚ server
+                       // (`acceptProjectHandover`). Z pole plyne peněžní
+                       // závazek nového vlastníka a po dobu kopie i zmrazení
+                       // zápisů — kdyby na něj dosáhl admin firmy, uměl by si
+                       // stavbu „předat" bez druhé strany i shodit zmrazení
+                       // uprostřed kopírování. Viz
+                       // docs/ai/predani-stavby-a-placeni.md.
+                       'handover',
+                       // 🔴 Testovací provoz zapíná VÝHRADNĚ provozovatel
+                       // z konzole `/provoz` (Admin SDK), po dohodě se
+                       // zákazníkem — v aplikaci pro něj žádný ovladač není
+                       // a nesmí být. Kdyby si ho admin firmy zapnul sám,
+                       // sbírali bychom data z domluvy, která neproběhla,
+                       // a lidem na stavbě bychom ukázali dotaz na něco,
+                       // o čem provozovatel neví. Viz
+                       // docs/legal/PRILOHA_TESTOVACI_PROVOZ.md §3.
+                       'observation'])
         ) || (
           // Postoupení vlastnictví DOSAVADNÍM vlastníkem — i když projekt vůbec
           // nespravuje. Přesně to je scénář „projektant založí projekt v přípravě
@@ -1754,10 +1925,22 @@ service cloud.firestore {
           && request.resource.data.workspaceId == resource.data.workspaceId
           && !request.resource.data.diff(resource.data).affectedKeys()
               .hasAny(['memberIds', 'roles', 'dataOwner', 'companies', 'archived',
+                       // Tentýž důvod jako u admina firmy výš — a tady o to
+                       // silnější: správce stavby není ani smluvní strana.
+                       'handover',
                        // Tentýž důvod jako u admina firmy o dvě větve výš:
                        // jinak by vazba značky na `request.time` platila jen pro
                        // ty, kdo do project docu jinak psát nesmí.
-                       'lastActivityAt'])
+                       'lastActivityAt',
+                       // 🔴 Testovací provoz je PLNĚNÍ SMLOUVY, ne provozní
+                       // vlastnost stavby: firma za něj dostává službu zdarma
+                       // a zavazuje se informovat své lidi
+                       // (docs/legal/PRILOHA_TESTOVACI_PROVOZ.md §3). Smluvní
+                       // strana je firma (`workspaces/{wid}.ownerId`), ne
+                       // správce stavby — ten by jinak zapnul sběr dat na
+                       // stavbě, o které se nikdo ze statutárů nedozví.
+                       // Tatáž úvaha jako u `archived` o řádek výš.
+                       'observation'])
         ) || (
           // Přeřazení JEDNOHO cizího člena správcem stavby (#507) — jediná
           // cesta, kterou se `roles` mění bez vlastníka/admina firmy.
@@ -1874,6 +2057,63 @@ service cloud.firestore {
         && request.resource.data.get('docCount', 0) is number;
       // Počítadlo se snižuje ZÁPORNÝM přírůstkem, ne mazáním dokumentu.
       allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // FAKTURACE — první serverem psané dokumenty v tomhle repu
+    //
+    // Tři kolekce, které dohromady drží fakturační veličinu. Všechny mají
+    // `allow write: if false` a píše je VÝHRADNĚ Cloud Function admin SDK,
+    // který pravidla obchází. To je ta „jindy a nezávisle" cesta, kterou
+    // popisuje odstavec nad blokem `usage`: z falšovatelného počítadla se
+    // nikdy nesmí odvodit částka, takže si fakturace vede vlastní stopu.
+    //
+    // 🔴 PROČ `allow write: if false` A NIKDY `allow write: if <podmínka>`:
+    // souběžné `allow` větve se skládají SJEDNOCENÍM. Kdyby tu bylo
+    // `allow write: if <cokoli>` a vedle `allow delete: if false`, zákaz
+    // mazání by byl dekorace — přesně past popsaná u `usage` výš.
+    //
+    // 🔴 ČTENÍ SE NIKDY NEPODMIŇUJE PLÁNEM. Tyhle bloky říkají, kdo smí vidět
+    // fakturační údaje; NEŘÍKAJÍ nic o přístupu k obsahu stavby. Chyba
+    // ve fakturačním dokumentu nesmí zamknout partii z výkresů — gatuje se
+    // jen to, co tvoří náklad, nikdy ne opačně (VOP čl. 13.3: data na stavbě
+    // jsou důkazní materiál).
+
+    // Serverový marker aktivity stavby za kalendářní měsíc.
+    //
+    // Píše ho trigger `recordProjectActivity` při KAŽDÉM zápisu do obsahu
+    // stavby; `writeCount` je proto zároveň naměřený objem činnosti pro
+    // pásma (V2) a fair-use práh (V13). Aktivní stavba = marker za daný měsíc
+    // existuje. Tohle je jediný signál aktivity, kterému fakturace věří —
+    // `lastActivityAt` na project docu je klientský string bez vazby na
+    // `request.time`, takže by si každý člen stavbu „uspal".
+    //
+    // Čtení pouští členům stavby záměrně: je to podklad toho, co jim přijde
+    // na faktuře, a VOP zákazníkovi na výpis dává právo.
+    match /workspaces/{wid}/projects/{pid}/activity/{month} {
+      allow read: if isProjectMember(wid, pid);
+      allow write: if false;
+    }
+
+    // Stav předplatného firmy. Jeden dokument (`current`).
+    //
+    // Čte jen VLASTNÍK A SPRÁVCI firmy — obrazovka Předplatné je podle
+    // `docs/ai/cenik-upgrade-us.md` kap. C.1 pro ostatní členy a hosty
+    // NEVIDITELNÁ (ne zakázaná — neviditelná). Širší čtení by nikomu nic
+    // nedalo a rozšířilo by okruh lidí, kteří vidí fakturační stav firmy.
+    match /workspaces/{wid}/billing/{docId} {
+      allow read: if isWsAdmin(wid);
+      allow write: if false;
+    }
+
+    // Měsíční snímek, ze kterého vznikla faktura. Append-only.
+    //
+    // Sweep existující snímek NIKDY nepřepíše — cena se nesmí měnit zpětně
+    // (V3). Že je append-only, vynucuje `write: if false` plus logika sweepu;
+    // pravidla to samy ověřit nedokážou, protože admin SDK jimi neprochází.
+    match /workspaces/{wid}/billingSnapshots/{month} {
+      allow read: if isWsAdmin(wid);
+      allow write: if false;
     }
 
     // Neměnná auditní stopa projektu.
@@ -1994,6 +2234,40 @@ service cloud.firestore {
     }
 
     // ---------------------------------------------------------------------
+    // NÁVRH NA PŘEDÁNÍ STAVBY NOVÉMU VLASTNÍKOVI (F1)
+    //
+    // Předání = přesun stavby do prostoru nového vlastníka; návrh
+    // v docs/ai/predani-stavby-a-placeni.md. Návrh musí přečíst někdo, kdo
+    // v prostoru zdroje NENÍ ČLENEM — jinak by ho nemohl přijmout. Tentýž
+    // problém řeší `pendingInvites`, proto tentýž vzor: adresa je e-mail
+    // z tokenu, ne členství.
+    //
+    // 🔴 CELÝ DOKUMENT PÍŠE SERVER (`allow write: if false`) — na rozdíl od
+    // `pendingInvites`, které klient zakládá sám. Z návrhu totiž plyne PENĚŽNÍ
+    // ZÁVAZEK: kdo ho přijme, začne za stavbu platit. Klientský zápis by
+    // znamenal, že si stav „přijato" nastaví kterákoli strana sama — a že si
+    // navrhovatel vybere, komu závazek přiřkne, bez jeho souhlasu.
+    //
+    // 🔴 Nález A1 (#535) platí i tady: `request.auth.token.email` se čte PŘÍMO,
+    // ne přes `.get(…, '')`. Kdyby se porovnávaly dvě prázdné hodnoty, vypsal
+    // by si registr návrhů kdokoli přihlášený bez e-mailu — a v něm jsou názvy
+    // staveb, jména firem a e-maily napříč všemi zákazníky.
+    // ---------------------------------------------------------------------
+    match /projectHandovers/{handoverId} {
+      // Adresát čte svoje návrhy i výpisem (potřebuje je vidět v Hubu, než se
+      // vůbec stane členem čehokoli). Navrhovatel čte JEN konkrétní návrh
+      // (`get`, ne `list`) — výpis by dovolil enumeraci cizích návrhů.
+      allow get: if isRealUser()
+        && request.auth.token.get('email', '') != ''
+        && (resource.data.get('toEmail', '') == request.auth.token.email
+            || resource.data.get('fromEmail', '') == request.auth.token.email
+            || resource.data.get('fromPrincipal', '') == principal());
+      allow list: if isRealUser()
+        && resource.data.toEmail == request.auth.token.email;
+      allow write: if false;
+    }
+
+    // ---------------------------------------------------------------------
     // Veřejná konfigurace firmy (federační URL pro auto-discovery)
     //
     // `config/public` = { authExchangeUrl }. Zapisuje setup CLI (admin SDK /
@@ -2005,6 +2279,126 @@ service cloud.firestore {
     match /config/{docId} {
       allow read: if true;
       allow write: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // ROZHODNUTÍ JEDNOTLIVCE o testovacím provozu.
+    //
+    // Tři stavy, a chybějící dokument je ten třetí: `granted` · `declined` ·
+    // **nerozhodnuto** (dokument neexistuje). Sbírá se JEN při `granted` —
+    // dokud se člověk nevyjádří, nezaznamenává se nic. Fail-closed je tu
+    // podstatný: mezi zapnutím provozu a odpovědí člověka může uběhnout den.
+    //
+    // 🔴 ČTE I PÍŠE VÝHRADNĚ TEN, KOHO SE TÝKÁ — ani vlastník firmy, ani
+    // správce stavby. Obojí je záměr a obojí je nutné:
+    //
+    //  · ZÁPIS: kdyby rozhodnutí bydlelo v členském záznamu stavby
+    //    (`workspaces/{wid}/projects/{pid}/members/{uid}`), přepsal by ho admin
+    //    firmy, protože do toho dokumentu píše. Rozhodnutí člověka by pak
+    //    platilo jen potud, pokud ho zaměstnavatel nechá platit.
+    //  · ČTENÍ: seznam těch, kdo odmítli, je sám o sobě citlivý — kdo ho má,
+    //    ví, na koho zatlačit. Balanční test v
+    //    docs/legal/PRILOHA_TESTOVACI_PROVOZ.md §2 stojí na tom, že se firma
+    //    k telemetrii ani k jejím metadatům nedostane; kdyby tohle četla,
+    //    závěr testu padá.
+    //
+    // Vynucení sběru je klientské (kontrola PŘED zápisem) a serverové sweepy
+    // jedou pod Admin SDK mimo pravidla — tahle cesta je pro člověka samotného.
+    // ---------------------------------------------------------------------
+    // ⚠️ JEDINÁ OBSAHOVÁ KOLEKCE POD STAVBOU BEZ ZMRAZENÍ, a je to záměr.
+    // Rozhodnutí o testovacím provozu je právní úkon člověka, ne obsah stavby:
+    // odvolat souhlas (`delete`) musí jít VŽDYCKY, i uprostřed předání —
+    // blokovat odvolání by bylo horší než ztratit souhlas udělený během těch
+    // pár minut. A ztráta udělení selhává bezpečně: bez záznamu se nesbírá nic
+    // a systém se zeptá znovu.
+    match /workspaces/{wid}/projects/{pid}/observationConsents/{who} {
+      allow read: if isRealUser() && principal() == who;
+      // Uzavřený tvar: rozhodnutí + verze znění + čas, nic jiného. Bez
+      // `hasOnly` by si sem šlo uložit cokoli pod hlavičkou „souhlas".
+      allow create, update: if isRealUser()
+        && principal() == who
+        && request.resource.data.keys().hasOnly(['decision', 'textVersion', 'at'])
+        && request.resource.data.decision in ['granted', 'declined']
+        && request.resource.data.textVersion is string
+        && request.resource.data.at is string;
+      // Smazání = návrat do „nerozhodnuto", tedy do stavu, kdy se NESBÍRÁ.
+      // Nikomu tím nic nepřibude, tak není důvod ho zakazovat.
+      allow delete: if isRealUser() && principal() == who;
+    }
+
+    // ---------------------------------------------------------------------
+    // OPRÁVNĚNÍ OPERÁTORA — kdo smí do provozního přehledu (`/provoz`).
+    //
+    // 🔴 NEJCITLIVĚJŠÍ DOKUMENT V CELÉ DATABÁZI: uděluje pohled na VŠECHNY
+    // zákazníky najednou. Zapisuje se výhradně mimo aplikaci
+    // (`scripts/set-operator.mjs` pod účtem s Admin právy), čte ho jen
+    // Cloud Function `operatorOverview` pod Admin SDK.
+    //
+    // Klient sem nesmí ani nahlédnout — kdo si vypíše seznam operátorů, ví,
+    // na koho mířit sociálním inženýrstvím.
+    //
+    // ⚠️ Implicitní zákaz na konci souboru by to chytil taky (ověřeno testem).
+    // Explicitní blok je tu pro případ, že sem někdo přidá širší `match`:
+    // u dokumentu, který uděluje přístup k datům všech zákazníků, se nespoléhá
+    // na to, že se na něj nezapomene.
+    // ---------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // ZÁZNAMY TESTOVACÍHO PROVOZU (telemetrie).
+    //
+    // Píše VÝHRADNĚ Cloud Function `recordObservationEvents` pod Admin SDK,
+    // která si ověřuje zapnutí, členství i souhlas. Klient sem nesmí zapisovat
+    // — `actor` je SHA-256 a pravidla ho neumí spočítat, takže by nedokázala
+    // ověřit, že pseudonym patří volajícímu, ani že člověk souhlas neodvolal.
+    //
+    // 🔴 A NESMÍ ANI ČÍST — zvlášť ne firma. Balanční test i celá věta „záznam
+    // neslouží k hodnocení lidí" stojí na tom, že se zákazník k telemetrii
+    // nedostane. Kdyby ji admin firmy vypsal, je z toho nástroj kontroly
+    // zaměstnanců a souhlas přestane být svobodný. Operátor ji čte přes Admin
+    // SDK, ne odsud.
+    // ---------------------------------------------------------------------
+    match /observationEvents/{eventId} {
+      allow read, write: if false;
+    }
+
+    match /operatorAccess/{who} {
+      allow read, write: if false;
+    }
+
+    // Komu firma patří (obchodník). Server-only, jako `operatorAccess`.
+    //
+    // 🔴 SCHVÁLNĚ NE `workspaces/{wid}.acquiredBy`, jak navrhoval backlog. Tam
+    // smí správce firmy zapsat libovolné pole (viz `allow update` výš, omezuje
+    // jen `ownerId` a `adminIds`), takže by si zákazník sám zapsal, kdo ho
+    // přivedl, a vyrobil tím provizi. Přesně to „šesté falšovatelné pole
+    // s finančním dopadem" z docs/ai/fakturace-rozhodnuti.md §5.
+    //
+    // Zákazník to navíc ani nemá vidět — je to náš vnitřní obchodní údaj.
+    match /operatorTenants/{wid} {
+      allow read, write: if false;
+    }
+
+    // Výchozí podmínky provize. Server-only — sazba, kterou platíme
+    // obchodníkovi, není věc zákazníka ani obchodníka samotného.
+    match /operatorSettings/{docId} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // Záznam o pohledech operátora do provozního přehledu (`/provoz`).
+    //
+    // Píše VÝHRADNĚ Cloud Function `operatorOverview` pod Admin SDK, tedy mimo
+    // pravidla. Explicitní `if false` je tu i přes to, že by doc spadl pod
+    // implicitní zákaz níž — má to dva důvody:
+    //  1. je to auditní stopa nad vlastními zaměstnanci, takže „nesmí se do ní
+    //     sáhnout z klienta" má být napsané, ne odvozené;
+    //  2. kdyby sem někdo někdy přidal širší `match`, tenhle blok drží.
+    //
+    // ⚠️ ANI ČTENÍ. Kdo se díval do dat zákazníků je citlivější než většina
+    // obsahu, který se tím prohlížel — a operátor si vlastní stopu číst
+    // nepotřebuje (dělá se to Admin SDK, když se ptá auditor podle DPA čl. 14).
+    // ---------------------------------------------------------------------
+    match /operatorAccessLog/{entryId} {
+      allow read, write: if false;
     }
 
     // No catch-all: everything else is denied by default.

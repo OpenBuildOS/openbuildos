@@ -298,10 +298,15 @@ service cloud.firestore {
         && canEdit(wid, pid);
     }
 
+    // ⚠️ VOLÁ SE `canEdit`, NE `isCompanySpaceLead`, a je to úspora, ne úlitba.
+    // `isCompanySpaceLead` = `isSameProjectCompany && canEdit` — jenže
+    // `isSameProjectCompany` je o řádek výš už ověřená, takže by se celá (včetně
+    // `projectData` a `memberCompany`) vyhodnotila podruhé. Význam je totožný,
+    // cena poloviční. Viz strop 1 000 výrazů na požadavek níž.
     function hasCompanyResourceAccess(wid, pid, companyId, data) {
       return isSameProjectCompany(wid, pid, companyId)
         && (
-          isCompanySpaceLead(wid, pid, companyId)
+          canEdit(wid, pid)
           || data.get('accessMode', '') == 'company_all'
           || (data.get('accessMode', '') == 'restricted'
               && principal() in data.get('allowedPrincipalIds', []))
@@ -324,42 +329,70 @@ service cloud.firestore {
       return /databases/$(database)/documents/workspaces/$(wid)/projects/$(pid)/companySpaces/$(companyId)/plans/$(planId);
     }
 
+    // 🔴 JEDNA VAZBA MÍSTO ČTYŘ OPISŮ `get(...)`. Firestore má na požadavek strop
+    // 1 000 VYHODNOCENÝCH VÝRAZŮ (vedle stropu 10 přístupů k dokumentům) a každý
+    // opis `get(companyPlanPath(...))` znamená znovu sestavit cestu ze čtyř
+    // interpolací a znovu projít celý podvýraz. Přesně na tenhle strop dojelo
+    // nahrávání dokumentů do firemní složky — pravidlo padalo na
+    // `EvaluationException: maximum of 1000 expressions`, tedy hlášením
+    // k nerozeznání od chybějícího oprávnění. Táž úvaha jako u `redeemOk` výš.
     function canUseCompanyPlan(wid, pid, companyId, planId, data) {
-      return planId != ''
-        && exists(companyPlanPath(wid, pid, companyId, planId))
-        && hasCompanyResourceAccess(wid, pid, companyId, get(companyPlanPath(wid, pid, companyId, planId)).data)
-        && data.get('folderId', '') == get(companyPlanPath(wid, pid, companyId, planId)).data.get('folderId', '')
-        && data.get('accessMode', '') == get(companyPlanPath(wid, pid, companyId, planId)).data.get('accessMode', '')
-        && data.get('allowedPrincipalIds', []) == get(companyPlanPath(wid, pid, companyId, planId)).data.get('allowedPrincipalIds', []);
+      let plan = planId != '' && exists(companyPlanPath(wid, pid, companyId, planId))
+        ? get(companyPlanPath(wid, pid, companyId, planId)).data
+        : null;
+      return plan != null
+        && hasCompanyResourceAccess(wid, pid, companyId, plan)
+        && data.get('folderId', '') == plan.get('folderId', '')
+        && data.get('accessMode', '') == plan.get('accessMode', '')
+        && data.get('allowedPrincipalIds', []) == plan.get('allowedPrincipalIds', []);
     }
 
+    /** Tentýž důvod pro jednu vazbu jako u `canUseCompanyPlan` výš. */
     function canUseCompanyFolder(wid, pid, companyId, folderId, data) {
+      let folder = folderId != '' && exists(companyFolderPath(wid, pid, companyId, folderId))
+        ? get(companyFolderPath(wid, pid, companyId, folderId)).data
+        : null;
       return (
           folderId == ''
           && data.get('accessMode', '') == 'company_all'
           && data.get('allowedPrincipalIds', []).size() == 0
         ) || (
-          folderId != ''
-          && exists(companyFolderPath(wid, pid, companyId, folderId))
-          && hasCompanyResourceAccess(wid, pid, companyId, get(companyFolderPath(wid, pid, companyId, folderId)).data)
-          && data.get('accessMode', '') == get(companyFolderPath(wid, pid, companyId, folderId)).data.get('accessMode', '')
-          && data.get('allowedPrincipalIds', []) == get(companyFolderPath(wid, pid, companyId, folderId)).data.get('allowedPrincipalIds', [])
+          folder != null
+          && hasCompanyResourceAccess(wid, pid, companyId, folder)
+          && data.get('accessMode', '') == folder.get('accessMode', '')
+          && data.get('allowedPrincipalIds', []) == folder.get('allowedPrincipalIds', [])
         );
     }
 
+    /**
+     * Smí nová/upravená složka viset pod `parentId`? Řeší JEN slučitelnost
+     * přístupů, ne oprávnění volajícího.
+     *
+     * 🔴 SCHVÁLNĚ SE TU NEPTÁ NA `hasCompanyResourceAccess`. Obě volající větve
+     * (zakládání i úprava složky) mají o řádek výš `isCompanySpaceLead`, a ten
+     * je silnější: vedoucí firemního prostoru projde `hasCompanyResourceAccess`
+     * vždycky, větví `canEdit`. Byla to tedy kontrola, která nikdy nic
+     * nezamítla — zato pokaždé znovu spočítala `permsOf` se vším, co k tomu
+     * patří. Na stropu 1 000 vyhodnocených výrazů na požadavek to nebyl luxus:
+     * zakládání podsložky kvůli tomu padalo. Viz #639.
+     *
+     * ⚠️ Kdo tuhle funkci zavolá odjinud než z větve chráněné
+     * `isCompanySpaceLead`, musí si přístup k rodiči ověřit sám.
+     */
     function validChildCompanyAccess(wid, pid, companyId, parentId, data) {
+      let parent = parentId != '' && exists(companyFolderPath(wid, pid, companyId, parentId))
+        ? get(companyFolderPath(wid, pid, companyId, parentId)).data
+        : null;
       return (
           parentId == ''
           && data.get('accessMode', '') in ['company_all', 'restricted']
         ) || (
-          parentId != ''
-          && exists(companyFolderPath(wid, pid, companyId, parentId))
-          && hasCompanyResourceAccess(wid, pid, companyId, get(companyFolderPath(wid, pid, companyId, parentId)).data)
+          parent != null
           && (
-            get(companyFolderPath(wid, pid, companyId, parentId)).data.get('accessMode', '') == 'company_all'
+            parent.get('accessMode', '') == 'company_all'
             || (
               data.get('accessMode', '') == 'restricted'
-              && get(companyFolderPath(wid, pid, companyId, parentId)).data.get('allowedPrincipalIds', []).hasAll(data.get('allowedPrincipalIds', []))
+              && parent.get('allowedPrincipalIds', []).hasAll(data.get('allowedPrincipalIds', []))
             )
           )
         );

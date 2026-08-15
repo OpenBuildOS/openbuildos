@@ -313,6 +313,67 @@ service cloud.firestore {
         );
     }
 
+    /**
+     * Pouští obsah sám sebou: `company_all` vidí celá firma, `restricted` jen
+     * vyjmenovaní. Čistě nad daty — bez čtení dokumentů a bez `permsOf`, takže
+     * se dá volat opakovaně bez ceny.
+     */
+    function companyDataOpen(data) {
+      return data.get('accessMode', '') == 'company_all'
+        || (data.get('accessMode', '') == 'restricted'
+            && principal() in data.get('allowedPrincipalIds', []));
+    }
+
+    /**
+     * Smí volající ZMĚNIT nebo SMAZAT tenhle firemní obsah? Cizí smí vedoucí
+     * prostoru, vlastní jeho autor — a jen dokud k němu má přístup.
+     *
+     * Nahradilo dvojici `hasCompanyResourceAccess(…) && (createdBy == principal()
+     * || isCompanySpaceLead(…))`, kde se `permsOf` počítalo dvakrát. Význam je
+     * totožný: po dosazení `isCompanySpaceLead = isSameProjectCompany && canEdit`
+     * a při už ověřené příslušnosti k firmě se výraz zjednoduší přesně na tohle.
+     */
+    function canModifyCompanyResource(wid, pid, companyId, data) {
+      return isSameProjectCompany(wid, pid, companyId)
+        && (
+          canEdit(wid, pid)
+          || (data.get('createdBy', '') == principal() && companyDataOpen(data))
+        );
+    }
+
+    /**
+     * ZÁPIS DO FIREMNÍ SLOŽKY jednou funkcí — a `let` je tu to podstatné.
+     *
+     * 🔴 PROČ TO NEJDE SKLÁDAT Z MENŠÍCH KOUSKŮ V PRAVIDLE. Větev `allow` neumí
+     * `let`, takže každá konjunkce vyhodnotí svůj podstrom znovu. Úprava
+     * dokumentu potřebuje vědět dvě věci — smí ten člověk MĚNIT tenhle obsah
+     * a smí ho DÁT DO té složky — a obě stojí na tomtéž `permsOf`. Napsané
+     * zvlášť se počítalo dvakrát (s původním třetím opisem třikrát) a přeteklo
+     * to strop 1 000 vyhodnocených výrazů na požadavek: úprava přestala jít
+     * úplně a hlásila `permission-denied` (#639). Uvnitř funkce se právo
+     * spočítá JEDNOU do `let` a použije se na obě otázky.
+     */
+    function canWriteCompanyResourceInto(wid, pid, companyId, folderId, before, after) {
+      let lead = isSameProjectCompany(wid, pid, companyId) && canEdit(wid, pid);
+      let folder = folderId != '' && exists(companyFolderPath(wid, pid, companyId, folderId))
+        ? get(companyFolderPath(wid, pid, companyId, folderId)).data
+        : null;
+      return isSameProjectCompany(wid, pid, companyId)
+        && (lead || (before.get('createdBy', '') == principal() && companyDataOpen(before)))
+        && (
+          (
+            folderId == ''
+            && after.get('accessMode', '') == 'company_all'
+            && after.get('allowedPrincipalIds', []).size() == 0
+          ) || (
+            folder != null
+            && (lead || companyDataOpen(folder))
+            && after.get('accessMode', '') == folder.get('accessMode', '')
+            && after.get('allowedPrincipalIds', []) == folder.get('allowedPrincipalIds', [])
+          )
+        );
+    }
+
     function validCompanyResourceIdentity(companyId, data) {
       return data.get('scope', '') == 'company_internal'
         && data.get('ownerCompanyId', '') == companyId
@@ -870,15 +931,17 @@ service cloud.firestore {
           && request.resource.data.get('documentId', '') == documentId
           && request.resource.data.get('approvalMode', '') == 'none'
           && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
-        allow update: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
-          && (resource.data.get('createdBy', '') == principal() || isCompanySpaceLead(wid, pid, companyId))
+        allow update: if canWriteCompanyResourceInto(
+            wid, pid, companyId,
+            request.resource.data.get('folderId', ''),
+            resource.data,
+            request.resource.data
+          )
           && request.resource.data.get('scope', '') == resource.data.get('scope', '')
           && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
           && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
-          && request.resource.data.get('approvalMode', '') == 'none'
-          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
-        allow delete: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
-          && (resource.data.get('createdBy', '') == principal() || isCompanySpaceLead(wid, pid, companyId));
+          && request.resource.data.get('approvalMode', '') == 'none';
+        allow delete: if canModifyCompanyResource(wid, pid, companyId, resource.data);
       }
 
       match /documentVersions/{versionId} {
@@ -889,14 +952,16 @@ service cloud.firestore {
           && request.resource.data.get('status', '') == 'working'
           && request.resource.data.get('workflowMode', '') == 'none'
           && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
-        allow update: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
-          && (resource.data.get('createdBy', '') == principal() || isCompanySpaceLead(wid, pid, companyId))
+        allow update: if canWriteCompanyResourceInto(
+            wid, pid, companyId,
+            request.resource.data.get('folderId', ''),
+            resource.data,
+            request.resource.data
+          )
           && request.resource.data.get('scope', '') == resource.data.get('scope', '')
           && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
-          && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
-          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
-        allow delete: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
-          && (resource.data.get('createdBy', '') == principal() || isCompanySpaceLead(wid, pid, companyId));
+          && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');
+        allow delete: if canModifyCompanyResource(wid, pid, companyId, resource.data);
       }
 
       match /plans/{planId} {
@@ -905,14 +970,16 @@ service cloud.firestore {
           && isSameProjectCompany(wid, pid, companyId)
           && request.resource.data.get('planId', '') == planId
           && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
-        allow update: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
-          && (resource.data.get('createdBy', '') == principal() || isCompanySpaceLead(wid, pid, companyId))
+        allow update: if canWriteCompanyResourceInto(
+            wid, pid, companyId,
+            request.resource.data.get('folderId', ''),
+            resource.data,
+            request.resource.data
+          )
           && request.resource.data.get('scope', '') == resource.data.get('scope', '')
           && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
-          && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
-          && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data);
-        allow delete: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
-          && (resource.data.get('createdBy', '') == principal() || isCompanySpaceLead(wid, pid, companyId));
+          && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');
+        allow delete: if canModifyCompanyResource(wid, pid, companyId, resource.data);
       }
 
       // Sdílené firemní markupy jednoho planVersion. Task piny sem nepatří a

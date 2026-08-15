@@ -374,6 +374,27 @@ service cloud.firestore {
         );
     }
 
+    /**
+     * Totéž pro ANOTACE nad firemním plánem: přístup se počítá jednou do `let`
+     * a použije se na obojí — na anotace i na plán, do kterého patří.
+     *
+     * ⚠️ Anotace nemají větev „autor smí svoje": kdo do plánu vidí, kreslí do
+     * něj. Proto je podmínka o jednu možnost kratší než u dokumentů.
+     */
+    function canWriteCompanyAnnotationsInto(wid, pid, companyId, planId, before, after) {
+      let lead = isSameProjectCompany(wid, pid, companyId) && canEdit(wid, pid);
+      let plan = planId != '' && exists(companyPlanPath(wid, pid, companyId, planId))
+        ? get(companyPlanPath(wid, pid, companyId, planId)).data
+        : null;
+      return isSameProjectCompany(wid, pid, companyId)
+        && (lead || companyDataOpen(before))
+        && plan != null
+        && (lead || companyDataOpen(plan))
+        && after.get('folderId', '') == plan.get('folderId', '')
+        && after.get('accessMode', '') == plan.get('accessMode', '')
+        && after.get('allowedPrincipalIds', []) == plan.get('allowedPrincipalIds', []);
+    }
+
     function validCompanyResourceIdentity(companyId, data) {
       return data.get('scope', '') == 'company_internal'
         && data.get('ownerCompanyId', '') == companyId
@@ -997,15 +1018,19 @@ service cloud.firestore {
           && request.resource.data.get('items', []) is list
           && request.resource.data.get('items', []).size() <= 2000
           && canUseCompanyPlan(wid, pid, companyId, request.resource.data.get('planId', ''), request.resource.data);
-        allow update: if hasCompanyResourceAccess(wid, pid, companyId, resource.data)
+        allow update: if canWriteCompanyAnnotationsInto(
+            wid, pid, companyId,
+            request.resource.data.get('planId', ''),
+            resource.data,
+            request.resource.data
+          )
           && request.resource.data.get('scope', '') == resource.data.get('scope', '')
           && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
           && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
           && request.resource.data.get('planId', '') == resource.data.get('planId', '')
           && request.resource.data.get('planVersionId', '') == resource.data.get('planVersionId', '')
           && request.resource.data.get('items', []) is list
-          && request.resource.data.get('items', []).size() <= 2000
-          && canUseCompanyPlan(wid, pid, companyId, request.resource.data.get('planId', ''), request.resource.data);
+          && request.resource.data.get('items', []).size() <= 2000;
         allow delete: if false;
       }
     }

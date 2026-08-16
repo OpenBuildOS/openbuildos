@@ -2383,6 +2383,14 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // Pozvánka pro obchodníka. Server-only — token je klíč k roli `sales`,
+    // takže kdo by kolekci uměl číst, udělá si obchodníka z libovolné pozvánky.
+    // Uplatňuje se výhradně přes callable `redeemOperatorInvite`, který navíc
+    // ověří, že přihlášený e-mail sedí na ten pozvaný.
+    match /operatorInvites/{token} {
+      allow read, write: if false;
+    }
+
     // ---------------------------------------------------------------------
     // Záznam o pohledech operátora do provozního přehledu (`/provoz`).
     //

@@ -10,6 +10,8 @@
   "scripts": {
     "setup:company": "node scripts/openbuildos-setup.mjs",
     "setup": "node scripts/openbuildos-setup.mjs",
-    "test": "node --test scripts/*.test.mjs"
+    "test": "node --test scripts/*.test.mjs",
+    "shared-files": "node scripts/shared-files-check.mjs",
+    "shared-files:sync": "node scripts/shared-files-sync.mjs"
   }
 }

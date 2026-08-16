@@ -1,0 +1,95 @@
+{
+  "_comment": [
+    "Sdílené soubory mezi tímto companionem a PRIVÁTNÍM repem appky.",
+    "",
+    "Zdroj pravdy je Háček 1 v `docs/REPO_BOUNDARIES.md` v hlavním repu. Ten je",
+    "privátní, takže se sem jeho tabulka ZRCADLÍ — companion CI se do hlavního",
+    "repa nedostane a tajemství do veřejného repa nepatří (viz docs/SHARED_FILES.md).",
+    "",
+    "`mainSha256` je otisk protějšku v hlavním repu ve chvíli, kdy byly obě",
+    "strany naposledy shodné. NENÍ to živý stav — companion je kanonický a mění",
+    "se PRVNÍ, takže po každé změně sdíleného souboru je tenhle otisk chvíli",
+    "pozadu. Přesně to `shared-files-check.mjs` hlásí jako dluh na zrcadlení.",
+    "",
+    "Soubor se needituje ručně: `npm run shared-files:sync` ho přepočítá."
+  ],
+  "generatedFrom": {
+    "repo": "trpaslik444/construct-cloud-sync",
+    "doc": "docs/REPO_BOUNDARIES.md",
+    "section": "Háček 1 — SDÍLENÉ soubory",
+    "ref": "88417cc72000d9e5f6b78df58fe28924e4472afd",
+    "date": "2026-08-16"
+  },
+  "shared": [
+    {
+      "main": "firestore.rules",
+      "companion": "selfhost/firestore.rules",
+      "mainSha256": "8ad5de2498fa073b64cf6e3d0f50e043131fac366c0df699d5c428bf14cfa9e1"
+    },
+    {
+      "main": "storage.rules",
+      "companion": "selfhost/storage.rules",
+      "mainSha256": "05f6fe798ccc13c121fa6cd3dc1b6f87274f03c2e4a6dfabf57f0e0a0738e23d"
+    },
+    {
+      "main": "scripts/openbuildos-storage-setup.mjs",
+      "companion": "selfhost/scripts/openbuildos-storage-setup.mjs",
+      "mainSha256": "2765522aadc916cbdc2db6b8b42954339e5912e964182e4ca1b2df23bf252821"
+    },
+    {
+      "main": "functions/src/membershipClaims.ts",
+      "companion": "selfhost/functions/src/membershipClaims.ts",
+      "mainSha256": "34aa7c7fe44a8c7a594a2687156e03bd3e45a159c5ca571e9f8561b158003f5f"
+    },
+    {
+      "main": "functions/src/membershipClaims.test.ts",
+      "companion": "selfhost/functions/src/membershipClaims.test.ts",
+      "mainSha256": "43fc79ef955395d8867eb252051f2f0f11d86b21fed71d09cfe191d5a3dbc190"
+    },
+    {
+      "main": "functions/src/planPromotion.ts",
+      "companion": "selfhost/functions/src/planPromotion.ts",
+      "mainSha256": "74b78909b7318599818e0533b6d2f9fcb50cda2661bace3aa80a0e9a6e9f4ed5"
+    },
+    {
+      "main": "functions/src/planPromotion.test.ts",
+      "companion": "selfhost/functions/src/planPromotion.test.ts",
+      "mainSha256": "0dd826ba43ba1f0a4ce02c5da881e4daaa2e1126e5e896b8d4438142107739a3"
+    },
+    {
+      "main": "functions/src/trashSweep.ts",
+      "companion": "selfhost/functions/src/trashSweep.ts",
+      "mainSha256": "1f6182f7d53b84da64ea0b5e7224de4b458bb92f29d07d19b4c422c8f6374781"
+    },
+    {
+      "main": "functions/src/trashSweep.test.ts",
+      "companion": "selfhost/functions/src/trashSweep.test.ts",
+      "mainSha256": "645755481fd4da41ef20c817f461db5b12f406ed6c7f3936ca6c42484d54026e"
+    },
+    {
+      "main": "functions/src/shareLinkRotation.ts",
+      "companion": "selfhost/functions/src/shareLinkRotation.ts",
+      "mainSha256": "fc2ca376dd66cbfec9bc1deb32a060852952d0e4159baf327929f9e54d8a58aa"
+    },
+    {
+      "main": "functions/src/shareLinkRotation.test.ts",
+      "companion": "selfhost/functions/src/shareLinkRotation.test.ts",
+      "mainSha256": "9424367b3779b7cf1e17c6a4c2b7fb4336cdbc62cd24f27a65ba6784c41e8da8"
+    },
+    {
+      "main": "functions/src/thumbnails.ts",
+      "companion": "selfhost/functions/src/thumbnails.ts",
+      "mainSha256": "fbf3fab32255c9be7714d35f164a3ecbcbc8f0300849242e184008ffe961f29d"
+    },
+    {
+      "main": "functions/src/thumbnails.test.ts",
+      "companion": "selfhost/functions/src/thumbnails.test.ts",
+      "mainSha256": "d2821d085b553efe5e3dbb3c599d81df4b24a2dc9ce2371aef905858d2d55c93"
+    }
+  ],
+  "notShared": [
+    "scripts/openbuildos-setup.mjs",
+    "functions/",
+    "functions/src/billing/**"
+  ]
+}

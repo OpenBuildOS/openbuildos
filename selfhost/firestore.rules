@@ -695,10 +695,14 @@ service cloud.firestore {
         && (isWsAdmin(wid) || exists(firmDirectoryPath(wid, principal())));
     }
 
-    match /workspaces/{wid}/companies/{companyId} {
-      allow read: if isFirmParticipant(wid);
-      allow create, update, delete: if isWsAdmin(wid);
-    }
+    // 🔴 REGISTR FIREM JE PER STAVBA, ne per prostor — viz
+    // `match /workspaces/{wid}/projects/{pid}/companies/{companyId}` níž.
+    // Firemní `workspaces/{wid}/companies` byl do 17. 8. 2026 sdílený seznam
+    // pro všechny stavby prostoru: kdo na jedné stavbě založil „Elektro s.r.o.",
+    // viděli ho v nabídce i lidé na všech ostatních. Přitom VŠECHNO, co se
+    // firmou řídí, je stejně per stavba — `projects/{pid}.companies` (kdo je za
+    // koho na TÉ stavbě), `companySpaces` i `visibility: <companyId>`. Firemní
+    // registr byl jediná část, která z toho vybočovala, a nic ho nedrželo.
 
     // ---------------------------------------------------------------------
     // Firm member directory (workspace-level, keyed by principal)
@@ -979,6 +983,21 @@ service cloud.firestore {
 
     // Firemní interní pracovní prostory jsou oddělené od oficiálních kolekcí,
     // aby legacy list query nikdy nemíchaly obsah s rozdílnou viditelností.
+    // REGISTR FIREM NA STAVBĚ — jen jméno a kontaktní osoba.
+    //
+    // ⚠️ POPIS, NE OPRÁVNĚNÍ. Ani `contactPrincipal` (kdo firmu na stavbě
+    // zastupuje) nikde nic nepovoluje — pravidla ho nečtou a číst nesmí. Kdo co
+    // smí, řeší dál role a flagy na `projects/{pid}`. Role `company_lead` se
+    // jednou zrušila právě proto, že z popisného zařazení udělala oprávnění.
+    //
+    // Čte každý člen stavby (jméno firmy je vidět u lidí, úkolů i dokumentů),
+    // spravuje vlastník/admin FIRMY — táž brána jako u členů stavby, aby si
+    // tabulka lidí a tenhle registr neříkaly každý něco jiného.
+    match /workspaces/{wid}/projects/{pid}/companies/{companyId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if isWsAdmin(wid) && !projectFrozen(pid);
+    }
+
     match /workspaces/{wid}/projects/{pid}/companySpaces/{companyId} {
       allow get: if isSameProjectCompany(wid, pid, companyId);
       allow list: if false;

@@ -1,0 +1,61 @@
+name: Sdílené soubory
+
+# Companion je KANONICKÝ — firmy z něj deployují přes setup CLI — ale do
+# 16. 8. 2026 tu neběžela na PR žádná kontrola. Rozdíl ve sdíleném souboru se
+# poznal až při příštím běhu CI v hlavním repu, klidně o dny později.
+#
+# 🔴 Proč se neporovnává přímo proti hlavnímu repu: `trpaslik444/construct-cloud-sync`
+# je PRIVÁTNÍ, tenhle repo VEŘEJNÝ. Token s přístupem do privátního repa uložený
+# v tajemstvích veřejného repa je horší vada než ta, kterou by hlídal — a navíc
+# by nefungoval u PR z forku, kde tajemství nejsou. Porovnává se proto proti
+# zrcadleným otiskům v `selfhost/shared-files.manifest.json`.
+# Rozhodnutí a odmítnuté varianty: selfhost/docs/SHARED_FILES.md
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# `pull_request` (ne `pull_request_target`): běží s kódem PR, ale BEZ tajemství
+# a jen s právem číst. Tahle kontrola žádné tajemství nepotřebuje, takže je to
+# ta bezpečná varianta i pro PR z forku.
+permissions:
+  contents: read
+
+concurrency:
+  group: shared-files-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  shared-files:
+    name: Sdílené soubory se nerozešly s hlavním repem
+    runs-on: ubuntu-latest
+    steps:
+      # `fetch-depth: 0`: kontrola potřebuje `base...HEAD`, aby odlišila
+      # „tenhle PR mění sdílený soubor" (červená bez přiznaného zrcadlení) od
+      # „dluh z dřívějška" (varování). V mělkém checkoutu ten diff nejde udělat
+      # a skript kvůli tomu radši spadne, než by mlčky zvolil mírnější verdikt.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Bez `npm ci` schválně: skript i jeho testy stojí jen na standardní
+      # knihovně Node. Companion nemá `node_modules` a zarážka, která by kvůli
+      # instalaci závislostí trvala minuty, se v PR přestane číst.
+      - name: Testy zarážky (18)
+        working-directory: selfhost
+        run: node --test scripts/shared-files-check.test.mjs
+
+      - name: Sdílené soubory
+        working-directory: selfhost
+        # Tělo PR jde přes proměnnou prostředí, ne do příkazové řádky — je to
+        # text od kohokoli, kdo otevře PR, a v `run:` by se interpoloval jako kód.
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          node scripts/shared-files-check.mjs \
+            ${{ github.event_name == 'pull_request' && format('--base origin/{0}', github.base_ref) || '' }}

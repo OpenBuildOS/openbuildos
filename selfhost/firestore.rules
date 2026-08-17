@@ -2106,6 +2106,21 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // Kniha nákupů kreditu. Jeden append-only záznam na koupený balíček.
+    //
+    // Zůstatek zásoby (`billing/current.creditUnits`) je jedno číslo a po slití
+    // dvou balíčků z něj NEJDE zjistit, kolik spotřebovaný stavboměsíc stál.
+    // Z pořizovací ceny se přitom počítá provize obchodníka a podle P4
+    // (`docs/ai/balicky-projekt-mesicu.md`) i vratka zůstatku při ukončení —
+    // obojí jsou peníze, které odejdou ven. Proto vlastní kniha, viz `credit.ts`.
+    //
+    // Čte vlastník a správci firmy, stejně jako `billing/current`: je to doklad
+    // o tom, co firma zaplatila, a patří do téhož okruhu lidí.
+    match /workspaces/{wid}/creditPurchases/{purchaseId} {
+      allow read: if isWsAdmin(wid);
+      allow write: if false;
+    }
+
     // Měsíční snímek, ze kterého vznikla faktura. Append-only.
     //
     // Sweep existující snímek NIKDY nepřepíše — cena se nesmí měnit zpětně

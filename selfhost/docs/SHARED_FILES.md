@@ -31,6 +31,31 @@ Companion CI se na obsah hlavního repa **nedostane**. Zvažovaly se tři cesty:
 | **`repository_dispatch` do hlavního repa** | ❌ Přesouvá problém, neřeší ho — odeslat dispatch do privátního repa taky chce token uložený **tady**. Navíc přijde výsledek asynchronně a PR by nic neblokoval. |
 | **Zrcadlené otisky v manifestu** | ✅ Zvoleno. Žádné tajemství, žádná síť, běží i na PR z forku. |
 
+## ⏳ Až bude companion privátní
+
+V plánu je companion překlopit na **privátní** — jeho veřejnost přestala být
+aktuální. Tahle tabulka tím dostává datum expirace, takže co platí kdy:
+
+**Nemění se nic na téhle zarážce.** `shared-files-check.mjs` porovnává proti
+manifestu v repu, ne přes síť. Nepředpokládá o viditelnosti companionu nic a
+běží stejně privátně jako veřejně.
+
+**Mění se důvod, proč tu manifest je.** Obě námitky proti tokenu (tajemství ve
+veřejném repu; PR z forku tajemství nedostane) padají naráz — privátní repo
+cizí forky nedostává a obě repa má **stejného vlastníka**, který je i jediný,
+kdo nasazuje. Token pak není ústupek, ale nejkratší cesta.
+
+**Cílový stav po překlopení:** read-only PAT do tajemství companionu, porovnávat
+**přímo** proti hlavnímu repu (`raw.githubusercontent.com` autorizaci hlavičkou
+`Bearer` přijímá) a manifest **zrušit**. Ušetří to přepočítávání otisků i celý
+`shared-files-sync.mjs`. Do té doby je manifest jediná varianta, která funguje
+bez tajemství ve veřejném repu.
+
+**Co se rozbije v den překlopení, když se nic neudělá:** zarážka v hlavním repu
+(`scripts/ci/shared-files-parity.mjs`) čte companion **bez tokenu**. Ta to pozná
+a řekne „companion nejde přečíst", ne „soubory chybí" — nápravou je doplnit
+`GH_TOKEN`, ne kontrolu vypnout.
+
 ## Co je červená a co jen varování
 
 Pořadí práce z `REPO_BOUNDARIES.md` je **„uprav companion → slouč ho → zrcadli

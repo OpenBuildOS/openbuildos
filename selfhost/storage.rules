@@ -170,3 +170,5 @@ service firebase.storage {
     }
   }
 }
+
+// zkušební změna sdíleného souboru

@@ -981,8 +981,6 @@ service cloud.firestore {
         ) && !projectFrozen(pid);
     }
 
-    // Firemní interní pracovní prostory jsou oddělené od oficiálních kolekcí,
-    // aby legacy list query nikdy nemíchaly obsah s rozdílnou viditelností.
     // REGISTR FIREM NA STAVBĚ — jen jméno a kontaktní osoba.
     //
     // ⚠️ POPIS, NE OPRÁVNĚNÍ. Ani `contactPrincipal` (kdo firmu na stavbě
@@ -998,6 +996,8 @@ service cloud.firestore {
       allow create, update, delete: if isWsAdmin(wid) && !projectFrozen(pid);
     }
 
+    // Firemní interní pracovní prostory jsou oddělené od oficiálních kolekcí,
+    // aby legacy list query nikdy nemíchaly obsah s rozdílnou viditelností.
     match /workspaces/{wid}/projects/{pid}/companySpaces/{companyId} {
       allow get: if isSameProjectCompany(wid, pid, companyId);
       allow list: if false;
@@ -1767,10 +1767,10 @@ service cloud.firestore {
       return request.resource.data.get('dataOwner', {}) == resource.data.get('dataOwner', {});
     }
 
-    function canTransferDataOwner() {
-      return resource.data.get('dataOwner', {}).get('principal', '') == principal()
-        || isWsOwner(resource.data.get('workspaceId', ''));
-    }
+    // 🪦 `canTransferDataOwner()` zrušena 18. 8. 2026 spolu s ovladačem
+    // „postoupit vlastnictví". Kdo smí NAVRHNOUT předání stavby, rozhoduje
+    // serverová funkce (`projectHandover.refuseProposeReason`) — pravidla
+    // k tomu nepotřebují nic, protože předání celé běží pod Admin SDK.
 
     // -------------------------------------------------------------------
     // Přeřazení UŽ PŘIJATÉHO člena správcem stavby (#507).
@@ -1881,9 +1881,15 @@ service cloud.firestore {
           isRealUser()
           && isWsAdmin(resource.data.get('workspaceId', ''))
           && request.resource.data.workspaceId == resource.data.workspaceId
-          // Vlastnictví dat je výjimka z „ws admin smí všechno": postoupit ho
-          // smí jen dosavadní vlastník nebo vlastník firmy (viz komentář výš).
-          && (dataOwnerUnchanged() || canTransferDataOwner())
+          // 🔴 Vlastnictví dat se z KLIENTA nemění vůbec — ani adminovi firmy.
+          // Zapisuje se jednou při založení (jako vlastní, viz `create` výš)
+          // a pak už ho přepisuje výhradně SERVER při dokončeném předání
+          // stavby (`acceptProjectHandover`). Do 18. 8. 2026 tudy vedla druhá
+          // cesta: „postoupit vlastnictví" jinému členovi téže stavby. Nic to
+          // nepřesunulo (stavba zůstala ve firmě) a plátce to nezměnilo
+          // (platí firma, rozhodnutí R1) — jen to vedle skutečného předání
+          // vypadalo jako druhý převod vlastnictví. Pole zůstává, ovladač ne.
+          && dataOwnerUnchanged()
           // 🔴 Náhrobek po `deleteProject` píše VÝHRADNĚ server. Z klientské
           // strany by to byl vypínač fakturace: `deleted` znamená „stavbu už
           // neúčtuj", a přepsat by si ho jinak mohl právě ten, kdo platí.
@@ -1914,20 +1920,6 @@ service cloud.firestore {
                        // o čem provozovatel neví. Viz
                        // docs/legal/PRILOHA_TESTOVACI_PROVOZ.md §3.
                        'observation'])
-        ) || (
-          // Postoupení vlastnictví DOSAVADNÍM vlastníkem — i když projekt vůbec
-          // nespravuje. Přesně to je scénář „projektant založí projekt v přípravě
-          // a později ho postoupí investorovi": projektant je na stavbě běžný
-          // koordinátor, ale data jsou jeho, dokud je nepředá.
-          //
-          // `hasOnly` (ne `!hasAny`): touhle větví se smí měnit VÝHRADNĚ
-          // vlastnictví. Kdyby to byl denylist, měl by vlastník bez `manage`
-          // najednou plný zápis do project docu.
-          isRealUser()
-          && resource.data.get('dataOwner', {}).get('principal', '') == principal()
-          && request.resource.data.workspaceId == resource.data.workspaceId
-          && request.resource.data.diff(resource.data).affectedKeys()
-              .hasOnly(['dataOwner', 'updatedAt'])
         ) || (
           // 🔴 Nález C2 (#535): `companies` v tomhle denylistu CHYBĚLO, takže si
           // správce stavby kdykoli přiřkl libovolnou firmu — a otevřel si tím

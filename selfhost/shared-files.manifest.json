@@ -17,14 +17,14 @@
     "repo": "trpaslik444/construct-cloud-sync",
     "doc": "docs/REPO_BOUNDARIES.md",
     "section": "Háček 1 — SDÍLENÉ soubory",
-    "ref": "5373ebc1ecad4c37c67c2a08a69da2844466cd81",
-    "date": "2026-08-17"
+    "ref": "d5e8af91c8ac1993fa28b3717f22e91553462b1d",
+    "date": "2026-08-18"
   },
   "shared": [
     {
       "main": "firestore.rules",
       "companion": "selfhost/firestore.rules",
-      "mainSha256": "eedacbec9a3f0dd1737c98c257ec40756b8df55ff086543453f72d6fa6276098"
+      "mainSha256": "d45d870f34686865d634b16eb2aea0841c2f1689e1771c208f6830008ce48d16"
     },
     {
       "main": "storage.rules",

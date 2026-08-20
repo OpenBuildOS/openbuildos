@@ -85,6 +85,17 @@ týdne vypne. Dělí se proto podle toho, **kdo to může spravit v tomhle PR**:
    ```
    Není to zaškrtávátko: pojmenuje konkrétní PR, který si člověk umí otevřít.
    Že se zrcadlení **opravdu** stalo, ověří bajt po bajtu CI hlavního repa.
+
+   ⚠️ **Ten řádek nesmí být obalený markdownem.** Zarážka hledá řádek začínající
+   `Mirror-to-main:`, takže `**Mirror-to-main:** …` neprojde — a hlášku dostaneš
+   takovou, jako bys zrcadlení vůbec nepřiznal (20. 8. 2026).
+
+   ⚠️ **Úprava těla PR sama o sobě kontrolu nespustí.** Workflow poslouchá jen
+   `opened`/`synchronize`/`reopened`, a `gh run rerun` přehraje PŮVODNÍ payload
+   i s původním tělem. Po opravě řádku tedy pushni commit, nebo PR zavři a znovu
+   otevři. Nouzový fallback na poslední commit tu nepomůže: na `pull_request`
+   běží CI nad MERGE commitem, takže `git log -1` vrátí „Merge … into …", ne
+   tvoji zprávu.
 3. Po sloučení zrcadli do hlavního repa a tam přepočítej otisky:
    ```
    npm run shared-files:sync

@@ -63,6 +63,14 @@ export interface ExpiredReport {
   sizeBytes?: number;
   /** Token sdílecího odkazu, ať po smazaném reportu nezůstane živý `/share/…`. */
   shareToken?: string;
+  /**
+   * Naskočila velikost reportu do počítadla spotřeby? Odečítá se JEN tehdy.
+   *
+   * 🔴 Přičtení na klientovi je best-effort a smí tiše selhat. Bezpodmínečný
+   * odečet by tedy u takového reportu ubral místo, které se nikdy nepřipočetlo,
+   * a počítadlo stavby by se trvale rozjelo směrem dolů.
+   */
+  usageCounted?: boolean;
 }
 
 /** Datová vrstva. Oddělená od admin SDK, ať jde úklid otestovat bez sítě. */
@@ -183,7 +191,10 @@ async function sweepOneReport(
     summary.deletedReports += 1;
 
     const bytes = typeof report.sizeBytes === "number" && Number.isFinite(report.sizeBytes) ? report.sizeBytes : 0;
-    if (bytes > 0) {
+    // `usageCounted !== true` schválně, ne `=== false`: chybějící pole (starší
+    // záznam, ruční zásah) znamená „nevíme", a u měřidla je nevědomost důvod
+    // neodečítat, ne odečíst naslepo.
+    if (bytes > 0 && report.usageCounted === true) {
       await store.addUsage(project, { storageBytes: -bytes });
       summary.freedBytes += bytes;
     }
@@ -263,6 +274,7 @@ export function createFirestoreReportStore(firestore: Firestore): ReportStore {
           storagePath: typeof data.storagePath === "string" ? data.storagePath : undefined,
           sizeBytes: typeof data.sizeBytes === "number" ? data.sizeBytes : undefined,
           shareToken: typeof data.shareToken === "string" ? data.shareToken : undefined,
+          usageCounted: data.usageCounted === true,
         };
       });
     },

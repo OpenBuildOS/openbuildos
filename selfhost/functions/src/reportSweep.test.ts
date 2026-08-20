@@ -68,7 +68,7 @@ test("smaže i sdílecí odkaz, ať po reportu nezůstane živý /share/…", as
 });
 
 test("🔴 odečet spotřeby visí na smazání ZÁZNAMU — když selže, spotřeba se neodečte", async () => {
-  const { store, usage } = makeStore([{ id: "r1", storagePath: "path", sizeBytes: 2_048 }], {
+  const { store, usage } = makeStore([{ id: "r1", storagePath: "path", sizeBytes: 2_048, usageCounted: true }], {
     async deleteReportDoc() {
       throw new Error("Firestore je pryč");
     },
@@ -84,10 +84,31 @@ test("🔴 odečet spotřeby visí na smazání ZÁZNAMU — když selže, spot�
   assert.equal(summary.freedBytes, 0);
 });
 
+test("🔴 report, u kterého se spotřeba nikdy nepřičetla, se NEODEČÍTÁ", async () => {
+  // Přičtení na klientovi je best-effort a smí tiše selhat. Kdyby se odečetlo
+  // i tak, počítadlo stavby by se trvale propadlo pod skutečnost.
+  const { store, usage } = makeStore([{ id: "r1", storagePath: "a", sizeBytes: 4_096, usageCounted: false }]);
+
+  const summary = await runReportSweep(store, { async deleteObjects() { return 1; } });
+
+  assert.deepEqual(usage, []);
+  assert.equal(summary.freedBytes, 0);
+  // Soubor i záznam ale zmizí — jen se nesahá na měřidlo.
+  assert.equal(summary.deletedReports, 1);
+});
+
+test("chybějící příznak se čte jako nevíme, a taky se neodečítá", async () => {
+  const { store, usage } = makeStore([{ id: "r1", storagePath: "a", sizeBytes: 4_096 }]);
+
+  await runReportSweep(store, { async deleteObjects() { return 1; } });
+
+  assert.deepEqual(usage, []);
+});
+
 test("úspěšný úklid odečte přesně velikost souboru, a to jednou", async () => {
   const { store, usage } = makeStore([
-    { id: "r1", storagePath: "a", sizeBytes: 1_000 },
-    { id: "r2", storagePath: "b", sizeBytes: 500 },
+    { id: "r1", storagePath: "a", sizeBytes: 1_000, usageCounted: true },
+    { id: "r2", storagePath: "b", sizeBytes: 500, usageCounted: true },
   ]);
 
   const summary = await runReportSweep(store, { async deleteObjects() { return 1; } });
@@ -98,7 +119,7 @@ test("úspěšný úklid odečte přesně velikost souboru, a to jednou", async 
 });
 
 test("záznam bez cesty k objektu úklid NEZHATÍ — jen se nemá co mazat", async () => {
-  const { store, calls } = makeStore([{ id: "r1", sizeBytes: 10 }]);
+  const { store, calls } = makeStore([{ id: "r1", sizeBytes: 10, usageCounted: true }]);
 
   const summary = await runReportSweep(store, makeStorage(calls));
 
@@ -165,7 +186,7 @@ test("nedostupné projekty skončí hlášeným selháním, ne tichým prázdný
 
 test("souhrn běhu nese závažnost podle výsledku — tichý log u mazání dat je jako žádný", async () => {
   const records: { severity: string; payload: Record<string, unknown> }[] = [];
-  const { store } = makeStore([{ id: "r1", storagePath: "a", sizeBytes: 5 }]);
+  const { store } = makeStore([{ id: "r1", storagePath: "a", sizeBytes: 5, usageCounted: true }]);
 
   await runReportSweep(store, { async deleteObjects() { return 1; } }, {
     onSummary: (record) => records.push(record),

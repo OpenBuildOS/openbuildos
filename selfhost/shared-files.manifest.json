@@ -17,14 +17,14 @@
     "repo": "trpaslik444/construct-cloud-sync",
     "doc": "docs/REPO_BOUNDARIES.md",
     "section": "Háček 1 — SDÍLENÉ soubory",
-    "ref": "d5e8af91c8ac1993fa28b3717f22e91553462b1d",
-    "date": "2026-08-18"
+    "ref": "0419fb9706a9c54c85bf526c92c5f616d5fdf5ff",
+    "date": "2026-08-20"
   },
   "shared": [
     {
       "main": "firestore.rules",
       "companion": "selfhost/firestore.rules",
-      "mainSha256": "d45d870f34686865d634b16eb2aea0841c2f1689e1771c208f6830008ce48d16"
+      "mainSha256": "fadcfa321a0187a75be13a0e00ae0cda9002599fd5127aae191d6f57728be42f"
     },
     {
       "main": "storage.rules",
@@ -65,6 +65,16 @@
       "main": "functions/src/trashSweep.test.ts",
       "companion": "selfhost/functions/src/trashSweep.test.ts",
       "mainSha256": "645755481fd4da41ef20c817f461db5b12f406ed6c7f3936ca6c42484d54026e"
+    },
+    {
+      "main": "functions/src/reportSweep.ts",
+      "companion": "selfhost/functions/src/reportSweep.ts",
+      "mainSha256": "6f6f87c9ab8b3e24c7e2346931e3b95f7a841f67e620369dba149f4999982b69"
+    },
+    {
+      "main": "functions/src/reportSweep.test.ts",
+      "companion": "selfhost/functions/src/reportSweep.test.ts",
+      "mainSha256": "6f714010296db5902360eb6c5a336b4a5480982bf3641c75f05ca884f00a14fa"
     },
     {
       "main": "functions/src/shareLinkRotation.ts",

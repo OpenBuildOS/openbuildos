@@ -768,6 +768,64 @@ export const syncMemberClaims = onCall<
 });
 
 /**
+ * `promoteUnapprovedDrawingOnUpload` — výkres nahraný na stavbě BEZ schvalování.
+ *
+ * 🔑 Proč druhý trigger, a ne `retry`/`onDocumentWritten` u toho vedle:
+ * `promoteApprovedDrawingToPlan` je `onDocumentUpdated` a pojistkou proti
+ * zacyklení mu je `before.status !== after.status`. Jenže stavba s vypnutým
+ * schvalováním (`projects/{pid}.documentApproval === "off"`) zakládá revizi
+ * rovnou jako `approved` — a tam žádný přechod stavu NENASTANE, dokument se
+ * jen vytvoří. Bez tohohle triggeru by taková firma měla trvale prázdné Plány
+ * a nedozvěděla se proč. Přepsat sousedovi podmínku na `onDocumentWritten` by
+ * naopak znamenalo sáhnout na cestu, kterou dnes chodí každé schválení.
+ *
+ * Rozhodování i zápis dělá TÁŽ funkce `promoteApprovedDrawing` (idempotentní,
+ * zamyká se markerem `planPromotion`), takže obě cesty vyrábějí stejný výkres.
+ * Region se ze stejného důvodu jako u souseda NEURČUJE.
+ */
+export const promoteUnapprovedDrawingOnUpload = onDocumentCreated(
+  {
+    document: "workspaces/{workspaceId}/projects/{projectId}/documentVersions/{versionId}",
+  },
+  async (event) => {
+    const created = event.data?.data();
+    // `isApprovalTransition(undefined, status)` = „vzniklo rovnou ve schváleném
+    // stavu". Revize založená jako `draft` (stavba SE schvalováním) sem nespadne
+    // a počká na schvalovatele, jak má.
+    if (!created || !isApprovalTransition(undefined, created.status)) {
+      return;
+    }
+
+    const { workspaceId, projectId, versionId } = event.params;
+
+    try {
+      const result = await promoteApprovedDrawing(getFirestore(getLocalApp()), {
+        workspaceId,
+        projectId,
+        versionId,
+      });
+      logger.info("promoteUnapprovedDrawingOnUpload", { workspaceId, projectId, versionId, ...result });
+    } catch (error) {
+      logger.error("promoteUnapprovedDrawingOnUpload selhalo", { workspaceId, projectId, versionId, error });
+      await getFirestore(getLocalApp())
+        .doc(`workspaces/${workspaceId}/projects/${projectId}/documentVersions/${versionId}`)
+        .set(
+          {
+            planPromotion: {
+              status: "failed",
+              reason: error instanceof Error ? error.message : String(error),
+              at: new Date().toISOString(),
+            },
+          },
+          { merge: true }
+        )
+        .catch(() => undefined);
+      throw error;
+    }
+  }
+);
+
+/**
  * `promoteApprovedDrawingToPlan` — schválený jednostránkový výkres se povýší
  * do Plánů na SERVERU (#506, fáze 2).
  *

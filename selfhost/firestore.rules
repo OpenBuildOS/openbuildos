@@ -2175,6 +2175,34 @@ service cloud.firestore {
       allow update, delete: if false;
     }
 
+    // Evidence vygenerovaných PDF reportů (`src/services/reporting/reportRecords.ts`).
+    //
+    // ⭐ PROČ VŮBEC. Sdílení reportu nahraje PDF do Storage pod náhodné id. Bez
+    // evidence o tom souboru neexistoval žádný zápis: nikdo nevěděl, že tam je,
+    // kolik zabírá ani kdo ho vyrobil. Zneplatnění odkazu rotuje download token,
+    // takže adresa umře — ale soubor leží dál a platí se za něj. Záznam nese
+    // `storagePath`, `sizeBytes` a `purgeAt`, podle kterých ho po 90 dnech
+    // uklidí naplánovaná funkce a odečte ze spotřeby stavby.
+    //
+    // ⚠️ `create, update` — NIKDY `write`. `allow write` pokrývá i delete a
+    // s `allow delete: if false` níž by se OR-oval (souběžné allow větve se
+    // skládají SJEDNOCENÍM, ne průnikem), takže by zákaz mazání byl pouhá
+    // dekorace a evidence by šla zahladit smazáním záznamu. Stejná past jako
+    // u `projects/{pid}/usage/{docId}` výš.
+    //
+    // Mazat smí JEN server (admin SDK pravidla obchází) — klient, který by směl
+    // záznam smazat, by tím zároveň schoval soubor před úklidem. Zneplatnění
+    // odkazu proto jen přepíná `revoked`, nemaže.
+    //
+    // Zápis je na úrovni ČLENSTVÍ, ne `canEditContent`: report smí vygenerovat
+    // a sdílet každý, kdo na stavbu vidí, a evidence, která se nezapíše, je
+    // horší než evidence od přispěvatele.
+    match /projects/{pid}/reports/{reportId} {
+      allow read: if isProjectMember(projectData(pid).get('workspaceId', ''), pid);
+      allow create, update: if isProjectMember(projectData(pid).get('workspaceId', ''), pid);
+      allow delete: if false;
+    }
+
     // Legacy annotation blobs -- superseded by
     // workspaces/{wid}/projects/{pid}/planAnnotations.
     match /plan_annotations/{docId} {

@@ -87,6 +87,9 @@ const ALLOWED_ORIGINS = new Set<string>([
   "https://openbuildos.org",
   "https://www.openbuildos.org",
   "https://app.openbuildos.org",
+  // ⚠️ STAGING OpenBuildOS tu SCHVÁLNĚ NENÍ, i když ho hlavní repo má.
+  // Firemní backend nemá důvod pouštět náš zkušební frontend ke svým datům —
+  // seznam se jinak drží shodný s hlavním repem, tohle je jediná odchylka.
   "http://localhost:5173",
 ]);
 

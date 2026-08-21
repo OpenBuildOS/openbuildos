@@ -1662,15 +1662,71 @@ service cloud.firestore {
     // The token (doc id) is the secret, so `get` is public: an unauthenticated
     // recipient holding the link reads exactly that one record (title + a
     // already-public file URL -- never sensitive metadata). Listing requires
-    // membership (managing share links), and only editors+ may create/revoke.
+    // membership (managing share links), and editors+ may create/revoke
+    // anything.
+    //
+    // ⭐ VÝJIMKA: VLASTNÍ REPORT SMÍ SDÍLET I ČLEN (`contribute`), 21. 8. 2026.
+    //
+    // Do té doby chtělo založení odkazu `edit` u všech typů, takže role Člen
+    // dostala na tlačítku „Sdílet odkaz" holé `Missing or insufficient
+    // permissions` — přestože komentář u `projects/{pid}/reports` slibuje, že
+    // report smí vygenerovat a sdílet každý, kdo na stavbu vidí.
+    //
+    // 🔴 A hlavně: ten zákaz NIC NECHRÁNIL. Člen si tentýž PDF stáhne
+    // tlačítkem vedle a pošle ho e-mailem, a nahrát ho do Storage taky smí —
+    // `storage.rules` pouští zakládání nových objektů každému členu projektu.
+    // Blokoval se tedy jediný článek řetězu, ukazatel; data byla venku tak jako
+    // tak. Výsledkem nebylo bezpečí, jen rozbitá funkce.
+    //
+    // Rozsah je proto co nejužší, ve stejném duchu jako `canCreateWith`
+    // (zakládat smí `contribute`, ale JEN se sebou jako autorem):
+    //  - jen `type == 'report'` — fotky a dokumenty dál chtějí `edit`,
+    //  - jen s vlastním `createdBy` (žádné sdílení „za někoho jiného"),
+    //  - `update` (= zneplatnění) jen nad SVÝM reportem a typ ani autor se
+    //    přepsat nedají, takže se z cizího odkazu nedá udělat vlastní,
+    //  - `delete` zůstává na `edit`: mazání záznamu je správa cizí stopy.
     // ---------------------------------------------------------------------
+
+    // 🔴 `type` JE JEN ŠTÍTEK OD KLIENTA, proto se ověřuje i CESTA souboru.
+    //
+    // Bez toho by si člen mohl založit odkaz s `type: 'report'` a `fileUrl`
+    // ukazujícím na fotku nebo dokument — a vydat tak přes `/share` obsah,
+    // který sdílet nesmí. Download URL nese cestu objektu URL-kódovanou
+    // (`…/o/workspaces%2F{wid}%2Fprojects%2F{pid}%2Freports%2F…`, viz
+    // `uploadAndShareReport`), takže se dá vymáhat, že jde opravdu o report
+    // TÉHLE stavby.
+    //
+    // Padá to na bezpečnou stranu: kdyby se tvar adresy někdy změnil, členovi
+    // sdílení přestane fungovat — nezpřístupní se nic navíc. Editorů se to
+    // netýká, ti mají `canEdit` a vlastní větev.
+    function reportObjectUrl(wid, pid, data) {
+      return data.get('fileUrl', '').matches(
+        '.*workspaces%2F' + wid + '%2Fprojects%2F' + pid + '%2Freports%2F.*'
+      );
+    }
+
+    function ownReportShare(wid, pid, data) {
+      return data.get('type', '') == 'report'
+        && data.get('createdBy', '') == principal()
+        && reportObjectUrl(wid, pid, data);
+    }
 
     match /workspaces/{wid}/projects/{pid}/shareLinks/{token} {
       allow get: if true;
       allow list: if isProjectMember(wid, pid);
-      allow create, update, delete: if (
+      allow create: if (
           canEdit(wid, pid)
+          || (isProjectMember(wid, pid) && ownReportShare(wid, pid, request.resource.data))
         ) && !projectFrozen(pid);
+      allow update: if (
+          canEdit(wid, pid)
+          || (
+            isProjectMember(wid, pid)
+            && ownReportShare(wid, pid, resource.data)
+            && ownReportShare(wid, pid, request.resource.data)
+          )
+        ) && !projectFrozen(pid);
+      allow delete: if canEdit(wid, pid) && !projectFrozen(pid);
     }
 
     // ---------------------------------------------------------------------
@@ -2197,9 +2253,15 @@ service cloud.firestore {
     // Zápis je na úrovni ČLENSTVÍ, ne `canEditContent`: report smí vygenerovat
     // a sdílet každý, kdo na stavbu vidí, a evidence, která se nezapíše, je
     // horší než evidence od přispěvatele.
-    match /projects/{pid}/reports/{reportId} {
-      allow read: if isProjectMember(projectData(pid).get('workspaceId', ''), pid);
-      allow create, update: if isProjectMember(projectData(pid).get('workspaceId', ''), pid);
+    //
+    // 🔴 CESTA JE POD `workspaces/{wid}/…`, ne pod kořenovým `projects/{pid}/…`.
+    // Sousední `projects/{pid}/usage/**` opravdu leží v kořeni, a při psaní se
+    // spolu s místem zkopírovala i jeho cesta — pravidlo pak hlídalo kolekci,
+    // na kterou nikdo nepíše, a skutečný zápis padal do výchozího deny. Tvar
+    // drží `reportsCollectionPath()` a `functions/src/reportSweep.ts`.
+    match /workspaces/{wid}/projects/{pid}/reports/{reportId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update: if isProjectMember(wid, pid) && !projectFrozen(pid);
       allow delete: if false;
     }
 
@@ -2214,8 +2276,9 @@ service cloud.firestore {
     // smazáním se nedá nic schovat před úklidem. Kdo si ji založil, má ji umět
     // i uklidit — jinak by seznam během měsíce zarostl a jediná cesta ven by
     // vedla přes podporu.
-    match /projects/{pid}/reportTemplates/{templateId} {
-      allow read, create, update, delete: if isProjectMember(projectData(pid).get('workspaceId', ''), pid);
+    match /workspaces/{wid}/projects/{pid}/reportTemplates/{templateId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if isProjectMember(wid, pid) && !projectFrozen(pid);
     }
 
     // Legacy annotation blobs -- superseded by

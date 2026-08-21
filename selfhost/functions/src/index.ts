@@ -87,6 +87,13 @@ const ALLOWED_ORIGINS = new Set<string>([
   "https://openbuildos.org",
   "https://www.openbuildos.org",
   "https://app.openbuildos.org",
+  // 🔴 STAGING TU MUSÍ BÝT. Když origin v seznamu není, `resolveCorsOrigin`
+  // vrátí bezpečný default (produkční doménu) — prohlížeč pak preflight
+  // odmítne a token-exchange NEPROBĚHNE. Výsledkem není hláška „nemáte
+  // právo", ale rozsypaná appka: workspace klient zůstane nepřihlášený, takže
+  // tiše selže všechno, co sahá na firemní data (21. 8. 2026 se to projevilo
+  // jako „nejde uložit šablona reportu").
+  "https://openbuildos-staging.web.app",
   "http://localhost:5173",
 ]);
 

@@ -2197,9 +2197,15 @@ service cloud.firestore {
     // Zápis je na úrovni ČLENSTVÍ, ne `canEditContent`: report smí vygenerovat
     // a sdílet každý, kdo na stavbu vidí, a evidence, která se nezapíše, je
     // horší než evidence od přispěvatele.
-    match /projects/{pid}/reports/{reportId} {
-      allow read: if isProjectMember(projectData(pid).get('workspaceId', ''), pid);
-      allow create, update: if isProjectMember(projectData(pid).get('workspaceId', ''), pid);
+    //
+    // 🔴 CESTA JE POD `workspaces/{wid}/…`, ne pod kořenovým `projects/{pid}/…`.
+    // Sousední `projects/{pid}/usage/**` opravdu leží v kořeni, a při psaní se
+    // spolu s místem zkopírovala i jeho cesta — pravidlo pak hlídalo kolekci,
+    // na kterou nikdo nepíše, a skutečný zápis padal do výchozího deny. Tvar
+    // drží `reportsCollectionPath()` a `functions/src/reportSweep.ts`.
+    match /workspaces/{wid}/projects/{pid}/reports/{reportId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update: if isProjectMember(wid, pid) && !projectFrozen(pid);
       allow delete: if false;
     }
 
@@ -2214,8 +2220,9 @@ service cloud.firestore {
     // smazáním se nedá nic schovat před úklidem. Kdo si ji založil, má ji umět
     // i uklidit — jinak by seznam během měsíce zarostl a jediná cesta ven by
     // vedla přes podporu.
-    match /projects/{pid}/reportTemplates/{templateId} {
-      allow read, create, update, delete: if isProjectMember(projectData(pid).get('workspaceId', ''), pid);
+    match /workspaces/{wid}/projects/{pid}/reportTemplates/{templateId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if isProjectMember(wid, pid) && !projectFrozen(pid);
     }
 
     // Legacy annotation blobs -- superseded by

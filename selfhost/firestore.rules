@@ -1687,8 +1687,28 @@ service cloud.firestore {
     //  - `delete` zůstává na `edit`: mazání záznamu je správa cizí stopy.
     // ---------------------------------------------------------------------
 
-    function ownReportShare(data) {
-      return data.get('type', '') == 'report' && data.get('createdBy', '') == principal();
+    // 🔴 `type` JE JEN ŠTÍTEK OD KLIENTA, proto se ověřuje i CESTA souboru.
+    //
+    // Bez toho by si člen mohl založit odkaz s `type: 'report'` a `fileUrl`
+    // ukazujícím na fotku nebo dokument — a vydat tak přes `/share` obsah,
+    // který sdílet nesmí. Download URL nese cestu objektu URL-kódovanou
+    // (`…/o/workspaces%2F{wid}%2Fprojects%2F{pid}%2Freports%2F…`, viz
+    // `uploadAndShareReport`), takže se dá vymáhat, že jde opravdu o report
+    // TÉHLE stavby.
+    //
+    // Padá to na bezpečnou stranu: kdyby se tvar adresy někdy změnil, členovi
+    // sdílení přestane fungovat — nezpřístupní se nic navíc. Editorů se to
+    // netýká, ti mají `canEdit` a vlastní větev.
+    function reportObjectUrl(wid, pid, data) {
+      return data.get('fileUrl', '').matches(
+        '.*workspaces%2F' + wid + '%2Fprojects%2F' + pid + '%2Freports%2F.*'
+      );
+    }
+
+    function ownReportShare(wid, pid, data) {
+      return data.get('type', '') == 'report'
+        && data.get('createdBy', '') == principal()
+        && reportObjectUrl(wid, pid, data);
     }
 
     match /workspaces/{wid}/projects/{pid}/shareLinks/{token} {
@@ -1696,14 +1716,14 @@ service cloud.firestore {
       allow list: if isProjectMember(wid, pid);
       allow create: if (
           canEdit(wid, pid)
-          || (isProjectMember(wid, pid) && ownReportShare(request.resource.data))
+          || (isProjectMember(wid, pid) && ownReportShare(wid, pid, request.resource.data))
         ) && !projectFrozen(pid);
       allow update: if (
           canEdit(wid, pid)
           || (
             isProjectMember(wid, pid)
-            && ownReportShare(resource.data)
-            && ownReportShare(request.resource.data)
+            && ownReportShare(wid, pid, resource.data)
+            && ownReportShare(wid, pid, request.resource.data)
           )
         ) && !projectFrozen(pid);
       allow delete: if canEdit(wid, pid) && !projectFrozen(pid);

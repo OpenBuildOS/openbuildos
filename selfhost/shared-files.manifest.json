@@ -24,7 +24,7 @@
     {
       "main": "firestore.rules",
       "companion": "selfhost/firestore.rules",
-      "mainSha256": "20bf67c53b30e50d418c1773988bbc65a6badbf59bb668febb13349bd7b3eabb"
+      "mainSha256": "5d12298cc2e484cd6cf55579d0103c68eb54af8f89fa76ee8d1c78035647cd6f"
     },
     {
       "main": "storage.rules",

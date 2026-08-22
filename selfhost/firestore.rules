@@ -145,14 +145,22 @@ service cloud.firestore {
     //   edit       mění CIZÍ obsah
     //   certify    schvaluje revize dokumentů a ověřuje úkoly (verified)
     //   publish    vydává do OFICIÁLNÍ dokumentace
+    //   diary      ČTE A VEDE stavební deník (diaryEntries)
     //   manage     spravuje členy a nastavení projektu
     //
     // 🔑 `certify` NEVYŽADUJE `edit`. To je celý smysl přestavby.
     //
     // Zdroje: role z `projects/{pid}.roles[principal]` (jediný zdroj, který
-    // vynucují pravidla) + dva ORTOGONÁLNÍ flagy ze zrcadla členů
-    // (`canApprove` → certify, `canPublishOfficial` → publish). Vlastník/admin
-    // firmy má na svých projektech vše.
+    // vynucují pravidla) + ORTOGONÁLNÍ flagy ze zrcadla členů
+    // (`canApprove` → certify, `canPublishOfficial` → publish,
+    // `canWriteDiary` → diary). Vlastník/admin firmy má na svých projektech vše.
+    //
+    // 📓 `diary` (22. 8. 2026): stavební deník byl do té doby čitelný pro
+    // KAŽDÉHO člena stavby a zapisovatelný každým, kdo měl `contribute` —
+    // tedy i pro pracovníka a subdodavatele. § 166 odst. 2 zák. 283/2021 Sb.
+    // ale vyjmenovává zapisovatele TAXATIVNĚ. Stavbu vedoucí role (`admin`,
+    // `editor`) mají `diary` z role; TDI a projektant, kteří editory obsahu
+    // nejsou, ho dostanou flagem `canWriteDiary`.
     //
     // ⚠️ ZRCADLO tohohle modelu na klientu je `src/lib/permissions/projectPermissions.ts`.
     // Když měníš jedno, měň obojí — a přidej rules test do tests/rules/firestore.permissions.test.ts.
@@ -174,11 +182,11 @@ service cloud.firestore {
     // členovi s legacy hodnotou v `roles` bychom vzali zakládání obsahu.
     function rolePermissions(role) {
       return role == 'admin'
-          ? ['read', 'contribute', 'edit', 'certify', 'publish', 'manage']
+          ? ['read', 'contribute', 'edit', 'certify', 'publish', 'diary', 'manage']
         : role == 'editor'
-          ? ['read', 'contribute', 'edit', 'publish']
+          ? ['read', 'contribute', 'edit', 'publish', 'diary']
         : role == 'company_lead'
-          ? ['read', 'contribute', 'edit']
+          ? ['read', 'contribute', 'edit', 'diary']
         : role == 'reader'
           ? ['read']
         : ['read', 'contribute'];
@@ -192,13 +200,25 @@ service cloud.firestore {
     // bez něj by `get()` na chybějící dokument byl chybový výraz a jeho
     // vyhodnocení by záviselo na pořadí větví v `||`. Cesta se v rámci requestu
     // cachuje, takže je to nejvýš jedno čtení navíc.
+    //
+    // 🔴 `let`, NE tři opisy `get(memberMirrorPath(...)).data`. Dokument se sice
+    // cachuje, ale KAŽDÝ opis se počítá do stropu 1000 výrazů na požadavek —
+    // a ten je společný pro celou dávku. Když k `canApprove`
+    // a `canPublishOfficial` přibyl třetí flag (`canWriteDiary`), rozepsaná
+    // varianta ten strop okamžitě přerazila na cestě POZVÁNEK (`redeemOk` je
+    // na něm dlouhodobě nejblíž) a projevila se jako permission-denied, tedy
+    // k nerozeznání od chybějícího práva. `let` drží tři flagy za CENU JEDNOHO
+    // čtení — je to levnější než stav před přidáním flagu.
     function memberFlagPermissions(wid, pid) {
-      return exists(memberMirrorPath(wid, pid))
-        ? (get(memberMirrorPath(wid, pid)).data.get('canApprove', false) == true
-             ? ['certify'] : [])
-          .concat(get(memberMirrorPath(wid, pid)).data.get('canPublishOfficial', false) == true
-             ? ['publish'] : [])
-        : [];
+      let mirror = memberMirrorPath(wid, pid);
+      return exists(mirror) ? memberFlagsOf(get(mirror).data) : [];
+    }
+
+    /** Flagy zrcadla → seznam oprávnění. Oddělené, ať se `get()` volá jednou. */
+    function memberFlagsOf(mirrorData) {
+      return (mirrorData.get('canApprove', false) == true ? ['certify'] : [])
+        .concat(mirrorData.get('canPublishOfficial', false) == true ? ['publish'] : [])
+        .concat(mirrorData.get('canWriteDiary', false) == true ? ['diary'] : []);
     }
 
     // 🔴 VÝKONNOSTNÍ MEZ: Firestore vyhodnotí nejvýš 1000 výrazů na požadavek.
@@ -269,7 +289,7 @@ service cloud.firestore {
     function permsOf(wid, pid) {
       return isProjectMember(wid, pid)
         ? (isWsAdmin(wid)
-            ? ['read', 'contribute', 'edit', 'certify', 'publish', 'manage']
+            ? ['read', 'contribute', 'edit', 'certify', 'publish', 'diary', 'manage']
             : rolePermissions(projectRole(pid)).concat(memberFlagPermissions(wid, pid)))
         : [];
     }
@@ -571,6 +591,14 @@ service cloud.firestore {
 
     function canCreateContent(wid, pid) {
       return canCreateWith(permsOf(wid, pid)) && !projectFrozen(pid);
+    }
+
+    // Zápis do STAVEBNÍHO DENÍKU. `diary` je vstupenka do deníku vůbec
+    // (drží ji stavbu vedoucí role a držitelé flagu `canWriteDiary`); cizí
+    // zápis navíc přepíše jen `edit`. Bere hotový seznam oprávnění, ne
+    // `wid`/`pid` — volající ho už jednou spočítal (viz `permsOf`).
+    function diaryWriteOk(perms, ownEntry) {
+      return perms.hasAny(['diary']) && (ownEntry || perms.hasAny(['edit']));
     }
 
     // Anti-spoof atribuce firmě u oficiálních dokumentů: `ownerCompanyId` na create
@@ -1486,12 +1514,30 @@ service cloud.firestore {
       allow delete: if canModifyContent(wid, pid);
     }
 
+    // STAVEBNÍ DENÍK — jediná kolekce, kde o přístupu rozhoduje `diary`,
+    // a to i na ČTENÍ. Deník není pracovní poznámka: § 166 odst. 2 zák.
+    // 283/2021 Sb. vyjmenovává zapisovatele taxativně a jeho obsah je podklad
+    // pro fakturaci i spory. Do 22. 8. 2026 ho tu četl každý člen stavby
+    // a zapisoval každý s `contribute` — tedy i pracovník a subdodavatel,
+    // kteří do něj zapisovat nesmějí. Hlasový zápis TÉHOŽ deníku přitom už
+    // dávno chtěl `edit`; byly to dvě cesty do jednoho dokumentu s různým
+    // právem.
+    //
+    // ⚠️ `permsOf()` se volá JEDNOU za pravidlo a předává se dál jako seznam
+    // (`diaryWriteOk`). `allow` neumí `let` a každé další volání je celý
+    // výpočet znovu — na stropu 1000 výrazů na požadavek už na tom pravidla
+    // jednou stála (viz komentář u `permsOf`).
     match /workspaces/{wid}/projects/{pid}/diaryEntries/{docId} {
-      allow read: if isProjectMember(wid, pid);
-      allow create: if canCreateContent(wid, pid);
-      allow update: if canModifyContent(wid, pid)
-        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '');  // author immutable
-      allow delete: if canModifyContent(wid, pid);
+      allow read: if permsOf(wid, pid).hasAny(['diary']);
+      allow create: if diaryWriteOk(permsOf(wid, pid), true)
+        && (request.resource.data.get('createdBy', '') == ''
+            || request.resource.data.get('createdBy', '') == principal())
+        && !projectFrozen(pid);
+      allow update: if diaryWriteOk(permsOf(wid, pid), resource.data.get('createdBy', '') == principal())
+        && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')  // author immutable
+        && !projectFrozen(pid);
+      allow delete: if diaryWriteOk(permsOf(wid, pid), resource.data.get('createdBy', '') == principal())
+        && !projectFrozen(pid);
     }
 
     // ---------------------------------------------------------------------
@@ -1514,11 +1560,13 @@ service cloud.firestore {
     // prázdné, takže by cizí přepisy vydal obyčejný dotaz. Přímý přístup
     // k poli tenhle tvar odmítne a vynutí dotaz filtrovaný na vlastní záznamy.
     //
-    // ZAKLÁDAT smí jen `edit`+ (fáze 1 cílí na management — stavbyvedoucí
-    // a mistr, tedy ty role, které deník vést musí ze zákona; § 166 odst. 2
-    // zák. 283/2021 Sb. vyjmenovává zapisovatele taxativně). Až se funkce
-    // otevře řemeslníkům, bude to znamenat i per-projektový seznam osob
-    // oprávněných zapisovat — a teprve tehdy se tenhle práh smí povolit.
+    // ZAKLÁDAT smí držitel `diary` — tedy ten, kdo smí zapisovat do deníku
+    // samotného (§ 166 odst. 2 zák. 283/2021 Sb. vyjmenovává zapisovatele
+    // taxativně). Do 22. 8. 2026 tu stálo `edit`, což byl tehdejší nejbližší
+    // dostupný práh: „management" se dal vyjádřit jedině právem měnit cizí
+    // obsah. Tím ale hlasovka minula TDI a projektanta, kteří do deníku
+    // zapisovat SMĚJÍ, a naopak by ji dostal každý editor. `diary` je totéž
+    // rozhodnutí vyjádřené přímo, ne oklikou přes editaci obsahu.
     //
     // ⚠️ ZVUK SEM NEPATŘÍ a nikam jinam taky ne. Nahrávka nese identitu,
     // přízvuk, emoci a hlasy třetích osob v pozadí, kterým nikdo nic neřekl.
@@ -1530,7 +1578,7 @@ service cloud.firestore {
       allow list: if isProjectMember(wid, pid)
         && resource.data.ownerPrincipal == principal();
       allow create: if (
-          canEdit(wid, pid)
+          permsOf(wid, pid).hasAny(['diary'])
         && request.resource.data.get('ownerPrincipal', '') == principal()
         ) && !projectFrozen(pid);
       // Okno na opravu (§9) — do konce dne smí autor svůj zápis upravit nebo

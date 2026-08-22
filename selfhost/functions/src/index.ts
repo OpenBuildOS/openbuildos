@@ -5,6 +5,7 @@ import { getStorage } from "firebase-admin/storage";
 import { HttpsError, onCall, onRequest, type Request } from "firebase-functions/v2/https";
 import { onDocumentCreated, onDocumentUpdated } from "firebase-functions/v2/firestore";
 import { onSchedule } from "firebase-functions/v2/scheduler";
+import { runInviteSweep } from "./inviteSweep";
 import * as logger from "firebase-functions/logger";
 import type { Response } from "express";
 
@@ -975,6 +976,71 @@ export const sweepExpiredTrash = onSchedule(
         onError: (message, error) => logger.warn(message, { error }),
         // Jediná stopa, kterou po sobě běh nechá — návratovou hodnotu tu nikdo nečte.
         onSummary: logSweepSummary,
+      }
+    );
+  }
+);
+
+/**
+ * Úklid dožilých pozvánek do stavby (`workspaces/{wid}/invites`) — DENNĚ.
+ *
+ * 🔴 Pozvánka je bearer token: id v odkazu je celé tajemství. Uplatnit prošlou
+ * nešlo nikdy, ale dokument zůstával ležet a `allow get` ho vydával komukoli,
+ * kdo odkaz držel — i po roce, i s `inviteeEmail` a `inviteeName`. Pravidla to
+ * od 22. 8. 2026 zavírají, tenhle běh dělá druhou půlku: záznam po odkladu
+ * smaže, takže tu není ani pro budoucí chybu v pravidlech.
+ *
+ * 04:50 — za share linky (4:20), ať si běhy nesahají na tytéž firmy najednou.
+ */
+export const sweepDeadInvites = onSchedule(
+  {
+    schedule: "50 4 * * *",
+    timeZone: "Europe/Prague",
+    region: "europe-west1",
+    timeoutSeconds: 540,
+  },
+  async () => {
+    const firestore = getFirestore(getLocalApp());
+    await runInviteSweep(
+      {
+        async listWorkspaceIds() {
+          const refs = await firestore.collection("workspaces").listDocuments();
+          return refs.map((ref) => ref.id);
+        },
+        async listExpired(workspaceId, before, limit) {
+          // Spodní mez není kosmetika: Firestore řadí `null` PŘED timestampy,
+          // takže samotné `expiresAt <= before` by vytáhlo i pozvánky bez
+          // platnosti. Stejná past jako v `trashSweep.ts`.
+          const snapshot = await firestore
+            .collection(`workspaces/${workspaceId}/invites`)
+            .where("expiresAt", ">", new Date(0))
+            .where("expiresAt", "<=", before)
+            .limit(limit)
+            .get();
+          return snapshot.docs.map((doc) => doc.id);
+        },
+        async listUsed(workspaceId, before, limit) {
+          const snapshot = await firestore
+            .collection(`workspaces/${workspaceId}/invites`)
+            .where("usedAt", ">", new Date(0))
+            .where("usedAt", "<=", before)
+            .limit(limit)
+            .get();
+          return snapshot.docs.map((doc) => doc.id);
+        },
+        async deleteInvite(workspaceId, token) {
+          await firestore.doc(`workspaces/${workspaceId}/invites/${token}`).delete();
+        },
+      },
+      {
+        onError: (message, error) => logger.warn(message, { error }),
+        onSummary: (record) => {
+          if (record.severity === "warning") {
+            logger.warn(record.message, record.payload);
+            return;
+          }
+          logger.info(record.message, record.payload);
+        },
       }
     );
   }

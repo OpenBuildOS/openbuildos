@@ -30,6 +30,7 @@ interface Recorded {
   deletedVersions: string[];
   deletedObjects: string[];
   usage: UsageDelta[];
+  deletedPinsFor: string[];
 }
 
 function makeStore(
@@ -38,9 +39,16 @@ function makeStore(
     versions?: VersionRecord[];
     plans?: PlanFileReferences | null;
     projects?: ProjectRef[];
+    pinsPerPhoto?: number;
   } = {}
 ): { store: TrashStore; storage: TrashStorage; recorded: Recorded } {
-  const recorded: Recorded = { deletedDocs: [], deletedVersions: [], deletedObjects: [], usage: [] };
+  const recorded: Recorded = {
+    deletedDocs: [],
+    deletedVersions: [],
+    deletedObjects: [],
+    usage: [],
+    deletedPinsFor: [],
+  };
 
   const store: TrashStore = {
     listProjects: async () => overrides.projects ?? [PROJECT],
@@ -52,6 +60,10 @@ function makeStore(
         : overrides.plans,
     deleteContentDoc: async (_project, type, id) => {
       recorded.deletedDocs.push(`${type}/${id}`);
+    },
+    deletePinsForPhoto: async (_project, photoId) => {
+      recorded.deletedPinsFor.push(photoId);
+      return overrides.pinsPerPhoto ?? 0;
     },
     deleteVersionDoc: async (_project, versionId) => {
       recorded.deletedVersions.push(versionId);
@@ -411,4 +423,31 @@ test("chybějící objekt (404) není chyba, ostatní se ohlásí a nevyhodí", 
   assert.deepEqual(attempted, ["a/ok.jpg", "a/missing.jpg", "a/denied.jpg"]);
   assert.equal(deleted, 1);
   assert.equal(errors.length, 1);
+});
+
+/**
+ * 🔴 PIN BEZ FOTKY JE ROZBITÁ DLAŽDICE. Pin je připnutí fotky do kontextu
+ * (úkol, výkres) a nese vlastní kresbu. Když doběh smazal fotku a piny nechal,
+ * zůstal na úkolu záznam odkazující na `photoId`, které už neexistuje: prázdné
+ * místo, které nejde otevřít ani odstranit. Klient má `deletePinsForPhoto()`,
+ * ale doběh běží na serveru a nikdo ho odtud nevolá.
+ */
+test("fotka: kaskádou zmizí i její piny", async () => {
+  const { store, storage, recorded } = makeStore({
+    expired: [{ type: "photo", id: "ph-1", storagePath: "workspaces/ws/photos/a.jpg" }],
+  });
+
+  await sweepExpiredTrash(store, storage, { now: NOW });
+
+  assert.deepEqual(recorded.deletedPinsFor, ["ph-1"]);
+});
+
+test("úkol ani dokument piny neřeší (nemá je co mít)", async () => {
+  const { store, storage, recorded } = makeStore({
+    expired: [{ type: "task", id: "t-1" }],
+  });
+
+  await sweepExpiredTrash(store, storage, { now: NOW });
+
+  assert.deepEqual(recorded.deletedPinsFor, [], "kaskáda patří jen k fotce");
 });

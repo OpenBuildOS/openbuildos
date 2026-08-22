@@ -855,8 +855,30 @@ service cloud.firestore {
     }
 
     match /workspaces/{wid}/invites/{inviteId} {
-      // The invite id itself is the secret; any real user holding it may read.
-      allow get: if isRealUser();
+      // The invite id itself is the secret; any real user holding it may read —
+      // ale JEN dokud pozvánka žije.
+      //
+      // 🔴 Do 22. 8. 2026 tu stálo pouhé `isRealUser()`. Uplatnit prošlou
+      // pozvánku nešlo (`allow update` níž má `request.time < expiresAt`),
+      // jenže ČÍST ji šlo pořád — takže odkaz z fotky chatu i po roce prozradil
+      // kterékoli přihlášené osobě, na jakou stavbu zněl, komu (`inviteeEmail`,
+      // `inviteeName`), s jakou rolí a od koho. Bearer token, který nikdy
+      // nepřestane platit, je přesně to, před čím má TTL chránit; tady dosud
+      // chránilo jen půlku.
+      //
+      // Chybějící `expiresAt` = ZAVŘENO. Na rozdíl od `shareLinks`, kde staré
+      // odkazy bez lhůty vědomě procházejí, tady `allow create` platnost
+      // vynucuje od #549, takže pozvánka bez ní je buď dávno mrtvá, nebo
+      // podvržená — ani jedno nemá být čitelné.
+      //
+      // ⚠️ Uplatněnou (`usedBy != null`) pozvánku čtení schválně PUSTÍ:
+      // `redeemInvite()` z ní dělá hlášku „už byla použita", což je pro člověka
+      // něco jiného než „neplatí". Dožitý záznam pak po odkladu smaže
+      // `sweepDeadInvites` (functions/src/inviteSweep.ts) — do té doby ho drží
+      // jen ta hláška.
+      allow get: if isRealUser()
+        && resource.data.get('expiresAt', null) is timestamp
+        && request.time < resource.data.expiresAt;
       allow list: if isWsAdmin(wid);
       allow create: if isRealUser()
         // Pozvánkou nejde udělit `admin` (eskalace) — jen role bez `manage`.
@@ -1762,7 +1784,17 @@ service cloud.firestore {
     }
 
     match /workspaces/{wid}/projects/{pid}/shareLinks/{token} {
-      allow get: if true;
+      // 🔴 PLATNOST SE VYNUCUJE TADY, ne v klientu. Klientská kontrola je
+      // kosmetika: kdo si adresu záznamu zapamatoval, přečetl by si ho i po
+      // vypršení. `expiresAt` zapisuje `createShareLink` (30 dní fotka/dokument,
+      // 90 dní report).
+      //
+      // ⚠️ ODKAZY BEZ `expiresAt` SE PUSTÍ DÁL. Vznikly před 22. 8. 2026, kdy
+      // platnost neexistovala — lidé je mají rozeslané a nikdo jim konec
+      // neslíbil. Utnout je zpětně by bylo horší než je nechat doběhnout
+      // úklidem, který jim lhůtu dopočítá z `createdAt`.
+      allow get: if !(resource.data.get('expiresAt', null) is timestamp)
+        || request.time < resource.data.expiresAt;
       allow list: if isProjectMember(wid, pid);
       allow create: if (
           canEdit(wid, pid)
@@ -2374,10 +2406,40 @@ service cloud.firestore {
       // výraz skončí chybou a požadavek se odmítne — nikdy se neporovnají dvě
       // prázdné hodnoty. `get` si předsadí ještě explicitní kontrolu, ať je
       // fail-closed čitelný i bez znalosti sémantiky chyb.
+      //
+      // 🔴 PLATNOST SE VYNUCUJE I PŘI ČTENÍ, nejen při uplatnění (`redeemOk`).
+      //
+      // Do 22. 8. 2026 stačila ke čtení SHODA E-MAILU — a `allow delete: if false`
+      // znamenal, že záznam nejde smazat vůbec. Prošlá pozvánka tedy zůstala
+      // čitelná NAVŽDY, a nese `apiKey` firemního backendu i `authExchangeUrl`.
+      // Kdokoli, kdo kdy tu adresu ovládne — i za tři roky — si přečetl identitu
+      // cizího backendu a jeho klíč. Uplatnit pozvánku nemohl, přečíst ano.
+      //
+      // Expirace tím přestává být jen „nejde přijmout" a stává se koncem
+      // přístupu. Doúklid dělá `sweepExpiredPendingInvites`; tohle je hranice,
+      // která platí okamžitě a nečeká na noční běh.
+      function pendingInviteLive() {
+        return resource.data.get('expiresAt', null) is timestamp
+          && request.time < resource.data.expiresAt;
+      }
       allow get: if isRealUser()
+        && pendingInviteLive()
         && request.auth.token.get('email', '') != ''
         && (resource.data.get('inviteeEmail', '') == request.auth.token.email
             || resource.data.get('inviterEmail', '') == request.auth.token.email);
+      // ⚠️ VE `list` PLATNOST VYNUTIT NELZE — a není to opomenutí.
+      //
+      // Firestore u výpisu neumí ověřit, že mez, kterou dodá klient v dotazu,
+      // odpovídá `request.time`; podmínka `request.time < resource.data.expiresAt`
+      // proto výpis odmítne VŽDY, i pro platné pozvánky. (Ověřeno v emulátoru:
+      // `false for 'list'` i u dotazu s `where('expiresAt','>',now)`.)
+      //
+      // Díru tím pádem zavírají dvě jiné věci:
+      //  - `listPendingInvitesForEmail` filtruje `expiresAt > now` sám, takže
+      //    Hub prošlou pozvánku neukáže;
+      //  - `sweepExpiredPendingInvites` je HODINOVÝ, ne denní — právě proto,
+      //    že tohle je jediné místo, kde prošlá pozvánka ještě chvíli svítí.
+      // Zbytkové okno je tedy do hodiny, ne navždy jako do 22. 8. 2026.
       allow list: if isRealUser()
         && resource.data.inviteeEmail == request.auth.token.email;
       // POZOR (bezpečnost): tento create dovoluje LIBOVOLNÉMU reálnému uživateli

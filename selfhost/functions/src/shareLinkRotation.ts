@@ -502,6 +502,82 @@ export function createFirestoreShareLinkStore(
         }
       }
 
+      // 🔴 FIREMNÍ PROSTORY (`companySpaces/{cid}`). Interní registr firmy leží
+      // POD stavbou, ale mimo `${base}/documentVersions` — do 22. 8. 2026ho
+      // tenhle průchod míjel. Následek nebyl jen „neuklizený odkaz": rotace
+      // tokenu je vlastnost OBJEKTU, takže zneplatnění sdíleného dokumentu
+      // tiše rozbilo tentýž soubor v interním registru a firma viděla mrtvou
+      // dlaždici bez vysvětlení.
+      //
+      // Firem na stavbě jsou jednotky, zneplatnění je vzácný úkon — cena je
+      // pár dotazů navíc jen tehdy, když někdo opravdu rotuje.
+      const companySpaces = await firestore.collection(`${base}/companySpaces`).listDocuments();
+      for (const space of companySpaces) {
+        const versions = await space
+          .collection("documentVersions")
+          .where("fileId", "==", target.objectPath)
+          .get();
+        const byUrl = await space
+          .collection("documentVersions")
+          .where("filePath", "==", staleUrl)
+          .get();
+        const seenVersions = new Set<string>();
+        for (const snap of [...versions.docs, ...byUrl.docs]) {
+          if (seenVersions.has(snap.id)) {
+            continue;
+          }
+          seenVersions.add(snap.id);
+          const patch = refreshedUrlFields(
+            (snap.data() ?? {}) as Record<string, unknown>,
+            ["filePath", "thumbnailUrl"],
+            target,
+            freshUrl
+          );
+          if (patch) {
+            batch.update(snap.ref, patch);
+            refreshed += 1;
+          }
+        }
+
+        // Firemní plány drží verze v poli, stejně jako ty oficiální — dotázat
+        // se na hodnotu uvnitř pole map nejde, takže se čtou celé.
+        const companyPlans = await space.collection("plans").get();
+        for (const snap of companyPlans.docs) {
+          const planVersions = refreshedUrlsInArray(
+            ((snap.data() ?? {}) as { versions?: unknown }).versions,
+            ["fileUrl", "thumbnailUrl"],
+            target,
+            freshUrl
+          );
+          if (planVersions) {
+            batch.update(snap.ref, { versions: planVersions });
+            refreshed += 1;
+          }
+        }
+      }
+
+      // 🔴 LOGO FIRMY (`workspaces/{wid}.logo.url`). Taky capability URL
+      // s tokenem, jen o patro výš než celý tenhle průchod — takže dokud tu
+      // nebylo, nešlo logo zneplatnit vůbec (rotace tokenu by ho jen tiše
+      // rozbila v reportech všech staveb).
+      //
+      // ⚠️ Logo NENÍ v `STORED_URL_COLLECTIONS`: ta je seznam KOLEKCÍ pod
+      // stavbou, tohle je jedno pole jednoho dokumentu firmy. Čte se jen když
+      // cesta objektu vede do `branding/`, ať běžné zneplatnění fotky
+      // nevytěžuje dokument firmy.
+      if (target.objectPath.includes("/branding/")) {
+        const workspaceRef = firestore.doc(`workspaces/${workspaceId}`);
+        const workspaceSnap = await workspaceRef.get();
+        const logo = ((workspaceSnap.data() ?? {}) as { logo?: Record<string, unknown> }).logo;
+        if (logo) {
+          const patch = refreshedUrlFields(logo, ["url"], target, freshUrl);
+          if (patch) {
+            batch.update(workspaceRef, { "logo.url": patch.url });
+            refreshed += 1;
+          }
+        }
+      }
+
       // Ostatní ŽIVÉ odkazy na týž soubor. Token je vlastnost objektu, takže je
       // rotace zabila taky — a odkaz, který nikdo nezneplatnil, nesmí přestat
       // fungovat jen proto, že někdo zneplatnil jiný.

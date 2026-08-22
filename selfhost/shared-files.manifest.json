@@ -17,14 +17,14 @@
     "repo": "trpaslik444/construct-cloud-sync",
     "doc": "docs/REPO_BOUNDARIES.md",
     "section": "Háček 1 — SDÍLENÉ soubory",
-    "ref": "0419fb9706a9c54c85bf526c92c5f616d5fdf5ff",
-    "date": "2026-08-20"
+    "ref": "bb443c10eec617c255cca826f8dd319b5352b6d0",
+    "date": "2026-08-22"
   },
   "shared": [
     {
       "main": "firestore.rules",
       "companion": "selfhost/firestore.rules",
-      "mainSha256": "7f07dc943052c1d8c106812eb0ebc8af582c80ea4e664eb35e9b4e043e732cad"
+      "mainSha256": "27f4ebccc557bfcd772d95bc667dcc0ba1edb67c5969fb45c46603854d93f248"
     },
     {
       "main": "storage.rules",
@@ -57,14 +57,24 @@
       "mainSha256": "0dd826ba43ba1f0a4ce02c5da881e4daaa2e1126e5e896b8d4438142107739a3"
     },
     {
+      "main": "functions/src/inviteSweep.ts",
+      "companion": "selfhost/functions/src/inviteSweep.ts",
+      "mainSha256": "b7e9b6161e33f6ed9d07127565cb115e9c4574631d284adacf7ca62ab656ea15"
+    },
+    {
+      "main": "functions/src/inviteSweep.test.ts",
+      "companion": "selfhost/functions/src/inviteSweep.test.ts",
+      "mainSha256": "087c4b0e131d2f7b623b3908075b1e1c36497b678a699b58fe42a0a304784c85"
+    },
+    {
       "main": "functions/src/trashSweep.ts",
       "companion": "selfhost/functions/src/trashSweep.ts",
-      "mainSha256": "1f6182f7d53b84da64ea0b5e7224de4b458bb92f29d07d19b4c422c8f6374781"
+      "mainSha256": "6a7e31871119bc190c39c68f99f2f559d6af4b5fef7caa158d56688e4c8700c8"
     },
     {
       "main": "functions/src/trashSweep.test.ts",
       "companion": "selfhost/functions/src/trashSweep.test.ts",
-      "mainSha256": "645755481fd4da41ef20c817f461db5b12f406ed6c7f3936ca6c42484d54026e"
+      "mainSha256": "a49a7f6912a96600ec1d5ea5e961558da6bb9ffbf7e46f78f5a0874d6a71c127"
     },
     {
       "main": "functions/src/reportSweep.ts",
@@ -79,12 +89,12 @@
     {
       "main": "functions/src/shareLinkRotation.ts",
       "companion": "selfhost/functions/src/shareLinkRotation.ts",
-      "mainSha256": "fc2ca376dd66cbfec9bc1deb32a060852952d0e4159baf327929f9e54d8a58aa"
+      "mainSha256": "8db955c40b90c6e5433086de4bc6660cdd93933244ce8d6dd55ace0f03e81ebc"
     },
     {
       "main": "functions/src/shareLinkRotation.test.ts",
       "companion": "selfhost/functions/src/shareLinkRotation.test.ts",
-      "mainSha256": "9424367b3779b7cf1e17c6a4c2b7fb4336cdbc62cd24f27a65ba6784c41e8da8"
+      "mainSha256": "17952fb33531c4fe5b4882db4732b5a90e09ad1f8161eea3587019d5643acb7a"
     },
     {
       "main": "functions/src/thumbnails.ts",

@@ -117,6 +117,18 @@ export interface TrashStore {
   /** `null` = nepodařilo se zjistit → objekty revizí se nechají být. */
   listPlanFileReferences(project: ProjectRef): Promise<PlanFileReferences | null>;
   deleteContentDoc(project: ProjectRef, type: SweptType, id: string): Promise<void>;
+  /**
+   * Piny smazané fotky (`photoPins` s tímhle `photoId`). Vrací počet smazaných.
+   *
+   * 🔴 PIN BEZ FOTKY JE ROZBITÁ DLAŽDICE, NE NEPOŘÁDEK. Pin je připnutí fotky
+   * do kontextu (úkol, výkres) a nese VLASTNÍ anotace — kresbu, kterou do ní
+   * někdo udělal. Když doběh koše smazal fotku a piny nechal, zůstal na úkolu
+   * záznam odkazující na `photoId`, které už neexistuje: člověk vidí prázdné
+   * místo, které nejde otevřít ani odstranit, a kresba v něm leží dál. Klient
+   * na to má `deletePinsForPhoto()`, ale doběh běží na serveru a nikdo ho
+   * nevolá — kaskádu tedy musí udělat tenhle soubor.
+   */
+  deletePinsForPhoto(project: ProjectRef, photoId: string): Promise<number>;
   deleteVersionDoc(project: ProjectRef, versionId: string): Promise<void>;
   addUsage(project: ProjectRef, delta: UsageDelta): Promise<void>;
 }
@@ -496,6 +508,11 @@ async function purgeSimpleItem(
   await store.deleteContentDoc(project, item.type, item.id);
   const deleted = await storage.deleteObjects(photoStorageObjectPaths(item.storagePath));
   if (item.type === "photo") {
+    // Kaskáda na piny. Až PO smazání fotky: kdyby se to obrátilo a mazání
+    // fotky selhalo, zůstala by fotka bez pinů — tedy tichá ztráta kresby
+    // u obsahu, který dál existuje. Takhle je nejhorší možný mezistav pin
+    // navíc, který se dobere příští běh.
+    await store.deletePinsForPhoto(project, item.id);
     const delta: UsageDelta = { storageBytes: -numberOrZero(item.sizeBytes), photoCount: -1 };
     if (!isEmptyUsageDelta(delta)) {
       await store.addUsage(project, delta);
@@ -617,6 +634,24 @@ export function createFirestoreTrashStore(firestore: Firestore): TrashStore {
 
     async deleteContentDoc(project, type, id) {
       await firestore.doc(`${base(project)}/${SWEPT_COLLECTIONS[type]}/${id}`).delete();
+    },
+
+    async deletePinsForPhoto(project, photoId) {
+      // Piny jedné fotky jsou jednotky kusů (tatáž fotka připnutá do pár
+      // kontextů), takže jedna dávka bohatě stačí a stránkovat není proč.
+      const snapshot = await firestore
+        .collection(`${base(project)}/photoPins`)
+        .where("photoId", "==", photoId)
+        .get();
+      if (snapshot.empty) {
+        return 0;
+      }
+      const batch = firestore.batch();
+      for (const doc of snapshot.docs) {
+        batch.delete(doc.ref);
+      }
+      await batch.commit();
+      return snapshot.size;
     },
 
     async deleteVersionDoc(project, versionId) {

@@ -293,8 +293,40 @@ function fakeFirestore(collections: Record<string, FakeDoc[]>) {
     },
   });
 
+  /**
+   * Podkolekce firemního prostoru. `listDocuments()` vrací REFERENCE, ne data —
+   * úklid firemních prostorů se ptá právě jím, protože id firem předem nezná.
+   */
+  const asSpaceRef = (path: string) => ({
+    collection: (name: string) => asQuery(`${path}/${name}`, collections[`${path}/${name}`] ?? []),
+  });
+
   const firestore = {
-    collection: (path: string) => asQuery(path, collections[path] ?? []),
+    collection: (path: string) => ({
+      ...asQuery(path, collections[path] ?? []),
+      listDocuments: async () =>
+        // Firemní prostory se nepoznají z dat, ale z existence podkolekcí —
+        // ve falešném Firestoru tedy z klíčů, které pod tou cestou začínají.
+        [
+          ...new Set(
+            Object.keys(collections)
+              .filter((key) => key.startsWith(`${path}/`))
+              .map((key) => key.slice(path.length + 1).split("/")[0])
+          ),
+        ].map((id) => asSpaceRef(`${path}/${id}`)),
+    }),
+    doc: (path: string) => ({
+      get: async () => {
+        reads.push(path);
+        const [collectionPath, id] = [
+          path.slice(0, path.lastIndexOf("/")),
+          path.slice(path.lastIndexOf("/") + 1),
+        ];
+        const found = (collections[collectionPath] ?? []).find((entry) => entry.id === id);
+        return { data: () => found?.data };
+      },
+      path,
+    }),
     batch: () => ({
       update: (ref: { path: string }, patch: Record<string, unknown>) => {
         writes.push({ path: ref.path, patch });
@@ -413,4 +445,73 @@ test("když není co přepsat, nezapisuje se vůbec nic", async () => {
   assert.equal(await store.refreshStoredDownloadUrls(REFRESH_INPUT), 0);
   assert.deepEqual(writes, []);
   assert.equal(commits(), 0);
+});
+
+/**
+ * 🔴 FIREMNÍ PROSTORY LEŽÍ POD STAVBOU, ALE MIMO `${BASE}/documentVersions`.
+ * Do 22. 8. 2026 je obnova míjela, a následek nebyl „neuklizený odkaz":
+ * rotace tokenu je vlastnost OBJEKTU, takže zneplatnění sdíleného dokumentu
+ * tiše rozbilo tentýž soubor v interním registru firmy — mrtvá dlaždice bez
+ * vysvětlení.
+ */
+test("obnova sáhne i do firemního prostoru (verze i plán)", async () => {
+  const { store, writes } = fakeFirestore({
+    [`${BASE}/companySpaces/c1/documentVersions`]: [
+      { id: "v1", data: { fileId: OBJECT.objectPath, filePath: FILE_URL } },
+      { id: "jina", data: { fileId: "jina/cesta.pdf", filePath: "https://example.com/x.pdf" } },
+    ],
+    [`${BASE}/companySpaces/c1/plans`]: [
+      { id: "pl1", data: { versions: [{ fileUrl: FILE_URL }] } },
+    ],
+    // Druhá firma na téže stavbě se nesmí zapomenout.
+    [`${BASE}/companySpaces/c2/documentVersions`]: [
+      { id: "v2", data: { fileId: OBJECT.objectPath, filePath: FILE_URL } },
+    ],
+  });
+
+  const refreshed = await store.refreshStoredDownloadUrls(REFRESH_INPUT);
+
+  assert.equal(refreshed, 3);
+  assert.deepEqual(writes.map((write) => write.path).sort(), [
+    `${BASE}/companySpaces/c1/documentVersions/v1`,
+    `${BASE}/companySpaces/c1/plans/pl1`,
+    `${BASE}/companySpaces/c2/documentVersions/v2`,
+  ]);
+});
+
+/**
+ * 🔴 LOGO FIRMY je taky capability URL s tokenem, jen o patro výš než celá
+ * obnova. Dokud tu nebylo, nešlo ho zneplatnit vůbec — rotace tokenu by ho jen
+ * tiše rozbila v reportech všech staveb.
+ */
+test("obnova přepíše i logo firmy, ale jen u objektu z `branding/`", async () => {
+  const brandingObject = { bucket: OBJECT.bucket, objectPath: "workspaces/ws_1/branding/logo-1.png" };
+  const staleLogoUrl = buildDownloadUrl(brandingObject, "stary-token");
+  const freshLogoUrl = buildDownloadUrl(brandingObject, "novy-token");
+  const { store, writes } = fakeFirestore({
+    workspaces: [{ id: "ws_1", data: { logo: { url: staleLogoUrl, format: "png" } } }],
+  });
+
+  const refreshed = await store.refreshStoredDownloadUrls({
+    ...REFRESH_INPUT,
+    target: brandingObject,
+    staleUrl: staleLogoUrl,
+    freshUrl: freshLogoUrl,
+  });
+
+  assert.equal(refreshed, 1);
+  assert.deepEqual(writes, [{ path: "workspaces/ws_1", patch: { "logo.url": freshLogoUrl } }]);
+});
+
+test("běžná rotace fotky dokument firmy vůbec nečte", async () => {
+  const { store, reads } = fakeFirestore({
+    workspaces: [{ id: "ws_1", data: { logo: { url: FILE_URL } } }],
+  });
+
+  await store.refreshStoredDownloadUrls(REFRESH_INPUT);
+
+  assert.ok(
+    !reads.includes("workspaces/ws_1"),
+    "zneplatnění fotky nemá vytěžovat dokument firmy"
+  );
 });

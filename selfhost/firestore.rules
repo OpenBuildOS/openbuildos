@@ -855,8 +855,30 @@ service cloud.firestore {
     }
 
     match /workspaces/{wid}/invites/{inviteId} {
-      // The invite id itself is the secret; any real user holding it may read.
-      allow get: if isRealUser();
+      // The invite id itself is the secret; any real user holding it may read —
+      // ale JEN dokud pozvánka žije.
+      //
+      // 🔴 Do 22. 8. 2026 tu stálo pouhé `isRealUser()`. Uplatnit prošlou
+      // pozvánku nešlo (`allow update` níž má `request.time < expiresAt`),
+      // jenže ČÍST ji šlo pořád — takže odkaz z fotky chatu i po roce prozradil
+      // kterékoli přihlášené osobě, na jakou stavbu zněl, komu (`inviteeEmail`,
+      // `inviteeName`), s jakou rolí a od koho. Bearer token, který nikdy
+      // nepřestane platit, je přesně to, před čím má TTL chránit; tady dosud
+      // chránilo jen půlku.
+      //
+      // Chybějící `expiresAt` = ZAVŘENO. Na rozdíl od `shareLinks`, kde staré
+      // odkazy bez lhůty vědomě procházejí, tady `allow create` platnost
+      // vynucuje od #549, takže pozvánka bez ní je buď dávno mrtvá, nebo
+      // podvržená — ani jedno nemá být čitelné.
+      //
+      // ⚠️ Uplatněnou (`usedBy != null`) pozvánku čtení schválně PUSTÍ:
+      // `redeemInvite()` z ní dělá hlášku „už byla použita", což je pro člověka
+      // něco jiného než „neplatí". Dožitý záznam pak po odkladu smaže
+      // `sweepDeadInvites` (functions/src/inviteSweep.ts) — do té doby ho drží
+      // jen ta hláška.
+      allow get: if isRealUser()
+        && resource.data.get('expiresAt', null) is timestamp
+        && request.time < resource.data.expiresAt;
       allow list: if isWsAdmin(wid);
       allow create: if isRealUser()
         // Pozvánkou nejde udělit `admin` (eskalace) — jen role bez `manage`.

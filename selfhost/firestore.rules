@@ -974,9 +974,11 @@ service cloud.firestore {
           && memberUid == principal()
           // `profession` (#506 fáze 3) je POPISNÁ — smí se nést pozvánkou, aby
           // „pozval jsem TDI" zůstalo pravdou i po přijetí. Oprávnění NEMĚNÍ:
-          // `memberFlagPermissions` níž sahá výhradně na `canApprove` /
-          // `canPublishOfficial`, a ty si sebe-připojující se dopsat NESMÍ —
-          // proto v allowlistu nejsou a zůstávají na správci.
+          // `memberFlagPermissions` níž čte `canApprove`, `canPublishOfficial`
+          // a `canWriteDiary`, a ty si sebe-připojující se dopsat NESMÍ —
+          // proto v allowlistu nejsou a zůstávají na správci. Když sem přibude
+          // další flag, TENHLE VÝČET SE NEROZŠIŘUJE: `hasOnly` ho odmítne sám,
+          // a to je záměr.
           && request.resource.data.keys()
               .hasOnly(['role', 'displayName', 'email', 'inviteId', 'joinedAt', 'companyId', 'profession'])
           && request.resource.data.role in ['reader', 'viewer', 'editor']

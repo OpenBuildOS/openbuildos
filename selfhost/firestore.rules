@@ -1762,7 +1762,17 @@ service cloud.firestore {
     }
 
     match /workspaces/{wid}/projects/{pid}/shareLinks/{token} {
-      allow get: if true;
+      // 🔴 PLATNOST SE VYNUCUJE TADY, ne v klientu. Klientská kontrola je
+      // kosmetika: kdo si adresu záznamu zapamatoval, přečetl by si ho i po
+      // vypršení. `expiresAt` zapisuje `createShareLink` (30 dní fotka/dokument,
+      // 90 dní report).
+      //
+      // ⚠️ ODKAZY BEZ `expiresAt` SE PUSTÍ DÁL. Vznikly před 22. 8. 2026, kdy
+      // platnost neexistovala — lidé je mají rozeslané a nikdo jim konec
+      // neslíbil. Utnout je zpětně by bylo horší než je nechat doběhnout
+      // úklidem, který jim lhůtu dopočítá z `createdAt`.
+      allow get: if !(resource.data.get('expiresAt', null) is timestamp)
+        || request.time < resource.data.expiresAt;
       allow list: if isProjectMember(wid, pid);
       allow create: if (
           canEdit(wid, pid)

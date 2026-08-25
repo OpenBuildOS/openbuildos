@@ -623,11 +623,20 @@ service cloud.firestore {
 
     // Update dokumentu: běžná práva k obsahu, NEBO — u `certify`/`publish` bez
     // `edit` — jen přepnutí platné revize jako vedlejší efekt schválení/uploadu.
+    //
+    // `revisionRemovals` je ve stejné úzké větvi schválně: smazat revizi smí
+    // podle `documentVersions` i její AUTOR s pouhým `contribute` (typicky
+    // publisher bez role `edit`), a `deleteVersion` k tomu do rodičovského
+    // dokumentu zapisuje stopu po smazané revizi. Kdyby stopa do allowlistu
+    // nepatřila, buď by smazání takovému člověku spadlo na permission-denied,
+    // nebo by se stopa musela psát „nepovinně" — a po natvrdo smazané schválené
+    // revizi s veřejným QR odkazem by nezůstalo nic. Pole je zastropované
+    // v `deleteVersion` (posledních 20 záznamů).
     function documentUpdateOk(perms) {
       return canModifyWith(perms)
         || (perms.hasAny(['certify', 'publish'])
             && request.resource.data.diff(resource.data).affectedKeys()
-                 .hasOnly(['currentVersionId', 'updatedAt']));
+                 .hasOnly(['currentVersionId', 'updatedAt', 'revisionRemovals']));
     }
 
     // Update revize dokumentu.

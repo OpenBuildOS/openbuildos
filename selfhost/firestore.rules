@@ -1798,6 +1798,25 @@ service cloud.firestore {
         && reportObjectUrl(wid, pid, data);
     }
 
+    /**
+     * 🔴 `movedAway` PÍŠE VÝHRADNĚ SERVER — je to NÁHROBEK po předání stavby.
+     *
+     * Verifikační QR se vypaluje do PDF ještě před uploadem a nese `wid`
+     * původní firmy, takže po předání míří natvrdo do prostoru, kde dokument
+     * už není. Server tam proto na místě odkazu nechá náhrobek
+     * (`functions/src/shareLinkTombstone.ts`), aby návštěvník se skenovaným
+     * papírem dostal vysvětlení místo „Odkaz již není platný".
+     *
+     * ⚠️ A ZÁROVEŇ JE TO JEDINÝ ODKAZ, KTERÝ NEVYPRŠÍ. Denní úklid
+     * (`functions/src/shareLinkSweep.ts`) ho vynechává — kdyby si tenhle
+     * příznak směl napsat klient, byl by to návod, jak si s právem `edit`
+     * vyrobit veřejný odkaz na živý soubor, který nikdy neskončí. Platnost
+     * odkazů (30/90 dní) by se tím dala obejít jedním polem.
+     */
+    function noServerOnlyShareFields(data) {
+      return !data.keys().hasAny(['movedAway']);
+    }
+
     match /workspaces/{wid}/projects/{pid}/shareLinks/{token} {
       // 🔴 PLATNOST SE VYNUCUJE TADY, ne v klientu. Klientská kontrola je
       // kosmetika: kdo si adresu záznamu zapamatoval, přečetl by si ho i po
@@ -1814,7 +1833,7 @@ service cloud.firestore {
       allow create: if (
           canEdit(wid, pid)
           || (isProjectMember(wid, pid) && ownReportShare(wid, pid, request.resource.data))
-        ) && !projectFrozen(pid);
+        ) && noServerOnlyShareFields(request.resource.data) && !projectFrozen(pid);
       allow update: if (
           canEdit(wid, pid)
           || (
@@ -1822,7 +1841,7 @@ service cloud.firestore {
             && ownReportShare(wid, pid, resource.data)
             && ownReportShare(wid, pid, request.resource.data)
           )
-        ) && !projectFrozen(pid);
+        ) && noServerOnlyShareFields(request.resource.data) && !projectFrozen(pid);
       allow delete: if canEdit(wid, pid) && !projectFrozen(pid);
     }
 

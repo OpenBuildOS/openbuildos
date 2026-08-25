@@ -624,14 +624,14 @@ service cloud.firestore {
     // Update dokumentu: běžná práva k obsahu, NEBO — u `certify`/`publish` bez
     // `edit` — jen přepnutí platné revize jako vedlejší efekt schválení/uploadu.
     //
-    // `revisionRemovals` je ve stejné úzké větvi schválně: smazat revizi smí
-    // podle `documentVersions` i její AUTOR s pouhým `contribute` (typicky
-    // publisher bez role `edit`), a `deleteVersion` k tomu do rodičovského
-    // dokumentu zapisuje stopu po smazané revizi. Kdyby stopa do allowlistu
-    // nepatřila, buď by smazání takovému člověku spadlo na permission-denied,
-    // nebo by se stopa musela psát „nepovinně" — a po natvrdo smazané schválené
-    // revizi s veřejným QR odkazem by nezůstalo nic. Pole je zastropované
-    // v `deleteVersion` (posledních 20 záznamů).
+    // `revisionRemovals` = stopa po TRVALE smazané revizi. Píše ji
+    // `deleteVersion` SAMOSTATNÝM zápisem (ne v mazací transakci), aby zápis
+    // do rodiče nikdy neshodil samotné smazání — revizi smí podle
+    // `documentVersions` smazat i její AUTOR s pouhým `contribute`, který na
+    // dokument sáhnout nemusí. Do allowlistu pole patří proto, aby stopa prošla
+    // aspoň publisherovi/schvalovateli bez role `edit`; komu ji pravidla
+    // odmítnou, ten se to dozví notifikací a revize se smaže i tak.
+    // Pole je zastropované v `deleteVersion` (posledních 20 záznamů).
     function documentUpdateOk(perms) {
       return canModifyWith(perms)
         || (perms.hasAny(['certify', 'publish'])
@@ -655,9 +655,15 @@ service cloud.firestore {
     // Ostatní (uploader/editor/autor) smí běžné editace, ale NE přechod do
     // rozhodnutí (zákaz self-approve). Audit se v rules nevynucuje.
     function versionUpdateOk(perms) {
+      // `supersededFromStatus` drží stav, ve kterém revize byla PŘED archivací
+      // (`planSupersede` archivuje i `for_construction` nebo
+      // `approved_with_comments`). Zapisuje ho táž transakce, která revizi
+      // archivuje, a čte ho návrat z archivu po smazání nástupce — bez něj by
+      // se obnovovalo naslepo na `approved` a tiše by zmizely výhrady, nebo
+      // uvolnění pro provedení stavby.
       return (perms.hasAny(['certify'])
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
-               'status', 'approvals', 'reviewedBy', 'reviewedByName',
+               'status', 'supersededFromStatus', 'approvals', 'reviewedBy', 'reviewedByName',
                'reviewedAt', 'reviewerComment', 'updatedAt'
              ]))
         || (canModifyWith(perms)

@@ -661,10 +661,20 @@ service cloud.firestore {
       // archivuje, a čte ho návrat z archivu po smazání nástupce — bez něj by
       // se obnovovalo naslepo na `approved` a tiše by zmizely výhrady, nebo
       // uvolnění pro provedení stavby.
+      //
+      // 🔴 `statusChanged*` MUSÍ BÝT V SEZNAMU, jinak je ruční oprava stavu
+      // (#734) mrtvá. `setVersionStatusManually` k novému stavu zapisuje stopu
+      // (kdo, kdy, jménem) — celý smysl #734 je, že náprava nemaže historii,
+      // tak ji nesmí mazat ani ona sama. Bez těch tří polí `hasOnly` celý zápis
+      // odmítne a uživatel dostane jen „Stav revize se nepodařilo uložit";
+      // ověřeno 26. 8. 2026 proti emulátoru, kde to spadlo i PROJEKTOVÉMU
+      // SPRÁVCI. Kdo smí stav změnit, se tím NEMĚNÍ — pořád jen `certify`,
+      // takže zákaz self-approve u editora bez schvalovacího práva drží dál.
       return (perms.hasAny(['certify'])
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
                'status', 'supersededFromStatus', 'approvals', 'reviewedBy', 'reviewedByName',
-               'reviewedAt', 'reviewerComment', 'updatedAt'
+               'reviewedAt', 'reviewerComment', 'updatedAt',
+               'statusChangedAt', 'statusChangedBy', 'statusChangedByName'
              ]))
         || (canModifyWith(perms)
             && !(request.resource.data.status != resource.data.status
@@ -1852,10 +1862,11 @@ service cloud.firestore {
     // verification page (/share/:wid/:token) can tell whether the scanned
     // revision is current or superseded. Carries ONLY harmless data
     // (currentVersionId + label) -- never titles, URLs or member info.
-    // Zapisuje se best-effort při uploadu (`edit`/`publish`) i při schválení
-    // (`certify`) — schvalovatel ani publisher nemusí mít `edit`, proto tu jsou
-    // všechny tři větve. Bez `publish` končila QR verifikace čerstvě nahrané
-    // revize „neutrálním stavem" (nález F2).
+    // Zapisuje se best-effort ze VŠECH cest, které mění platnou revizi (upload,
+    // schválení i zamítnutí, ruční oprava stavu, smazání a přesun revize) —
+    // jedním helperem `reconcileDocumentStatusPointer`. Kdo tam smí, určuje
+    // `documentStatusWriteOk` níž: TÁŽ množina jako u `documents/{docId}`,
+    // včetně mazání (nález F2).
     // ---------------------------------------------------------------------
 
     function validDocumentStatus(data) {
@@ -1865,13 +1876,53 @@ service cloud.firestore {
         && data.currentVersionLabel is string;
     }
 
+    // Autor RODIČOVSKÉHO dokumentu. `authoredBySelf()` se tu použít nedá: čte
+    // `resource.data`, což je u téhle cesty ukazatel, ne dokument. Čtení stojí
+    // jeden `get`, ale je ve DRUHÉ větvi — vyhodnotí se teprve, když volající
+    // nemá `edit`/`certify`/`publish`.
+    function documentAuthoredBySelf(wid, pid, documentId) {
+      let parent = get(/databases/$(database)/documents/workspaces/$(wid)/projects/$(pid)/documents/$(documentId));
+      return parent != null && parent.data.get('createdBy', '') == principal();
+    }
+
+    /**
+     * 🔴 UKAZATEL JE ODVOZENÝ STÍN `currentVersionId`, TAKŽE PRÁVO NA NĚJ MUSÍ
+     * BÝT TOTOŽNÉ — ne přísnější (nález F2, #506).
+     *
+     * `documents/{docId}` pouští zápis `currentVersionId` třem množinám:
+     * `canModifyWith` (tedy `edit`, NEBO `contribute` u vlastního dokumentu)
+     * a úzké větvi `documentUpdateOk` pro `certify`/`publish`. Ukazatel do
+     * 26. 8. 2026 pouštěl jen první tři z toho, a MAZAT ho směl výhradně `edit`.
+     * Publisher, schvalovatel i autor dokumentu tak uměli platnou revizi
+     * přepnout, ale její veřejný stín ne — a QR na stavbě zůstal viset na
+     * revizi, která už neplatí, případně hlásil „aktuálnost nelze ověřit".
+     * Přesně tomu mělo #371 zabránit.
+     *
+     * Rozsah je proto ÚZKÝ a odvozený, ne „kdokoli": kopíruje množinu
+     * z `documentUpdateOk`, včetně větve pro autora s `contribute`. Schéma
+     * hlídá `validDocumentStatus` — pole se rozšířit nedá a nic citlivého
+     * (název, adresa souboru, členové) do veřejného dokumentu nepřibude.
+     */
+    function documentStatusWriteOk(wid, pid, documentId) {
+      let perms = permsOf(wid, pid);
+      return perms.hasAny(['edit', 'certify', 'publish'])
+        || (perms.hasAny(['contribute']) && documentAuthoredBySelf(wid, pid, documentId));
+    }
+
     match /workspaces/{wid}/projects/{pid}/documentStatus/{documentId} {
       allow get: if true;
       allow list: if isProjectMember(wid, pid);
-      allow create, update: if permsOf(wid, pid).hasAny(['edit', 'certify', 'publish'])
+      allow create, update: if documentStatusWriteOk(wid, pid, documentId)
         && validDocumentStatus(request.resource.data)
         && !projectFrozen(pid);
-      allow delete: if canEdit(wid, pid) && !projectFrozen(pid);
+      // 🔴 MAZÁNÍ JE PLNOHODNOTNÝ STAV UKAZATELE, ne úklid. `validDocumentStatus`
+      // vyžaduje neprázdné `currentVersionId`, takže „dokument nemá žádnou
+      // platnou revizi" (smazaná, archivovaná nebo přesunutá poslední schválená)
+      // se nedá zapsat — jde jen smazat. Kdyby mazání zůstalo přísnější než
+      // zápis, `reconcileDocumentStatusPointer` by u publishera a schvalovatele
+      // uměl ukazatel jen posouvat, nikdy zrušit, a veřejná stránka by dál
+      // tvrdila, že platí revize, která zmizela.
+      allow delete: if documentStatusWriteOk(wid, pid, documentId) && !projectFrozen(pid);
     }
 
     // ---------------------------------------------------------------------

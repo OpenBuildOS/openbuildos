@@ -1824,7 +1824,78 @@ service cloud.firestore {
      * odkazů (30/90 dní) by se tím dala obejít jedním polem.
      */
     function noServerOnlyShareFields(data) {
-      return !data.keys().hasAny(['movedAway']);
+      return !data.keys().hasAny(['movedAway', 'movedAt']);
+    }
+
+    /**
+     * 🔴 KONEC PLATNOSTI JE POVINNÝ A OMEZENÝ — jinak platnost neexistuje.
+     *
+     * Nález 26. 8. 2026 (sonda proti emulátoru, ne úvahou): do téhle chvíle
+     * pravidla o `expiresAt` při ZÁPISU nevěděla vůbec nic. Kdokoli s právem
+     * `edit` směl:
+     *  · založit odkaz úplně bez `expiresAt`,
+     *  · to pole u hotového odkazu smazat (`deleteField()`),
+     *  · posunout ho do roku 2099.
+     * Tedy vyrobit si veřejnou adresu živého souboru, která nikdy neskončí.
+     *
+     * Je to TÁŽ díra jako u `movedAway` (#790), o patro výš: tam si klient
+     * nesměl napsat příznak, kterým se úklidu uteče — tady si rovnou sahal na
+     * lhůtu samotnou. Jediná pojistka byl denní úklid
+     * (`functions/src/shareLinkSweep.ts`), který odkazu bez `expiresAt` lhůtu
+     * dopočítá z `createdAt` — jenže i `createdAt` si psal klient, takže dvojice
+     * „žádné `expiresAt` + `createdAt` v roce 2099" se vyhnula i jemu. Navždy,
+     * bez stopy.
+     *
+     * Okno je záměrně o den delší než produktová lhůta
+     * (`src/lib/shareLinkLifetime.ts`: 30 dní fotka/dokument, 90 report):
+     * hodnotu počítá klient ze SVÝCH hodin a tvrdší okno by u rozjetých hodin
+     * shodilo běžné sdílení na permission-denied. Stejná vůle jako u pozvánek.
+     *
+     * `type` je jen štítek od klienta, takže si delší okno teoreticky vezme
+     * i fotka označená za report. Nevadí: kdo tenhle zápis smí, ten obojí
+     * sdílet SMÍ — rozdíl je v době, ne v přístupu, a členská výjimka pro
+     * reporty je vymáhaná zvlášť cestou souboru (`reportObjectUrl`).
+     */
+    function shareExpiryInWindow(data) {
+      return data.get('expiresAt', null) is timestamp
+        && data.expiresAt > request.time
+        && data.expiresAt < request.time
+            + duration.value(data.get('type', '') == 'report' ? 91 : 31, 'd');
+    }
+
+    /**
+     * Lhůta se smí jen ZKRACOVAT, nikdy prodlužovat ani mizet.
+     *
+     * ⚠️ Odkazy BEZ `expiresAt` (vzniklé před 22. 8. 2026 a náhrobky) tudy musí
+     * projít dál — zneplatnit starý odkaz je běžný úkon a `revoked: true` na
+     * něm nesmí padat. Doplnit jim lhůtu se smí, ale jen v okně; nechat je tak,
+     * jak jsou, taky. Doběhne je úklid, který jim ji dopočítá z `createdAt`.
+     */
+    function shareExpiryNotExtended(before, after) {
+      return before.get('expiresAt', null) is timestamp
+        ? (after.get('expiresAt', null) is timestamp
+            && after.expiresAt <= before.expiresAt)
+        : (!(after.get('expiresAt', null) is timestamp)
+            || shareExpiryInWindow(after));
+    }
+
+    /**
+     * 🔴 `createdAt` JE PO ZALOŽENÍ NEMĚNNÉ. U odkazu bez `expiresAt` je to
+     * JEDINÝ údaj, ze kterého si úklid lhůtu dopočítá — kdyby ho směl klient
+     * posunout, obejde se úklid u přesně těch odkazů, kvůli kterým vznikl.
+     * Běžné cesty ho nepřepisují (`revoked: true`, `documentId` u přesunu
+     * revize), takže tahle zarážka nic živého neškrtí.
+     *
+     * A `revoked` platí jen jedním směrem: zneplatnění je konec, ne přepínač.
+     * Když rotace download tokenu neproběhla (starší self-host backend), bylo
+     * by odznačení zpět na `false` oživením adresy, kterou někdo úmyslně
+     * zavřel. Kdo potřebuje sdílet znovu, vyrobí nový odkaz — s novou lhůtou.
+     */
+    function shareImmutablesKept(before, after) {
+      return after.get('createdAt', null) == before.get('createdAt', null)
+        && (before.get('revoked', false) == true
+              ? after.get('revoked', false) == true
+              : true);
     }
 
     match /workspaces/{wid}/projects/{pid}/shareLinks/{token} {
@@ -1833,17 +1904,28 @@ service cloud.firestore {
       // vypršení. `expiresAt` zapisuje `createShareLink` (30 dní fotka/dokument,
       // 90 dní report).
       //
-      // ⚠️ ODKAZY BEZ `expiresAt` SE PUSTÍ DÁL. Vznikly před 22. 8. 2026, kdy
-      // platnost neexistovala — lidé je mají rozeslané a nikdo jim konec
-      // neslíbil. Utnout je zpětně by bylo horší než je nechat doběhnout
-      // úklidem, který jim lhůtu dopočítá z `createdAt`.
+      // ⚠️ ODKAZY BEZ `expiresAt` SE PUSTÍ DÁL, i po opravě z 26. 8. 2026.
+      // Zvažovalo se brát je při čtení rovnou za prošlé — zamítnuto:
+      //  1. NÁHROBEK PO PŘEDÁNÍ STAVBY (#790) `expiresAt` nemá ze své podstaty
+      //     a čtený být MUSÍ. „Chybí lhůta = prošlé" by ho umlčelo a vytištěný
+      //     QR by se vrátil k „Odkaz již není platný" — tedy přesně k tomu,
+      //     co #790 opravoval.
+      //  2. Zbylé bezčasé odkazy vznikly před 22. 8. 2026 a jejich příjemcům
+      //     nikdo konec neslíbil.
+      // Díru zavírá ZÁPISOVÁ strana (`shareExpiryInWindow`): nový odkaz bez
+      // lhůty už nevznikne a stávající o ni nepřijde, takže množina bezčasých
+      // odkazů je od téhle chvíle UZAVŘENÁ a konečná. Doběhne je úklid, který
+      // jim lhůtu dopočítá z `createdAt` — a to pole je teď neměnné, takže
+      // dopočet nejde odsunout.
       allow get: if !(resource.data.get('expiresAt', null) is timestamp)
         || request.time < resource.data.expiresAt;
       allow list: if isProjectMember(wid, pid);
       allow create: if (
           canEdit(wid, pid)
           || (isProjectMember(wid, pid) && ownReportShare(wid, pid, request.resource.data))
-        ) && noServerOnlyShareFields(request.resource.data) && !projectFrozen(pid);
+        ) && noServerOnlyShareFields(request.resource.data)
+        && shareExpiryInWindow(request.resource.data)
+        && !projectFrozen(pid);
       allow update: if (
           canEdit(wid, pid)
           || (
@@ -1851,7 +1933,10 @@ service cloud.firestore {
             && ownReportShare(wid, pid, resource.data)
             && ownReportShare(wid, pid, request.resource.data)
           )
-        ) && noServerOnlyShareFields(request.resource.data) && !projectFrozen(pid);
+        ) && noServerOnlyShareFields(request.resource.data)
+        && shareExpiryNotExtended(resource.data, request.resource.data)
+        && shareImmutablesKept(resource.data, request.resource.data)
+        && !projectFrozen(pid);
       allow delete: if canEdit(wid, pid) && !projectFrozen(pid);
     }
 

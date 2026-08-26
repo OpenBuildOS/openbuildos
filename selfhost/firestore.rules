@@ -1674,6 +1674,27 @@ service cloud.firestore {
         ) && !projectFrozen(pid);
     }
 
+    // Tvary místností nad výkresem (#385). Geometrie NEZAKLÁDÁ místnost — jen
+    // dává tvar záznamu, který už je v číselníku stavby (`roomOrZoneId`).
+    //
+    // 🔑 Proč `edit`, a ne `manage`. Číselník místností je konfigurace projektu
+    // a mění ho jen správce (`manage`) — tam se zakládají, přejmenovávají a ruší
+    // MÍSTNOSTI. Tvar žádnou místnost nezaloží ani nepřejmenuje: visí na
+    // `planId + planVersionId + page` a s revizí výkresu pozbývá platnosti,
+    // takže je to obsah VÝKRESU, ne číselníku — stejná úroveň jako `plans`
+    // a `planAnnotations`. Vyžadovat `manage` by znamenalo, že tvar nesmí
+    // obkreslit ten, kdo nad výkresem pracuje, a #385 mluví výslovně
+    // o „oprávněném editorovi oficiálního projektu".
+    //
+    // Rozsah: firemní interní výkresy leží pod `companySpaces/{companyId}/plans`,
+    // tedy MIMO tuhle cestu — tvar k nim se sem tím pádem nedá založit.
+    match /workspaces/{wid}/projects/{pid}/roomGeometries/{docId} {
+      allow read: if isProjectMember(wid, pid);
+      allow create, update, delete: if (
+          canEdit(wid, pid)
+        ) && !projectFrozen(pid);
+    }
+
     match /workspaces/{wid}/projects/{pid}/documents/{docId} {
       allow read: if isProjectMember(wid, pid);
       // Do OFICIÁLNÍ dokumentace smí zakládat jen `publish`, ne každý člen.

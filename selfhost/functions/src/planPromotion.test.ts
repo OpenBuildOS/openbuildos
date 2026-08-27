@@ -168,6 +168,47 @@ test("z jednostránkového výkresu vznikne nový plán s platnou revizí", () =
   assert.equal(version.uploadedAt, "2026-08-01T08:00:00.000Z");
 });
 
+/**
+ * 🔴 Nález z prokliknutí stagingu (27. 8. 2026), navazuje na #800.
+ *
+ * Rozměr listu je jediný podklad, podle kterého `planRevisionCarry` na klientu
+ * pozná, že nová revize je na jinak tvarovaném listu a pin se na ni přenést
+ * nesmí. Server PDF neotevírá — proto ho čte z revize dokumentu, kam ho zapsal
+ * klient při příjmu. Když se sem nedonese, revize výkresu ho nemá vůbec a
+ * kontrola padá na „přenes 1:1", tedy na tichý posun pinu na cizí místo.
+ */
+test("revize výkresu si nese rozměr listu změřený při příjmu dokumentu", () => {
+  const decision = decidePromotion({
+    version: makeVersion({ pageWidthUnits: 595, pageHeightUnits: 420 }),
+    document: makeDocument(),
+    plans: [],
+    now: NOW,
+    newId: sequentialIds("plan"),
+  });
+
+  assert.equal(decision.kind, "write");
+  if (decision.kind !== "write") return;
+  assert.equal(decision.plan.versions[0].widthUnits, 595);
+  assert.equal(decision.plan.versions[0].heightUnits, 420);
+});
+
+test("nesmyslný rozměr se nepřevezme — radši žádný než nula", () => {
+  // Nula by v poměru stran znamenala dělení nulou; text („595") zase porovnání
+  // dvou nesouměřitelných hodnot. Obojí by z guardu udělalo náhodný generátor.
+  const decision = decidePromotion({
+    version: makeVersion({ pageWidthUnits: 0, pageHeightUnits: "420" }),
+    document: makeDocument(),
+    plans: [],
+    now: NOW,
+    newId: sequentialIds("plan"),
+  });
+
+  assert.equal(decision.kind, "write");
+  if (decision.kind !== "write") return;
+  assert.equal(decision.plan.versions[0].widthUnits, undefined);
+  assert.equal(decision.plan.versions[0].heightUnits, undefined);
+});
+
 test("🔴 soubor se NEKOPÍRUJE — fileUrl je týž objekt jako filePath revize", () => {
   // Na tom závisí mazání revizí (`src/services/planFileReferences.ts`):
   // vazba plán↔objekt se hledá porovnáním fileUrl. Kopie by ji rozbila.

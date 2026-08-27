@@ -61,6 +61,15 @@ export interface SourceVersionRecord {
   filePath?: unknown;
   thumbnailUrl?: unknown;
   pageCount?: unknown;
+  /**
+   * Rozměr 1. strany v PDF jednotkách (scale 1), změřený klientem při příjmu
+   * dokumentu. Server PDF neotevírá — tohle je jediný zdroj rozměru, který má.
+   * Bez něj revize výkresu žádný rozměr nedostane a kontrola „nová revize je na
+   * jinak velkém listu" (`src/components/plans/planRevisionCarry.ts`) rozhoduje
+   * naslepo ve prospěch přenosu 1:1.
+   */
+  pageWidthUnits?: unknown;
+  pageHeightUnits?: unknown;
   versionLabel?: unknown;
   uploadedBy?: unknown;
   uploadedAt?: unknown;
@@ -142,6 +151,14 @@ export type PromotionDecision =
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * Rozměr strany dává smysl jen jako kladné konečné číslo. Nula/NaN/„595" jako
+ * text se dál nepustí: poměr stran se z toho počítá dělením.
+ */
+function asPositiveNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
 /** Firestore drží datum jako Timestamp NEBO ISO řetězec — obojí na ISO. */
@@ -299,6 +316,10 @@ export function decidePromotion(input: DecidePromotionInput): PromotionDecision 
     revisionLabel: asString(version.versionLabel),
     sourceDocumentId: asString(document.id),
     sourceDocumentVersionId: version.id,
+    // Povyšuje se jen jednostránková revize (viz kontrola `pageCount === 1`
+    // výše), takže změřená 1. strana JE ta povyšovaná.
+    widthUnits: asPositiveNumber(version.pageWidthUnits),
+    heightUnits: asPositiveNumber(version.pageHeightUnits),
   };
 
   if (!matched) {
@@ -380,6 +401,8 @@ function buildPlanVersion(
     revisionLabel?: string;
     sourceDocumentId?: string;
     sourceDocumentVersionId: string;
+    widthUnits?: number;
+    heightUnits?: number;
   }
 ): StoredPlanVersion {
   return {
@@ -398,6 +421,8 @@ function buildPlanVersion(
     status: "approved",
     sourceDocumentId: shared.sourceDocumentId,
     sourceDocumentVersionId: shared.sourceDocumentVersionId,
+    widthUnits: shared.widthUnits,
+    heightUnits: shared.heightUnits,
     createdAt: nowIso,
   };
 }

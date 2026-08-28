@@ -17,8 +17,8 @@
     "repo": "trpaslik444/construct-cloud-sync",
     "doc": "docs/REPO_BOUNDARIES.md",
     "section": "Háček 1 — SDÍLENÉ soubory",
-    "ref": "679ce508c695d301207693ba21633dec857009d0",
-    "date": "2026-08-27"
+    "ref": "ee623c70f194bd02f8566bee73fec6eef30fff5a",
+    "date": "2026-08-28"
   },
   "shared": [
     {
@@ -39,12 +39,12 @@
     {
       "main": "functions/src/membershipClaims.ts",
       "companion": "selfhost/functions/src/membershipClaims.ts",
-      "mainSha256": "34aa7c7fe44a8c7a594a2687156e03bd3e45a159c5ca571e9f8561b158003f5f"
+      "mainSha256": "c3c623f0ec3e24080af9fdec72621cfddaf0048e366a039dae7dd4ee50c81d6e"
     },
     {
       "main": "functions/src/membershipClaims.test.ts",
       "companion": "selfhost/functions/src/membershipClaims.test.ts",
-      "mainSha256": "43fc79ef955395d8867eb252051f2f0f11d86b21fed71d09cfe191d5a3dbc190"
+      "mainSha256": "c295dd863dc224e05626a3374b248b79facb2de65258add4664783706857b32e"
     },
     {
       "main": "functions/src/planPromotion.ts",
@@ -89,7 +89,7 @@
     {
       "main": "functions/src/shareLinkRotation.ts",
       "companion": "selfhost/functions/src/shareLinkRotation.ts",
-      "mainSha256": "8db955c40b90c6e5433086de4bc6660cdd93933244ce8d6dd55ace0f03e81ebc"
+      "mainSha256": "b0a626ba691d7f52116fc96f5902728a20efaa6089441a03e2f6bf515aed476f"
     },
     {
       "main": "functions/src/shareLinkRotation.test.ts",

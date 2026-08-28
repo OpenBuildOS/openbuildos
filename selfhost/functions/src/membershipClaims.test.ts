@@ -174,7 +174,7 @@ test("přetečení je TVRDÁ chyba se srozumitelnou hláškou, ne tiché uřízn
   assert.ok(thrown instanceof ClaimsTooLargeError, "musí vyhodit ClaimsTooLargeError");
   const error = thrown as ClaimsTooLargeError;
   assert.ok(error.bytes > error.limit);
-  assert.match(error.message, /60 projektů/);
+  assert.match(error.message, /60 stavbám/);
   // Seznam zůstal celý — nic se tiše neuřízlo.
   assert.equal(countProjectGrants(claims), 60);
 });
@@ -506,7 +506,7 @@ test("hostovaný prostor s mnoha stavbami narazí na strop tokenu, ne na tiché 
   const error = thrown as ClaimsTooLargeError;
   assert.ok(error.bytes > error.limit);
   assert.ok(error.limit < CLAIMS_BYTE_LIMIT, "rozpočet musí mít rezervu pod tvrdým limitem");
-  assert.match(error.message, /60 projektů/);
+  assert.match(error.message, /60 stavbám/);
   // Seznam zůstal celý — nic se neuřízlo.
   assert.equal(countProjectGrants(claims), 60);
 });
@@ -565,7 +565,9 @@ test("hostované firmě se do tokenu vejde 34 staveb, na 35. to řekne nahlas", 
 
   assert.equal(fits, 34, "hranice se pohnula — to je zpráva pro produkt, ne jen červený test");
 
-  // Na 35. stavbě to musí být SROZUMITELNÉ: co se stalo a co s tím.
+  // Na 35. stavbě to musí být SROZUMITELNÉ: co se stalo a co s tím. Věta jde
+  // beze změny na obrazovku (pruh `ClaimsLimitBanner` i chyba přihlášení),
+  // takže v ní NESMÍ být bajty ani jméno Googlovy služby.
   const overflow = await claimsFor(35);
   let thrown: unknown;
   try {
@@ -574,12 +576,48 @@ test("hostované firmě se do tokenu vejde 34 staveb, na 35. to řekne nahlas", 
     thrown = error;
   }
   assert.ok(thrown instanceof ClaimsTooLargeError);
-  assert.match((thrown as ClaimsTooLargeError).message, /35 projektů/);
-  assert.match((thrown as ClaimsTooLargeError).message, /admina firmy/);
+  const overflowMessage = (thrown as ClaimsTooLargeError).message;
+  assert.match(overflowMessage, /35 stavbám/);
+  assert.match(overflowMessage, /správce firmy/);
+  assert.doesNotMatch(overflowMessage, /firebase|workspace|\d+ B\b/i);
 
   // Rozpočet má rezervu pod tvrdým limitem Firebase — token se nesmí utrhnout
   // až u Firebase, kde by z toho byla neurčitá chyba.
   assert.ok(claimsByteSize({ ...stamp, ...(await claimsFor(34)) }) < CLAIMS_BYTE_LIMIT);
+});
+
+// 🔴 `countProjectGrants` počítá JEN `p`/`pw`. Správcovství firmy (`wsa`) se do
+// počtu nepromítne, ale bajty žere — takže existuje přetečení, u kterého vyjde
+// nula staveb. Věta „Máte přístup k 0 stavbám… nebo ať z vás udělá správce
+// firmy" by tomu člověku radila stav, ve kterém UŽ JE, a ještě by si protiřečila.
+test("přetečení jen přes `wsa` nehlásí „0 staveb“ ani nesmyslnou radu", () => {
+  const claims: MembershipClaims = {
+    // Hostované `wid` má 23 znaků (`ws_` + 20) — tolik firem rozpočet přeteče.
+    wsa: Array.from({ length: 40 }, (_, index) => `ws_${String(index).padStart(20, "0")}`),
+  };
+  const stamped = { src: "openbuildos", cv: CLAIMS_VERSION, ...claims };
+
+  assert.equal(countProjectGrants(claims), 0, "předpoklad testu: `wsa` se nepočítá");
+  assert.ok(claimsByteSize(stamped) > 900, "předpoklad testu: samo `wsa` přeteče rozpočet");
+
+  let thrown: unknown;
+  try {
+    assertClaimsFit(stamped);
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown instanceof ClaimsTooLargeError);
+  const message = (thrown as ClaimsTooLargeError).message;
+
+  assert.doesNotMatch(message, /0 stavb/, "nula staveb je pro čtenáře nesmysl");
+  assert.doesNotMatch(
+    message,
+    /udělá správce firmy/,
+    "tohle už ten člověk je — rada by mu neřekla, co má dělat"
+  );
+  // Musí to pořád být věta pro člověka, ne náhradní žargon.
+  assert.match(message, /nevejde/);
+  assert.doesNotMatch(message, /firebase|workspace|wsa|\d+ B\b/i);
 });
 
 // ────────────────────────────────────────────────────────────────────────────

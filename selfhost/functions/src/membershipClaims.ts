@@ -234,12 +234,22 @@ export type TokenClaims = MembershipClaims & Record<string, unknown>;
 export class ClaimsTooLargeError extends Error {
   readonly bytes: number;
   readonly limit: number;
+  /**
+   * Počet staveb, které se do claims nevešly.
+   *
+   * ⚠️ NESE HO CHYBA, ne jen hláška. Do 27. 8. 2026 to číslo existovalo POUZE
+   * ve větě `message` — a ta se ten den přepsala pro uživatele. Kdyby zůstalo
+   * jen tam, museli by ho oba logující volající (`authExchange`,
+   * `syncMemberClaims`) dolovat z textu, nebo by o něj přišli.
+   */
+  readonly projects: number;
 
-  constructor(message: string, bytes: number, limit: number) {
+  constructor(message: string, bytes: number, limit: number, projects: number) {
     super(message);
     this.name = "ClaimsTooLargeError";
     this.bytes = bytes;
     this.limit = limit;
+    this.projects = projects;
   }
 }
 
@@ -421,6 +431,19 @@ export function claimsByteSize(claims: unknown): number {
  * Ověří, že se claims vejdou do tokenu. TVRDÁ chyba se srozumitelnou hláškou —
  * tiché uříznutí seznamu projektů by znamenalo, že uživatel bez varování
  * ztratí přístup k části staveb (SECURITY_CLAIMS_DESIGN.md kap. 3).
+ *
+ * 🔴 `message` JDE BEZE ZMĚNY NA OBRAZOVKU, na dvou různých místech: klient ho
+ * pouští do pruhu `ClaimsLimitBanner` (přes `resource-exhausted`) i do chyby
+ * přihlášení `WorkspaceSignInError` (přes 413 z `authExchange`), kde přebíjí
+ * i připravenou hlášku `too-many-projects`. Do 27. 8. 2026 tu proto uživatel
+ * četl bajty a jméno Googlovy služby („…933 B. Firebase dovoluje nejvýš
+ * 1000 B."), zatímco nadpis pruhu nad tím mluvil česky.
+ *
+ * Věta tedy nese JEN to, co člověku k rozhodnutí stačí — kolik staveb má a co
+ * s tím —, a musí obstát i samostatně (v přihlášení kolem sebe nemá nic).
+ * ⚠️ Čísla pro nás se tím NEZTRÁCEJÍ: `bytes`, `limit` i `projects` visí na
+ * `ClaimsTooLargeError` a oba volající (`authExchange`, `syncMemberClaims`) je
+ * logují. `projects` na chybu přibylo právě proto, že dřív žilo jen ve větě.
  */
 export function assertClaimsFit(
   claims: TokenClaims,
@@ -432,14 +455,32 @@ export function assertClaimsFit(
   }
 
   const projectCount = countProjectGrants(claims);
-  throw new ClaimsTooLargeError(
-    `Seznam přístupů se nevejde do přihlašovacího tokenu (${bytes} B, limit ${limit} B; `
-      + `${projectCount} projektů). Firebase dovoluje nejvýš ${CLAIMS_BYTE_LIMIT} B. `
-      + "Řešení: rozdělit práci na míň projektů, nebo z uživatele udělat admina "
-      + "firmy (ten má jedinou položku na celý workspace).",
-    bytes,
-    limit
-  );
+  throw new ClaimsTooLargeError(describeOverflow(projectCount), bytes, limit, projectCount);
+}
+
+/**
+ * Věta pro uživatele nad stropem. Oddělená kvůli tomu, že {@link countProjectGrants}
+ * počítá JEN `p`/`pw`.
+ *
+ * 🔴 `wsa` (správcovství celé firmy) se do počtu NEPROMÍTÁ, přitom bajty žere:
+ * hostované `wid` má 23 znaků, takže správci ~34 firem přeteče rozpočet, i když
+ * nemá jedinou položku v `p`/`pw`. Tomu by věta „Máte přístup k 0 stavbám…
+ * nebo ať z vás udělá správce firmy" radila stav, ve kterém UŽ JE — a ještě by
+ * si protiřečila. Proto má ten případ vlastní znění.
+ *
+ * Kdo změní {@link countProjectGrants}, ať `wsa` počítá, musí sem sáhnout taky.
+ */
+function describeOverflow(projectCount: number): string {
+  if (projectCount === 0) {
+    // Zbývá jediná pravdivá věc, kterou lze říct: přístupů je moc a sám s tím
+    // nic nesvede. Rada „ubrat stavby" by tu byla lež — žádné tu nejsou.
+    return "Máte přístup k tolika firmám, že se to do jednoho přihlášení nevejde. "
+      + "Ozvěte se nám, tohle za vás musíme srovnat my.";
+  }
+  return `Máte přístup k ${projectCount} stavbám a tolik se jich do jednoho přihlášení `
+    + "nevejde. Požádejte správce firmy, ať vás z části staveb odebere, nebo ať "
+    + "z vás udělá správce firmy — ten se dostane do všech staveb naráz a tenhle "
+    + "strop se ho netýká.";
 }
 
 /** Claims tak, jak se reálně razí do tokenu — velikost se měří VČETNĚ režie. */
@@ -479,8 +520,8 @@ export function projectSlotsLeft(
   const width = Math.max(sample.projectId.length, 1);
 
   // Syntetické `pid` mají DÉLKU vzorku — na obsahu nezáleží, na bajtech ano.
-  // Prefix ` ` nepatří do žádného skutečného id, takže se nemůže potkat
-  // s existující položkou a „zdarma" se zduplikovat.
+  // Vzorek začíná MEZEROU, která do žádného skutečného id nepatří — takže se
+  // nemůže potkat s existující položkou a „zdarma" se zduplikovat.
   for (let slot = 0; slot < 1000; slot += 1) {
     const filler = ` ${String(slot)}`.padEnd(width, "0").slice(0, width);
     const probe: MembershipClaims = {

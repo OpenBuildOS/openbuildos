@@ -185,7 +185,7 @@ export function parseStorageObjectFromDownloadUrl(fileUrl: string): StorageObjec
   } catch {
     throw new ShareLinkRotationError(
       "failed-precondition",
-      "Sdílený soubor nemá podporovaný Firebase Storage download URL."
+      "Sdílený soubor je uložený jinde, než odkud ho umíme zneplatnit."
     );
   }
 
@@ -207,7 +207,7 @@ export function parseStorageObjectFromDownloadUrl(fileUrl: string): StorageObjec
 
   throw new ShareLinkRotationError(
     "failed-precondition",
-    "Sdílený soubor nemá podporovaný Firebase Storage download URL."
+    "Sdílený soubor je uložený jinde, než odkud ho umíme zneplatnit."
   );
 }
 
@@ -339,7 +339,10 @@ export async function revokeShareLinkAndRotate(
 ): Promise<RevokeShareLinkResult> {
   const { workspaceId, projectId, token, principal } = input;
   if (!workspaceId || !projectId || !token) {
-    throw new ShareLinkRotationError("invalid-argument", "Chybí wid, pid nebo token.");
+    throw new ShareLinkRotationError(
+      "invalid-argument",
+      "Není určená firma, stavba nebo odkaz, který se má zneplatnit."
+    );
   }
 
   const [workspace, project] = await Promise.all([
@@ -360,7 +363,7 @@ export async function revokeShareLinkAndRotate(
   if (typeof shareLink.fileUrl !== "string" || shareLink.fileUrl.length === 0) {
     throw new ShareLinkRotationError(
       "failed-precondition",
-      "Sdílecí odkaz neobsahuje URL souboru."
+      "U tohohle sdílecího odkazu není zaznamenané, na který soubor míří."
     );
   }
 

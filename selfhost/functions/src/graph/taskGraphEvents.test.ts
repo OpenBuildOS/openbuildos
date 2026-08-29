@@ -223,3 +223,51 @@ test("timestampToMicros: Timestamp → mikrosekundy; chybějící vstup → 0", 
   assert.equal(timestampToMicros({ seconds: 1, nanoseconds: 500_000 }), 1_000_500);
   assert.equal(timestampToMicros(undefined), 0);
 });
+
+// ── opravy z bezpečnostního review (Codex, 29. 8.) ─────────────────────────
+
+test("🔴 legacy interní úkol BEZ visibility → vis se odvodí ze scope (fail-closed, žádný únik)", () => {
+  const events = computeTaskGraphEvents(
+    input(
+      { title: "Interní", status: "open", scope: "company_internal", ownerCompanyId: "firma-a" },
+      undefined
+    )
+  );
+  assert.equal(events[0].vis.visibility, "firma-a");
+});
+
+test("🔴 legacy interní úkol bez visibility I ownerCompanyId → sentinel, který nikdo nepřečte", () => {
+  const events = computeTaskGraphEvents(
+    input({ title: "Interní", scope: "company_internal" }, undefined)
+  );
+  assert.equal(events[0].vis.visibility, "__internal_unreadable__");
+});
+
+test("legacy projektový úkol bez visibility → prázdný string (celá stavba)", () => {
+  const events = computeTaskGraphEvents(
+    input({ title: "Projektový", scope: "project_official" }, undefined)
+  );
+  assert.equal(events[0].vis.visibility, "");
+});
+
+test("deletedAt=false ani prázdný string NEjsou smazání (žádný falešný deleted)", () => {
+  const before: TaskDocLike = { title: "T", status: "open", deletedAt: null, visibility: "" };
+  assert.equal(
+    computeTaskGraphEvents(input(before, { ...before, deletedAt: false })).length,
+    0
+  );
+  assert.equal(
+    computeTaskGraphEvents(input(before, { ...before, deletedAt: "" })).length,
+    0
+  );
+});
+
+test("update s rozbitým after.updatedAt → occurredAt padá na fallback, NE na staré before.updatedAt", () => {
+  const events = computeTaskGraphEvents(
+    input(
+      { title: "T", status: "open", updatedAt: "2026-08-01T06:00:00.000Z", visibility: "" },
+      { title: "T", status: "done", updatedAt: 12345, visibility: "" }
+    )
+  );
+  assert.deepEqual(events[0].occurredAt, FALLBACK);
+});

@@ -1329,8 +1329,12 @@ export const taskGraphEvents = onDocumentWritten(
     }
 
     const { wid, pid, taskId } = event.params;
-    const revSnapshot = event.data?.after.exists ? event.data.after : event.data?.before;
-    const entityRevMicros = timestampToMicros(revSnapshot?.updateTime);
+    // U tvrdého smazání `before.updateTime` NENÍ nová revize (byla by shodná
+    // s posledním updatem a lifecycle by nešel seřadit) — bere se čas commitu
+    // z CloudEventu.
+    const entityRevMicros = event.data?.after.exists
+      ? timestampToMicros(event.data.after.updateTime)
+      : Date.parse(event.time) * 1000;
     const fallbackOccurredAt = isoToTimestampLike(event.time, { seconds: 0, nanoseconds: 0 });
 
     const drafts = computeTaskGraphEvents({
@@ -1346,23 +1350,22 @@ export const taskGraphEvents = onDocumentWritten(
     }
 
     const firestore = getFirestore(getLocalApp());
+    // Všechny eventy jednoho zdrojového zápisu jdou v JEDNOM batchi — buď
+    // vzniknou všechny, nebo žádný (nikdy neúplná skupina po částečném pádu).
+    // `set()` místo `create()`: obsah je deterministický (eventId z CloudEvent
+    // id + payload z diffu), takže opakované doručení zapíše totéž — atomicita
+    // s `create()` nejde dohromady (jeden ALREADY_EXISTS by shodil celý batch
+    // a chybějící eventy by už nikdy nevznikly). Jediné, co se při retry
+    // posune, je `committedAt` (zápisový sentinel serverTimestamp — kontrakt
+    // §3.4 to u committedAt povoluje).
+    const batch = firestore.batch();
     for (const draft of drafts) {
-      // `TimestampLike` je strukturální (§3.4 kontrakt); `serverTimestamp()` je
-      // zápisový sentinel, který Firestore po zápisu nahradí skutečným razítkem —
-      // kontrakt to výslovně povoluje (viz komentář u `committedAt` v grafContract.ts).
       const eventDoc = { ...draft, committedAt: FieldValue.serverTimestamp() } as unknown as GraphEvent;
-      try {
-        await firestore
-          .doc(`workspaces/${wid}/projects/${pid}/graphEvents/${draft.eventId}`)
-          .create(eventDoc);
-      } catch (error) {
-        const code = typeof error === "object" && error && "code" in error ? String(error.code) : "";
-        if (code === "6" || code === "already-exists") {
-          // Idempotentní retry — event už existuje z předchozího doručení.
-          continue;
-        }
-        throw error;
-      }
+      batch.set(
+        firestore.doc(`workspaces/${wid}/projects/${pid}/graphEvents/${draft.eventId}`),
+        eventDoc
+      );
     }
+    await batch.commit();
   }
 );

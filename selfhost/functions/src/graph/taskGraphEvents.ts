@@ -27,6 +27,7 @@ export interface TaskDocLike {
   updatedAt?: unknown; // ISO string (viz `src/services/tasks.ts` serializeTask)
   updatedByUserId?: unknown;
   visibility?: unknown;
+  scope?: unknown; // pro fail-closed odvození visibility u legacy úkolů
   ownerCompanyId?: unknown;
   assignment?: { assigneeId?: unknown } | unknown;
   schedule?: { startDate?: unknown; endDate?: unknown } | unknown;
@@ -121,18 +122,33 @@ function dateRangeOrUndefined(
 }
 
 function isDeletedAtSet(value: unknown): boolean {
-  return value !== null && value !== undefined;
+  // Jen hodnoty, které klient reálně zapisuje (Timestamp objekt / ISO string /
+  // epocha) — `false`, `""` ani jiný odpad smazání neznamenají a nesmí vyrobit
+  // falešný `deleted` event.
+  if (value === null || value === undefined || value === false || value === "") return false;
+  return typeof value === "string" || typeof value === "number" || typeof value === "object";
 }
 
 function statusOf(task: TaskDocLike | undefined): string | undefined {
   return stringOrUndefined(task?.status);
 }
 
+/**
+ * 🔴 FAIL-CLOSED. `""` = obsah celé stavby, takže default `""` by eventy
+ * LEGACY interního úkolu (bez backfillnutého `visibility`) otevřel všem členům
+ * — včetně titulku v tombstone. Bez explicitního `visibility` se proto odvozuje
+ * ze `scope` stejně jako `taskVisibility()` na FE; interní úkol bez
+ * `ownerCompanyId` dostane sentinel, který žádný čtenář nematchne.
+ */
 function visibilityOf(before: TaskDocLike | undefined, after: TaskDocLike | undefined): string {
-  const afterVis = after?.visibility;
-  if (isPlainString(afterVis)) return afterVis;
-  const beforeVis = before?.visibility;
-  return isPlainString(beforeVis) ? beforeVis : "";
+  const doc = after ?? before;
+  const explicit = doc?.visibility;
+  if (isPlainString(explicit)) return explicit;
+  if (doc?.scope === "company_internal") {
+    const owner = doc?.ownerCompanyId;
+    return isPlainString(owner) && owner.length > 0 ? owner : "__internal_unreadable__";
+  }
+  return "";
 }
 
 function ownerCompanyIdOf(before: TaskDocLike | undefined, after: TaskDocLike | undefined): string | undefined {
@@ -153,8 +169,11 @@ export function computeTaskGraphEvents(input: ComputeTaskGraphEventsInput): Grap
   const entity: GraphNodeRef = { wid: ref.wid, pid: ref.pid, type: "task", taskId: ref.taskId };
   const actor =
     stringOrUndefined(after?.updatedByUserId) || stringOrUndefined(before?.updatedByUserId) || "unknown";
+  // U update s rozbitým/chybějícím `after.updatedAt` je pravdě blíž serverový
+  // čas doručení (fallback) než STARÉ `before.updatedAt`; before se použije
+  // jen u tvrdého smazání, kde after neexistuje.
   const occurredAt = isoToTimestampLike(
-    stringOrUndefined(after?.updatedAt) ?? stringOrUndefined(before?.updatedAt),
+    stringOrUndefined(after?.updatedAt) ?? (after ? undefined : stringOrUndefined(before?.updatedAt)),
     fallbackOccurredAt
   );
   const ownerCompanyId = ownerCompanyIdOf(before, after);

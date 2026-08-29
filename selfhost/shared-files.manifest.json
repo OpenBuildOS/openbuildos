@@ -105,6 +105,11 @@
       "main": "functions/src/thumbnails.test.ts",
       "companion": "selfhost/functions/src/thumbnails.test.ts",
       "mainSha256": "d2821d085b553efe5e3dbb3c599d81df4b24a2dc9ce2371aef905858d2d55c93"
+    },
+    {
+      "main": "functions/src/graph/graphContract.ts",
+      "companion": "selfhost/functions/src/graph/graphContract.ts",
+      "mainSha256": "a780f33d2e2601e66ff3ca5a03c47221f0b617f777598a06d0a0c5a24cfa3476"
     }
   ],
   "notShared": [

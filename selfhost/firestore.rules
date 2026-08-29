@@ -362,6 +362,16 @@ service cloud.firestore {
         || resource.data.visibility == memberCompany(pid, principal());
     }
 
+    // Stejná logika jako `visibleInList`, ale nad `vis` obálkou odvozených
+    // dokumentů grafu (`graphEvents` §3.6 projektového grafu) místo přímo nad
+    // `visibility` úkolu — recykluje `memberCompany`, nová jen tahle jedna
+    // funkce (strop 1 000 výrazů). PŘÍMÝ přístup na `vis.visibility`, ne
+    // `.get()` — u `list` je to nutné (nález A1, viz `visibleInList` výš).
+    function graphEventVisible(pid, vis) {
+      return vis.visibility == ''
+        || vis.visibility == memberCompany(pid, principal());
+    }
+
     function isSameProjectCompany(wid, pid, companyId) {
       return companyId != ''
         && isProjectMember(wid, pid)
@@ -1506,6 +1516,17 @@ service cloud.firestore {
            && (isCompanySpaceLead(wid, pid, resource.data.get('ownerCompanyId', '')) || authoredBySelf()))
         : canModifyContent(wid, pid))
         && !projectFrozen(pid);
+    }
+
+    // Append-only události projektového grafu (Fáze 0c,
+    // `docs/specs/projektovy-graf.md` §3.4) — zapisuje VÝHRADNĚ Admin SDK
+    // trigger (obchází rules), klient jen čte. Viditelnost zrcadlí zdrojový
+    // úkol přes denormalizovanou obálku `vis` (§3.6): stejný princip jako
+    // `visibleInList` nad `tasks` výš, jen nad `vis.visibility` místo
+    // `visibility`. Žádné `allow create/update/delete` — immutable vůči
+    // klientům (§3.4: jediná mutace je serverová redakce `redacted`).
+    match /workspaces/{wid}/projects/{pid}/graphEvents/{eventId} {
+      allow read: if isProjectMember(wid, pid) && graphEventVisible(pid, resource.data.vis);
     }
 
     match /workspaces/{wid}/projects/{pid}/files/{docId} {

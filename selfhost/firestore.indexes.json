@@ -105,6 +105,20 @@
           "arrayConfig": "CONTAINS"
         }
       ]
+    },
+    {
+      "collectionGroup": "overlayGroups",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "memberDocumentIds",
+          "arrayConfig": "CONTAINS"
+        },
+        {
+          "fieldPath": "status",
+          "order": "ASCENDING"
+        }
+      ]
     }
   ],
   "fieldOverrides": []

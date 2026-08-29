@@ -3,7 +3,7 @@ import { getAuth } from "firebase-admin/auth";
 import { FieldValue, getFirestore } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
 import { HttpsError, onCall, onRequest, type Request } from "firebase-functions/v2/https";
-import { onDocumentCreated, onDocumentUpdated } from "firebase-functions/v2/firestore";
+import { onDocumentCreated, onDocumentUpdated, onDocumentWritten } from "firebase-functions/v2/firestore";
 import { onSchedule } from "firebase-functions/v2/scheduler";
 import { runInviteSweep } from "./inviteSweep";
 import * as logger from "firebase-functions/logger";
@@ -58,6 +58,10 @@ import {
   type ThumbnailKind,
   type ThumbnailSourceRecord,
 } from "./thumbnails";
+// Projektový graf, Fáze 0c (docs/specs/projektovy-graf.md §3.4, §4.2) — jen companion,
+// viz hlavička taskGraphEvents.ts. `graphContract.ts` je BYTE IDENTICKÝ s hlavním repem.
+import { computeTaskGraphEvents, isoToTimestampLike, timestampToMicros } from "./graph/taskGraphEvents";
+import type { GraphEvent } from "./graph/graphContract";
 
 /**
  * Token-exchange Cloud Function `authExchange` pro OpenBuildOS federaci.
@@ -1287,5 +1291,81 @@ export const generateDocumentThumbnail = onDocumentCreated(
       },
       { workspaceId, projectId, versionId }
     );
+  }
+);
+
+/**
+ * `taskGraphEvents` — Fáze 0c projektového grafu (#834,
+ * `docs/specs/projektovy-graf.md` §3.4, §4.2): append-only `graphEvents`
+ * z diffu úkolu. Diffovací logika je čistá funkce `computeTaskGraphEvents`
+ * (viz `graph/taskGraphEvents.ts`, testováno bez emulátoru) — tenhle trigger
+ * jen čte snapshot, dopočítá `entityRev`/`committedAt` a zapisuje.
+ *
+ * ⭐ `onDocumentWritten`, NE `onDocumentCreated`/`onDocumentUpdated` zvlášť:
+ * jeden diff musí pokrýt vznik, update i (tvrdé) smazání dokumentu — to je
+ * přesně to, co `onDocumentWritten` nese v `event.data.before`/`.after`
+ * (`exists` na obou stranách; typicky jedna chybí u create/delete).
+ *
+ * ⚠️ IDEMPOTENCE: `eventId` je deterministický (`event.id` z CloudEventu +
+ * akce), takže opakovaný běh (retry po chybě, "at-least-once" doručení)
+ * skončí na `.create()` chybou `ALREADY_EXISTS` (kód 6) — ta se tiše
+ * spolkne, cokoli jiného propadá dál (retry funkce). Bez `retry: true`
+ * ze stejného důvodu jako `promoteApprovedDrawingToPlan` výše (firebase-tools
+ * by k failure policy vyžadovalo `--force`, které self-host setup nesmí použít).
+ *
+ * ⚠️ REGION SE NEURČUJE — stejně jako u sousedních Firestore triggerů výše,
+ * Eventarc musí ležet v lokaci databáze a firebase-tools ji odvodí sama.
+ *
+ * ⚠️ ŽÁDNÉ ČTENÍ NAVÍC — všechno se počítá z trigger snapshotu, `vis` je
+ * denormalizovaná viditelnost přímo z úkolu (§3.6), ne dotaz na jiný dokument.
+ */
+export const taskGraphEvents = onDocumentWritten(
+  { document: "workspaces/{wid}/projects/{pid}/tasks/{taskId}" },
+  async (event) => {
+    const before = event.data?.before.exists ? (event.data.before.data() as Record<string, unknown>) : undefined;
+    const after = event.data?.after.exists ? (event.data.after.data() as Record<string, unknown>) : undefined;
+    if (!before && !after) {
+      return; // nemělo by nastat, ale diff nemá co počítat
+    }
+
+    const { wid, pid, taskId } = event.params;
+    // U tvrdého smazání `before.updateTime` NENÍ nová revize (byla by shodná
+    // s posledním updatem a lifecycle by nešel seřadit) — bere se čas commitu
+    // z CloudEventu.
+    const entityRevMicros = event.data?.after.exists
+      ? timestampToMicros(event.data.after.updateTime)
+      : Date.parse(event.time) * 1000;
+    const fallbackOccurredAt = isoToTimestampLike(event.time, { seconds: 0, nanoseconds: 0 });
+
+    const drafts = computeTaskGraphEvents({
+      before,
+      after,
+      ref: { wid, pid, taskId },
+      eventBaseId: event.id,
+      entityRevMicros,
+      fallbackOccurredAt,
+    });
+    if (drafts.length === 0) {
+      return;
+    }
+
+    const firestore = getFirestore(getLocalApp());
+    // Všechny eventy jednoho zdrojového zápisu jdou v JEDNOM batchi — buď
+    // vzniknou všechny, nebo žádný (nikdy neúplná skupina po částečném pádu).
+    // `set()` místo `create()`: obsah je deterministický (eventId z CloudEvent
+    // id + payload z diffu), takže opakované doručení zapíše totéž — atomicita
+    // s `create()` nejde dohromady (jeden ALREADY_EXISTS by shodil celý batch
+    // a chybějící eventy by už nikdy nevznikly). Jediné, co se při retry
+    // posune, je `committedAt` (zápisový sentinel serverTimestamp — kontrakt
+    // §3.4 to u committedAt povoluje).
+    const batch = firestore.batch();
+    for (const draft of drafts) {
+      const eventDoc = { ...draft, committedAt: FieldValue.serverTimestamp() } as unknown as GraphEvent;
+      batch.set(
+        firestore.doc(`workspaces/${wid}/projects/${pid}/graphEvents/${draft.eventId}`),
+        eventDoc
+      );
+    }
+    await batch.commit();
   }
 );

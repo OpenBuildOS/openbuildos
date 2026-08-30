@@ -1,6 +1,6 @@
 import { initializeApp, getApps, getApp } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
-import { FieldValue, getFirestore } from "firebase-admin/firestore";
+import { FieldValue, Timestamp, getFirestore } from "firebase-admin/firestore";
 import { getStorage } from "firebase-admin/storage";
 import { HttpsError, onCall, onRequest, type Request } from "firebase-functions/v2/https";
 import { onDocumentCreated, onDocumentUpdated, onDocumentWritten } from "firebase-functions/v2/firestore";
@@ -46,8 +46,11 @@ import {
 // s hlavním repem (viz docs/REPO_BOUNDARIES.md).
 import {
   ShareLinkRotationError,
+  canEditProjectContent,
   createFirestoreShareLinkStore,
   revokeShareLinkAndRotate,
+  type ProjectRecord,
+  type WorkspaceRecord,
 } from "./shareLinkRotation";
 // Serverové miniatury — SDÍLENÝ modul s hlavním repem (viz docs/REPO_BOUNDARIES.md).
 import {
@@ -61,7 +64,10 @@ import {
 // Projektový graf, Fáze 0c (docs/specs/projektovy-graf.md §3.4, §4.2) — jen companion,
 // viz hlavička taskGraphEvents.ts. `graphContract.ts` je BYTE IDENTICKÝ s hlavním repem.
 import { computeTaskGraphEvents, isoToTimestampLike, timestampToMicros } from "./graph/taskGraphEvents";
-import type { GraphEvent } from "./graph/graphContract";
+import type { GraphEvent, ReviewItem } from "./graph/graphContract";
+// `resolveReviewItem` — Fáze 2b projektového grafu (§3.5), SDÍLENÝ modul
+// s hlavním repem (viz docs/REPO_BOUNDARIES.md).
+import { planReviewResolution } from "./graph/resolveReviewItem";
 
 /**
  * Token-exchange Cloud Function `authExchange` pro OpenBuildOS federaci.
@@ -1369,3 +1375,144 @@ export const taskGraphEvents = onDocumentWritten(
     await batch.commit();
   }
 );
+
+/**
+ * `resolveReviewItem` — Fáze 2b projektového grafu (`docs/specs/projektovy-graf.md`
+ * §3.5): jediná cesta, kudy `ReviewItem` opouští `pending`. Rozhodovací logika
+ * je čistá funkce `planReviewResolution` (viz `graph/resolveReviewItem.ts`,
+ * testováno bez emulátoru) — tenhle wrapper jen autorizuje volajícího, přečte
+ * review item (a případnou cílovou entitu) a zapíše výsledek v JEDNÉ transakci.
+ *
+ * ⭐ AUTORIZACE reuse-uje `canEditProjectContent` ze `shareLinkRotation.ts`
+ * (stejný modul, který používá `revokeShareLinkAndRotateToken` výše) — čte
+ * KOŘENOVÉ `workspaces/{wid}` a `projects/{pid}` (ne subkolekci `members`,
+ * `projects` leží mimo `workspaces/…`, viz `createFirestoreShareLinkStore`)
+ * a zrcadlí `canEdit(wid, pid)` z `firestore.rules`: vlastník/admin firmy,
+ * nebo projektová role `admin`/`editor`/`company_lead` — VIEWER neprojde.
+ * ReviewItem sám nese `reviewers` (`target_editors`), ale to je jen deklarace
+ * PRO KOHO je návrh — samotné oprávnění rozhodnout je „umí editovat obsah
+ * na tomhle projektu", stejná brána jako u ostatního obsahu grafu.
+ *
+ * ⚠️ TRANSAKCE: Firestore vyžaduje všechna `get()` PŘED prvním zápisem, proto
+ * se cílová entita (je-li `entityPatch`) čte HNED PO spočítání výsledku,
+ * ještě před `txn.update()` na review itemu. `already_resolved` a chybové
+ * výsledky (`unsupported_field`/`unknown_field`/`unsupported_payload`) nikdy
+ * nezapisují nic — jen review item se čte.
+ */
+export const resolveReviewItem = onCall<{
+  workspaceId?: string;
+  projectId?: string;
+  itemId?: string;
+  action?: string;
+  corrections?: Record<string, unknown>;
+}>({ region: "europe-west1" }, async (request) => {
+  if (!request.auth) {
+    throw new HttpsError("unauthenticated", "Chybí přihlášení.");
+  }
+  const principal = principalFromAuth(request.auth);
+
+  const workspaceId = typeof request.data?.workspaceId === "string" ? request.data.workspaceId : "";
+  const projectId = typeof request.data?.projectId === "string" ? request.data.projectId : "";
+  const itemId = typeof request.data?.itemId === "string" ? request.data.itemId : "";
+  const action = request.data?.action;
+  const corrections = request.data?.corrections;
+
+  if (!workspaceId || !projectId || !itemId) {
+    throw new HttpsError("invalid-argument", "Chybí workspaceId, projectId nebo itemId.");
+  }
+  if (action !== "confirmed" && action !== "rejected") {
+    throw new HttpsError("invalid-argument", 'action musí být "confirmed" nebo "rejected".');
+  }
+  if (
+    corrections !== undefined &&
+    (action !== "confirmed" || typeof corrections !== "object" || corrections === null || Array.isArray(corrections))
+  ) {
+    throw new HttpsError(
+      "invalid-argument",
+      'corrections smí doprovázet jen action "confirmed" a musí být objekt.'
+    );
+  }
+
+  const firestore = getFirestore(getLocalApp());
+  const [workspaceSnap, projectSnap] = await Promise.all([
+    firestore.doc(`workspaces/${workspaceId}`).get(),
+    firestore.doc(`projects/${projectId}`).get(),
+  ]);
+  const workspace = workspaceSnap.exists ? (workspaceSnap.data() as WorkspaceRecord) : null;
+  const project = projectSnap.exists ? (projectSnap.data() as ProjectRecord) : null;
+  if (!canEditProjectContent(workspace, project, workspaceId, principal)) {
+    throw new HttpsError("permission-denied", "Nemáš oprávnění rozhodovat o návrzích na téhle stavbě.");
+  }
+
+  const itemRef = firestore.doc(`workspaces/${workspaceId}/projects/${projectId}/reviewItems/${itemId}`);
+  const nowIso = new Date().toISOString();
+
+  try {
+    const txnResult = await firestore.runTransaction(async (txn) => {
+      const itemSnap = await txn.get(itemRef);
+      if (!itemSnap.exists) {
+        throw new HttpsError("not-found", "ReviewItem neexistuje.");
+      }
+      const item = itemSnap.data() as ReviewItem;
+      const outcome = planReviewResolution(item, action, corrections, principal, nowIso);
+
+      if (outcome.kind === "already_resolved") {
+        return { alreadyResolved: true as const, item };
+      }
+      if (outcome.kind === "error") {
+        throw new HttpsError("failed-precondition", outcome.error.message);
+      }
+
+      // Všechna čtení musí proběhnout PŘED prvním zápisem (Firestore transakce).
+      const entityRef = outcome.entityPatch
+        ? firestore.doc(`${outcome.entityPatch.collectionPath}/${outcome.entityPatch.docId}`)
+        : null;
+      if (entityRef) {
+        const entitySnap = await txn.get(entityRef);
+        if (!entitySnap.exists) {
+          throw new HttpsError("not-found", "Cílový dokument pro tenhle návrh už neexistuje.");
+        }
+      }
+
+      const firestoreResolution: Record<string, unknown> = {
+        by: outcome.resolutionPatch.resolution.by,
+        at: FieldValue.serverTimestamp(),
+        ...(outcome.resolutionPatch.resolution.applied ? { applied: outcome.resolutionPatch.resolution.applied } : {}),
+        ...(outcome.resolutionPatch.resolution.note ? { note: outcome.resolutionPatch.resolution.note } : {}),
+      };
+      txn.update(itemRef, { status: outcome.resolutionPatch.status, resolution: firestoreResolution });
+      if (entityRef && outcome.entityPatch) {
+        txn.update(entityRef, outcome.entityPatch.fields);
+      }
+
+      return { alreadyResolved: false as const, finalStatus: outcome.finalStatus };
+    });
+
+    if (txnResult.alreadyResolved) {
+      const existing = txnResult.item.resolution;
+      return {
+        status: "already_resolved" as const,
+        ...(existing
+          ? {
+              resolution: {
+                status: txnResult.item.status,
+                by: existing.by,
+                at: existing.at instanceof Timestamp ? existing.at.toDate().toISOString() : nowIso,
+              },
+            }
+          : {}),
+      };
+    }
+
+    return {
+      status: "resolved" as const,
+      resolution: { status: txnResult.finalStatus, by: principal, at: nowIso },
+    };
+  } catch (error) {
+    if (error instanceof HttpsError) {
+      throw error;
+    }
+    logger.error("resolveReviewItem selhalo", { workspaceId, projectId, itemId, principal, error });
+    throw new HttpsError("internal", "Rozhodnutí o návrhu se nepodařilo dokončit.");
+  }
+});

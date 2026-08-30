@@ -1742,6 +1742,31 @@ service cloud.firestore {
       allow delete: if canContribute(wid, pid) && !projectFrozen(pid);
     }
 
+    // Vytěžený text dokumentů (`docs/specs/projektovy-graf.md` §4.3, Fáze 3) —
+    // vrstva B1 (přepočitatelná projekce). Čtení zrcadlí `graphEvents` výš:
+    // táž `graphEventVisible` nad denormalizovanou obálkou `vis`, přímým
+    // přístupem kvůli `list` (nález A1).
+    //
+    // 🔴 Zápis stojí na `publish`, ne na `canCreateContent`. Chunk vzniká JEN
+    // jako doprovod nahrané verze oficiální dokumentace, a tu smí zakládat
+    // právě držitel `publish` (viz `officialCreateOk` u `documents`). Volnější
+    // brána by dovolila komukoli, kdo smí zakládat obsah, podstrčit do
+    // vyhledávání a pozdějšího retrievalu text, který v žádném dokumentu není.
+    // Samotné `officialCreateOk` se sem použít NEDÁ — ověřuje `ownerCompanyId`
+    // a `createdBy`, pole, která odvozený chunk nenese.
+    match /workspaces/{wid}/projects/{pid}/extractedChunks/{chunkId} {
+      allow read: if isProjectMember(wid, pid) && graphEventVisible(pid, resource.data.vis);
+      allow create, update: if permsOf(wid, pid).hasAny(['publish'])
+        && request.resource.data.schemaVersion == 1
+        && request.resource.data.documentId is string
+        && request.resource.data.extractorVersion is string
+        && graphEventVisible(pid, request.resource.data.vis)
+        && !projectFrozen(pid);
+      // Projekce žije a umírá se zdrojem (§7 Retence): kdo smí zahodit
+      // dokument, smí zahodit i jeho vytěžený text.
+      allow delete: if canModifyContent(wid, pid);
+    }
+
     match /workspaces/{wid}/projects/{pid}/files/{docId} {
       allow read: if isProjectMember(wid, pid);
       allow create: if canCreateContent(wid, pid);

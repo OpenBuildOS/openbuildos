@@ -261,14 +261,16 @@ export function planReviewResolution(
         kind: "error",
         error: {
           code: "unsupported_payload",
-          message: 'ReviewItem s payload.kind "edge_proposal" zatím nejde potvrdit — producent hran ještě neexistuje.',
+          message: "Tenhle druh návrhu se zatím potvrdit nedá — návrhy souvislostí ještě nikdo nevytváří.",
         },
       };
     case "field_values":
       return planFieldValuesResolution(item.target, item.payload, corrections, finalStatus, principal, nowIso);
     default: {
       const exhaustive: never = item.payload;
-      throw new Error(`planReviewResolution: neznámý payload.kind ${(exhaustive as { kind: string }).kind}`);
+      // Vnitřní kontrola úplnosti — sem se dostane jen kód, ne uživatel:
+      // každý druh položky fronty musí mít větev výš.
+      throw new Error(`planReviewResolution: neznámý druh položky ${(exhaustive as { kind: string }).kind}`);
     }
   }
 }

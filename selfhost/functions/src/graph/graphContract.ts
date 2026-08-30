@@ -273,6 +273,113 @@ export interface NeedMute {
 }
 
 // ---------------------------------------------------------------------------
+// §4.3 Vytěžený text — stav extrakce a chunky (Fáze 3, vrstva B1)
+// ---------------------------------------------------------------------------
+
+/**
+ * Verze extraktoru. **Bump = řízená reindexace**, ne kosmetika: chunky se starší
+ * verzí se nemíchají s novými (§7 „Verzování"). Měň ji, když se změní tvar
+ * výstupu (jiné dělení, jiná normalizace), ne když se opraví překlep v komentáři.
+ */
+export const EXTRACTOR_VERSION = "pdfjs-text-1";
+
+/**
+ * Cíl délky jednoho chunku ve ZNACÍCH. Spec mluví o „~2 kB"; čeština má
+ * v UTF-8 diakritiku na dvou bajtech, takže 1 800 znaků ≈ 2–3 kB — a měřeno
+ * na reálném korpusu Kladna (92 stran, medián 2 626 znaků na stránku) se tím
+ * většina stran rozpadne na dva chunky, což je záměr: chunk má být menší než
+ * stránka, aby citace mířila do místa, ne na celý výkres.
+ */
+export const CHUNK_TARGET_CHARS = 1800;
+
+/**
+ * Proč se extrakce nepovedla. `no_text_layer` NENÍ chyba aplikace — sken bez
+ * textové vrstvy je legitimní vstup a čeká na OCR; odlišit ho od `unreadable`
+ * je celý smysl tohohle výčtu (§7 „Chybové cesty": nikdy tichý fallback).
+ */
+export type ExtractionFailureReason =
+  | "no_text_layer" // PDF otevřeno, ale textová vrstva prázdná → kandidát na OCR
+  | "unreadable" // soubor se nepodařilo otevřít/rozparsovat
+  | "unsupported" // není PDF (dnes umíme jen PDF)
+  | "too_large" // přes strop, extrakce se nepokoušela
+  | "not_stored"; // text se PŘEČETL, ale neuložil (práva, offline) — jiná náprava
+  //                 než `unreadable`: zkusit znovu, ne shánět jiný soubor
+
+/**
+ * Stav vytěžení JEDNÉ verze dokumentu.
+ *
+ * ⚠️ ODCHYLKA OD SPECU (§4.3 uvádí `state` mezi poli chunku): stav sedí na
+ * VERZI, ne na chunku. Neúspěšná extrakce žádný chunk nevyrobí, takže „state:
+ * failed" na chunku je stav, který nemá kam napsat — a otázka, na kterou musí
+ * UI umět odpovědět, zní „přečetli jsme obsah tohohle dokumentu?", což je
+ * vlastnost verze. Chunky proto existují jen pro `done`.
+ */
+export interface ExtractionStatus {
+  schemaVersion: 1;
+  state: "pending" | "done" | "failed";
+  /** Vyplněné jen u `failed`. */
+  reason?: ExtractionFailureReason;
+  extractorVersion: string;
+  /** Naměřené u `done` — kolik se toho vytěžilo (metrika kvality bez obsahu, §7). */
+  pages?: number;
+  chars?: number;
+  chunks?: number;
+  at: TimestampLike;
+}
+
+/**
+ * `workspaces/{wid}/projects/{pid}/extractedChunks/{chunkId}` — vrstva B1
+ * (přepočitatelná projekce). Žije a umírá se zdrojem: smazaná verze → smazané
+ * chunky.
+ *
+ * Kanonický text celé verze leží ve Storage vedle souboru
+ * (`…/documents/{documentId}/{versionId}/extracted/text.json`); tady je jen
+ * tolik, kolik potřebuje retrieval, aby se kvůli hledání nemusel stahovat
+ * celý JSON.
+ */
+export interface ExtractedChunk {
+  schemaVersion: 1;
+  /** Verze, ze které chunk pochází — vždy `type: "document_version"`. */
+  versionRef: GraphNodeRef;
+  documentId: string;
+  /** 1-based, jako čísluje pdf.js i člověk. */
+  page: number;
+  /** Rozsah ve znacích v rámci textu TÉ STRÁNKY (ne celého dokumentu). */
+  charRange: [number, number];
+  text: string;
+  /** Hash normalizovaného textu — evidence přežije novou extrakci i OCR (viz `Evidence.sourceHash`). */
+  sourceHash: string;
+  extractorVersion: string;
+  vis: SecurityEnvelope;
+  createdAt: TimestampLike;
+}
+
+/**
+ * Deterministické ID chunku — opakovaná extrakce téže verze přepíše tytéž
+ * dokumenty místo hromadění duplicit (stejná úvaha jako u `needMuteId`).
+ * `extractorVersion` je součástí ID záměrně: po bumpu vzniknou chunky vedle
+ * starých, takže reindexace je viditelná a stará sada se dá uklidit adresně.
+ */
+export function extractedChunkId(
+  versionId: string,
+  page: number,
+  charStart: number,
+  extractorVersion: string
+): string {
+  return stableId([extractorVersion, versionId, String(page), String(charStart)]);
+}
+
+/**
+ * Normalizace před hashováním: sjednotí bílé znaky a velikost písmen, aby
+ * `sourceHash` přežil kosmetické změny extraktoru (jiné mezerování mezi
+ * položkami textové vrstvy) a nezměnil se jen proto, že pdf.js poskládal
+ * tytéž glyfy o kousek jinak.
+ */
+export function normalizeChunkText(text: string): string {
+  return text.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+// ---------------------------------------------------------------------------
 // 3.7 Serializovatelný dotaz
 // ---------------------------------------------------------------------------
 

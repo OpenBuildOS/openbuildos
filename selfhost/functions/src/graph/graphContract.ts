@@ -240,6 +240,39 @@ export interface SecurityEnvelope {
 }
 
 // ---------------------------------------------------------------------------
+// §5.4 Ztišení zjištění (needMutes) — sdílené, auditovatelné lidské rozhodnutí
+// ---------------------------------------------------------------------------
+
+/**
+ * `workspaces/{wid}/projects/{pid}/needMutes/{muteId}` — vrstva B2 (lidské
+ * rozhodnutí, neobnovitelné). Ztišuje konkrétní zjištění needs enginu
+ * (`src/services/graph/needs.ts`), dokud se otisk situace nezmění.
+ *
+ * `muteId` (dokumentové ID, NENÍ pole v datech — stejný vzor jako
+ * `dedupeKey`/ID u `ReviewItem`) je deterministický z IDENTITY zjištění
+ * (`needMuteId`), takže opakované ztišení téhož zjištění přepíše původní
+ * záznam místo hromadění duplicit.
+ *
+ * `fingerprint` je otisk SITUACE (`needFingerprint`), ne identity — zachytí
+ * VŠECHNY entity, o které se zjištění opírá (u pravidla 1 např. [úkol,
+ * připnutá revize, platná revize]). Změní-li se cokoli z toho (nová platná
+ * revize, jiný přiřazený řešitel…), otisk už nesedí a ztišení need znovu
+ * odkryje — to je pojistka proti „ztišil jsem a ono to zmlklo navždy".
+ */
+export interface NeedMute {
+  schemaVersion: 1;
+  reasonCode: string;
+  /** Otisk SITUACE, která se ztišila — viz komentář výš. Změní-li se, ztišení neplatí. */
+  fingerprint: string;
+  /** Do kdy (snooze). Chybí = „vyřešeno jinak" (dokud se fingerprint nezmění). */
+  until?: TimestampLike;
+  by: string; // principal
+  at: TimestampLike;
+  note?: string; // v1 nepoužito UI, ale v kontraktu ať je
+  vis: SecurityEnvelope;
+}
+
+// ---------------------------------------------------------------------------
 // 3.7 Serializovatelný dotaz
 // ---------------------------------------------------------------------------
 
@@ -380,6 +413,17 @@ function fnv1a64(input: string): bigint {
 }
 
 /**
+ * Stabilní hex ID z libovolného počtu částí spojených `|` — sdílený základ pro
+ * `makeEdgeId` i `needMuteId` (§5.4). Jeden hash, jedna sada pravidel escapování
+ * (žádné — části se nesmí samy o sobě spoléhat na to, že v sobě `|` nemají;
+ * volající si nese odpovědnost za jednoznačnost svých částí, přesně jako dosud
+ * `makeEdgeId`).
+ */
+export function stableId(parts: string[]): string {
+  return fnv1a64(parts.join("|")).toString(16);
+}
+
+/**
  * Deterministické id hrany: `hash(type | keyA | keyB)`. U symetrických typů
  * (`SYMMETRIC_EDGE_TYPES`) se `refKey(from)`/`refKey(to)` před hashem seřadí
  * lexikograficky, aby A→B a B→A dostaly stejné id.
@@ -393,7 +437,28 @@ export function makeEdgeId(type: GraphEdgeType, from: GraphNodeRef, to: GraphNod
     keyA = keyTo;
     keyB = keyFrom;
   }
-  return fnv1a64(`${type}|${keyA}|${keyB}`).toString(16);
+  return stableId([type, keyA, keyB]);
+}
+
+/**
+ * Deterministické ID ztišení (§5.4) — z IDENTITY zjištění (`reasonCode` +
+ * `refKey` PRVNÍ entity), NE z otisku situace (`needFingerprint`). Opakované
+ * ztišení téhož zjištění tak dá stejné ID a přepíše původní záznam místo
+ * hromadění duplicit; ID slouží přímo jako Firestore dokumentové ID
+ * (`needMutes/{muteId}`), proto hex výstup `stableId`, ne surový text.
+ */
+export function needMuteId(reasonCode: string, primaryRefKey: string): string {
+  return stableId([reasonCode, primaryRefKey]);
+}
+
+/**
+ * Otisk SITUACE, kterou ztišení pokrývá (§5.4) — `refKey` VŠECH entit v
+ * zachovaném pořadí, spojené `|`. Na rozdíl od `needMuteId` se NEHASHUJE:
+ * ukládá se jako datové pole a porovnává se jen na rovnost, hash by tu jen
+ * skryl, která entita se změnila, kdyby bylo potřeba ladit neshodu.
+ */
+export function needFingerprint(refKeys: string[]): string {
+  return refKeys.join("|");
 }
 
 /**

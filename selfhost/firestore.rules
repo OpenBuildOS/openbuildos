@@ -1564,6 +1564,37 @@ service cloud.firestore {
         && graphEventVisible(pid, request.resource.data.vis);
     }
 
+    // Ztišení zjištění needs enginu — „vím o tom, neřeš to"
+    // (`docs/specs/projektovy-graf.md` §5.4). Sdílené LIDSKÉ rozhodnutí,
+    // vrstva B2 (audit, neobnovitelné). Čtení zrcadlí `graphEvents`/
+    // `reviewItems` výš: stejná `graphEventVisible` nad denormalizovanou
+    // obálkou `vis` (§3.6), žádná nová funkce (strop 1000 výrazů).
+    //
+    // Na rozdíl od `reviewItems` SMÍ klient i `update` — dokumentové ID
+    // (`muteId`) je deterministické z IDENTITY zjištění (`needMuteId` v
+    // `graphContract.ts`, §5.4), takže opakované ztišení TÉHOŽ zjištění
+    // přepisuje týž dokument místo zakládání duplicity. `delete` = vrácení
+    // ztišení (unmute) — proto smí bez dalších podmínek, kdo smí obsah zakládat.
+    //
+    // `request.resource.data.by == principal()`: nejde ztišit cizím jménem —
+    // kdo zápis pošle, je vždy ten, kdo se pod ním podepíše. Kdokoli jiný
+    // s právem zakládat obsah smí zápis PŘEPSAT (nová hodnota `by` je pak
+    // JEHO principal) — ztišení je sdílený výrok o projektu, ne osobní
+    // vlastnictví záznamu.
+    //
+    // ⚠️ `delete` NESMÍ volat `canCreateContent` — ta uvnitř čte
+    // `request.resource.data`, které je při mazání `null` a vyhodnocení by
+    // spadlo na chybu (= zamítnutí). Použije se `canContribute` (jen výčet
+    // oprávnění, bez dotazu na request.resource) + stejná zmrazovací pojistka.
+    match /workspaces/{wid}/projects/{pid}/needMutes/{muteId} {
+      allow read: if isProjectMember(wid, pid) && graphEventVisible(pid, resource.data.vis);
+      allow create, update: if canCreateContent(wid, pid)
+        && request.resource.data.by == principal()
+        && request.resource.data.schemaVersion == 1
+        && graphEventVisible(pid, request.resource.data.vis);
+      allow delete: if canContribute(wid, pid) && !projectFrozen(pid);
+    }
+
     match /workspaces/{wid}/projects/{pid}/files/{docId} {
       allow read: if isProjectMember(wid, pid);
       allow create: if canCreateContent(wid, pid);

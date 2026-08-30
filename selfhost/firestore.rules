@@ -1529,6 +1529,41 @@ service cloud.firestore {
       allow read: if isProjectMember(wid, pid) && graphEventVisible(pid, resource.data.vis);
     }
 
+    // Potvrzovací mechanika projektového grafu (Fáze 2a,
+    // `docs/specs/projektovy-graf.md` §3.5) — návrhy odvozených údajů/hran
+    // (nejistá klasifikace, nejisté párování revize…) čekající na rozhodnutí
+    // člověka. Čtení zrcadlí `graphEvents` výš: stejná `graphEventVisible`
+    // nad denormalizovanou obálkou `vis` (§3.6), NOVÁ funkce se kvůli tomu
+    // nezavádí (strop 1000 výrazů).
+    //
+    // `allow create`: kdokoli, kdo smí zakládat obsah (`canCreateContent`) —
+    // dnes reálně jen producenti volaní z klienta (intake dokumentů, viz
+    // `src/modules/documents/services/intakeReviewItems.ts`), ne ruční zápis.
+    // Pojistky na payloadu čtou pole PŘÍMO (ne `.get()` s defaultem, ať zápis
+    // bez nich rovnou spadne, místo aby si tiše domyslel výchozí hodnotu):
+    // `status` musí být `pending` (klient nesmí založit rovnou hotové
+    // rozhodnutí), `schemaVersion` musí sedět na `1`, `createdAt` musí být
+    // `request.time` (serverTimestamp, ne klientovy hodiny — stejný vzor jako
+    // `lastActivityAt` u `projects`) a `vis` musí projít stejnou bránou jako
+    // čtení — klient si nesmí vymyslet ŠIRŠÍ viditelnost, než jakou sám vidí.
+    //
+    // ŽÁDNÉ `allow update/delete` z klienta. Dokumentové ID JE `dedupeKey`
+    // (nastavuje klient, viz `reviewItemDocId` ve výše zmíněné službě) — díky
+    // tomu je opakovaný zápis stejné nejistoty idempotentní: druhý `create`
+    // nad existujícím id spadne rules enginu do větve `update`, kterou tu
+    // záměrně nemáme, tedy `permission-denied` (služba ho tiše polyká).
+    // Rozhodnutí (`confirmed`/`corrected`/`rejected` + aplikace payloadu) je
+    // serverová transakce (`resolveReviewItem`, Admin SDK obchází rules) —
+    // Fáze 2b.
+    match /workspaces/{wid}/projects/{pid}/reviewItems/{itemId} {
+      allow read: if isProjectMember(wid, pid) && graphEventVisible(pid, resource.data.vis);
+      allow create: if canCreateContent(wid, pid)
+        && request.resource.data.status == 'pending'
+        && request.resource.data.schemaVersion == 1
+        && request.resource.data.createdAt == request.time
+        && graphEventVisible(pid, request.resource.data.vis);
+    }
+
     match /workspaces/{wid}/projects/{pid}/files/{docId} {
       allow read: if isProjectMember(wid, pid);
       allow create: if canCreateContent(wid, pid);

@@ -17,14 +17,14 @@
     "repo": "trpaslik444/construct-cloud-sync",
     "doc": "docs/REPO_BOUNDARIES.md",
     "section": "Háček 1 — SDÍLENÉ soubory",
-    "ref": "e24bd2ac6b2b0ae07fc7980a1bf413653485ae0b",
+    "ref": "34476c0863a6da32a2a55eefdc0118af1128ebb1",
     "date": "2026-08-30"
   },
   "shared": [
     {
       "main": "firestore.rules",
       "companion": "selfhost/firestore.rules",
-      "mainSha256": "41e9932cc2c7d3fb9b7e4d3535932091feb0392eb2d61a18597ebb6202c49692"
+      "mainSha256": "6b744de03209007872cad4d2f0704ba74951462fdba9da9d6f2f280a15fbd908"
     },
     {
       "main": "storage.rules",
@@ -109,7 +109,7 @@
     {
       "main": "functions/src/graph/graphContract.ts",
       "companion": "selfhost/functions/src/graph/graphContract.ts",
-      "mainSha256": "504c397619fd5d7fdab012f9258065723c2788531383908c1e1299e3cd083252"
+      "mainSha256": "30ffe9f2e286c097b0baa18ec291960dc678d0bbeb8b1bbda95d25bf14716047"
     },
     {
       "main": "functions/src/graph/taskGraphEvents.ts",
@@ -124,7 +124,7 @@
     {
       "main": "functions/src/graph/resolveReviewItem.ts",
       "companion": "selfhost/functions/src/graph/resolveReviewItem.ts",
-      "mainSha256": "4a9c6815d0e629626ffb54fab4168c82530a7b4559413be93ef915d7d2ca306f"
+      "mainSha256": "2df051925510e894231f8a10507ca23424b291201fc991525b4ca30e515ff886"
     },
     {
       "main": "functions/src/graph/resolveReviewItem.test.ts",

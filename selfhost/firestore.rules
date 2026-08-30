@@ -1540,6 +1540,29 @@ service cloud.firestore {
         );
     }
 
+    /**
+     * Ověření se dá VZÍT ZPĚT stejným oprávněním, jakým vzniklo (US-16,
+     * `docs/ai/overovani-ukolu-kdo-a-kdy-us.md`).
+     *
+     * 🔴 Do 30. 8. 2026 to bylo nesymetrické: ověřit stačilo `certify`
+     * (`certifyTaskVerification`), ale vrátit zpátky chtělo `edit` — `reopenOk`
+     * u odchodu z `verified` volá `canCompleteTask`, a nad tím ještě
+     * `canModifyWith` požaduje `edit`. Kontrolní role (TDI, projektant) tedy
+     * uměla zavřít a neuměla otevřít: kdo se překlikl, musel shánět někoho
+     * s editačními právy. To je na stavbě horší než ta chyba samotná.
+     *
+     * Větev je stejně úzká jako ta ověřovací a je to DEMOTACE — z `verified`
+     * ven, nikdy dovnitř. Pole jsou tatáž, protože klient u návratu maže
+     * razítko i podpis (`withVerifiedAt`).
+     */
+    function certifyTaskReopen(perms) {
+      return perms.hasAny(['certify'])
+        && resource.data.get('status', '') == 'verified'
+        && request.resource.data.get('status', '') != 'verified'
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['status', 'updatedAt', 'updatedByUserId', 'activityLog', 'verifiedAt', 'verifiedBy']);
+    }
+
     function taskParticipantUpdateOk(perms) {
       return perms.hasAny(['contribute'])
         && isTaskParticipant()
@@ -1583,6 +1606,7 @@ service cloud.firestore {
     function taskProjectUpdateOk(perms) {
       return (canModifyWith(perms) && taskStatusTransitionOk(perms))
         || certifyTaskVerification(perms)
+        || certifyTaskReopen(perms)
         // Poslední v řadě schválně: je to nejdražší větev (diff + porovnání
         // seznamů) a pro `edit` role se k ní nikdy nedojde.
         || taskParticipantUpdateOk(perms);

@@ -1443,7 +1443,7 @@ service cloud.firestore {
         && request.resource.data.get('status', '') == 'verified'
         && resource.data.get('status', '') != 'verified'
         && request.resource.data.diff(resource.data).affectedKeys()
-             .hasOnly(['status', 'updatedAt', 'updatedByUserId', 'activityLog']);
+             .hasOnly(['status', 'updatedAt', 'updatedByUserId', 'activityLog', 'verifiedAt', 'verifiedBy']);
     }
 
     // Nový úkol nesmí rovnou vzniknout jako completed/verified bez příslušného
@@ -1451,7 +1451,15 @@ service cloud.firestore {
     // úkolu). Interní úkol: člen zakládá do své firmy a nesmí vzniknout rovnou
     // jako 'verified'.
     function taskCreateOk(perms, pid) {
-      return canCreateWith(perms) && taskVisibilityOk() && (
+      return canCreateWith(perms) && taskVisibilityOk()
+        // Podpis převzetí nejde podvrhnout ani při ZALOŽENÍ. Úkol smí vzniknout
+        // rovnou jako `verified` (`canReachDoneStatus`), takže bez téhle
+        // podmínky by šlo obejít invariant na update tím, že se rovnou založí
+        // hotový úkol „převzatý" někým jiným.
+        && (!(request.resource.data.get('verifiedBy', '') is string)
+            || request.resource.data.get('verifiedBy', '') == ''
+            || request.resource.data.get('verifiedBy', '') == principal())
+        && (
         taskIsInternal(request.resource.data)
           ? (validInternalTaskCreate(pid)
              && request.resource.data.get('status', '') != 'verified')
@@ -1461,9 +1469,123 @@ service cloud.firestore {
 
     // Update PROJEKTOVÉHO úkolu: buď běžná práva k obsahu se stavovým guardem,
     // nebo úzká větev pro schvalovatele bez `edit` (ověření cizího úkolu).
+    // ── Účastník smí uzavřít SVOU práci (V1, docs/ai/viditelnost-ukolu-pro-delniky-us.md)
+    //
+    // 🔴 NÁLEZ 29. 8. 2026: `viewer` (contribute bez edit) nemohl na úkolu,
+    // který nezaložil, změnit VŮBEC NIC — ani stav. Výjimka pro řešitele
+    // v pravidlech nikdy nebyla (`canModifyWith` = edit || vlastní autorství,
+    // `canCompleteTask` = edit). Dělník tedy nemohl označit za hotové to, co
+    // dostal přidělené, a musel shánět někoho s právy, aby za něj klikl.
+    //
+    // Povolení je ÚZKÉ a stojí na DIFFU, ne na důvěře. Účastník smí posunout
+    // stav a připsat komentář; cokoli jiného zůstává na `edit`.
+
+    /** Seznam komentářů úkolu, odolný vůči starým dokumentům bez `relations`. */
+    function taskCommentList(data) {
+      return data.get('relations', {}).get('comments', []);
+    }
+
+    /**
+     * Je volající vedený jako účastník úkolu? Čte se z ULOŽENÉHO dokumentu, ne
+     * z příchozího — jinak by se do `participants` stačilo dopsat a povolení si
+     * tím udělit.
+     */
+    function isTaskParticipant() {
+      return principal() in resource.data.get('participants', []);
+    }
+
+    /**
+     * Pole, kterých se účastník smí dotknout. Cokoli mimo seznam = zamítnuto,
+     * takže řešitel, termín, rozsah ani kategorie se tudy změnit nedají.
+     *
+     * `updatedAt`/`updatedByUserId`/`activityLog` jsou tu proto, že je klient
+     * zapisuje ke KAŽDÉ změně; bez nich by neprošla ani ta povolená.
+     *
+     * `verifiedAt`/`verifiedBy` jsou tu ze stejného důvodu: `withVerifiedAt` je
+     * u NEověřeného stavu maže, takže by uložení starého dokumentu se zbylým
+     * razítkem spadlo. Nic to neotevírá — účastník se na `verified` stejně
+     * nedostane a mimo něj se razítko ignoruje (`resolveVerifiedAt`).
+     */
+    function participantAffectedKeysOk() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+        .hasOnly(['status', 'updatedAt', 'updatedByUserId', 'activityLog', 'relations', 'tags', 'participants', 'verifiedAt', 'verifiedBy']);
+    }
+
+    /**
+     * Uvnitř `relations` smí přibýt jen komentář. Checklist, přílohy ani odkazy
+     * se nesmí hnout — `relations` je jedna mapa, takže bez téhle kontroly by
+     * povolení „komentovat" znamenalo i „smazat přílohy".
+     *
+     * `hasAll` drží komentáře PŘÍRŮSTKOVÉ: existující nejde změnit ani smazat.
+     */
+    function participantRelationsOk() {
+      return request.resource.data.get('relations', {}).get('checklist', []) == resource.data.get('relations', {}).get('checklist', [])
+        && request.resource.data.get('relations', {}).get('attachments', []) == resource.data.get('relations', {}).get('attachments', [])
+        && request.resource.data.get('relations', {}).get('links', []) == resource.data.get('relations', {}).get('links', [])
+        && taskCommentList(request.resource.data).hasAll(taskCommentList(resource.data));
+    }
+
+    /**
+     * Přidaný komentář musí být PODEPSANÝ volajícím a na jeden zápis smí přibýt
+     * nejvýš jeden. Bez toho by šlo připsat záznam cizím jménem.
+     *
+     * Podepisuje se `createdBy` (federovaný principal), NE `userId` — to nese
+     * centrální uid, které se v prostoru firmy s `principal()` nemusí rovnat.
+     */
+    function participantCommentOk() {
+      return taskCommentList(request.resource.data).size() == taskCommentList(resource.data).size()
+        || (
+          taskCommentList(request.resource.data).size() == taskCommentList(resource.data).size() + 1
+          && taskCommentList(request.resource.data)[taskCommentList(resource.data).size()].get('createdBy', '') == principal()
+        );
+    }
+
+    function taskParticipantUpdateOk(perms) {
+      return perms.hasAny(['contribute'])
+        && isTaskParticipant()
+        && participantAffectedKeysOk()
+        && participantRelationsOk()
+        && participantCommentOk()
+        // Štítky smí jen PŘIBÝVAT — `#štítek` v komentáři se propisuje do úkolu.
+        && request.resource.data.get('tags', []).hasAll(resource.data.get('tags', []))
+        // Účastníci taky jen přibývat (zmínka v komentáři). Nikoho tudy nevyhodí.
+        && request.resource.data.get('participants', []).hasAll(resource.data.get('participants', []))
+        // 'verified' je věc `certify` — ani tam, ani zpátky odtud nevede cesta.
+        && request.resource.data.get('status', '') != 'verified'
+        && resource.data.get('status', '') != 'verified';
+    }
+
+    /**
+     * 🔴 PODPIS PŘEVZETÍ SE NEDÁ PODVRHNOUT.
+     *
+     * „Ověřeno" je totéž co „převzato" (rozhodnutí vlastníka 30. 8. 2026),
+     * takže `verifiedBy` je nejcitlivější pole na úkolu. Platí jako INVARIANT
+     * pro každý update, ne jen pro větev ověřování — držitel `edit` totiž
+     * projde obecnou cestou (`canModifyWith`) a ta o obsahu polí nic neříká,
+     * takže by si mohl připsat převzetí cizím jménem.
+     *
+     * Tři povolené tvary: hodnota se nemění, maže se (odchod z `verified`),
+     * nebo se člověk podepisuje SÁM. Prázdno se pouští schválně — principal se
+     * resolvuje z tokenu a na stavbě bez signálu se to nemusí povést; radši
+     * převzetí bez podpisu než zablokované převzetí.
+     */
+    function verifiedBySignatureOk() {
+      return request.resource.data.get('verifiedBy', '') == resource.data.get('verifiedBy', '')
+        // „Maže se" znamená chybějící pole I explicitní `null` — klient posílá
+        // obojí podle toho, jestli jde o `setDoc` celého úkolu (pole vypadne)
+        // nebo o cílený update. Kontrolovat jen prázdný řetězec by druhou
+        // variantu zamítlo, a to by zablokovalo znovuotevření úkolu.
+        || !(request.resource.data.get('verifiedBy', '') is string)
+        || request.resource.data.get('verifiedBy', '') == ''
+        || request.resource.data.get('verifiedBy', '') == principal();
+    }
+
     function taskProjectUpdateOk(perms) {
       return (canModifyWith(perms) && taskStatusTransitionOk(perms))
-        || certifyTaskVerification(perms);
+        || certifyTaskVerification(perms)
+        // Poslední v řadě schválně: je to nejdražší větev (diff + porovnání
+        // seznamů) a pro `edit` role se k ní nikdy nedojde.
+        || taskParticipantUpdateOk(perms);
     }
 
     function taskPath(wid, pid, taskId) {
@@ -1503,6 +1625,7 @@ service cloud.firestore {
       allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
         && taskScopeImmutable()
         && taskVisibilityOk()
+        && verifiedBySignatureOk()
         && (
           taskIsInternal(resource.data)
             ? (taskCompanyMember(pid, resource.data) && internalTaskStatusOk(wid, pid))

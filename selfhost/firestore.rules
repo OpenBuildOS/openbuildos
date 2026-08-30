@@ -788,10 +788,44 @@ service cloud.firestore {
     // falšovatelné — žádné pravidlo se jich neptá (viz membershipClaims.ts).
     // ---------------------------------------------------------------------
 
+    // `invitePath(wid, inviteId)` je definovaná níž (u self-join na stavbu) —
+    // podruhé ji zavádět nejde a nemá smysl.
+
+    /**
+     * Uplatnil TENHLE člověk TUHLE firemní pozvánku, a platí ještě?
+     *
+     * Firemní pozvánka je ta BEZ stavby (`projectId == ''`) — jediná cesta, jak
+     * se do adresáře dostane někdo, koho nikdo nezval na konkrétní stavbu.
+     * Deklaruje ji sám zápis polem `viaInviteId`, stejný vzor jako `viaProjectId`
+     * výš: rules neumí iterovat kolekci, tak zápis řekne, o co se opírá, a
+     * pravidlo tu deklaraci ověří. Lhát se nedá — `usedBy` zapsal redeem a
+     * pravidlo `update` níž ho pustí jen na `principal()`.
+     *
+     * ⚠️ PLATNOST SE KONTROLUJE ZNOVU, i když `usedBy` už dokazuje uplatnění.
+     * Bez toho by roky stará uplatněná pozvánka byla trvalý klíč zpátky: koho
+     * správce z firmy vyřadil, ten by si týmž odkazem záznam založil znovu.
+     * S kontrolou je to okno nejvýš TTL pozvánky (14 dní) a správce ho umí
+     * zavřít hned — smazáním pozvánky (`allow delete` níž).
+     *
+     * `request.time` jako výchozí hodnota `expiresAt` je ZÁMĚRNĚ: dokument bez
+     * platnosti tak vyjde `request.time < request.time`, tedy zavřeno.
+     */
+    function redeemedCompanyInvite(wid, inviteId) {
+      return inviteId != ''
+        && exists(invitePath(wid, inviteId))
+        && get(invitePath(wid, inviteId)).data.get('projectId', '') == ''
+        && get(invitePath(wid, inviteId)).data.get('usedBy', '') == principal()
+        && request.time < get(invitePath(wid, inviteId)).data.get('expiresAt', request.time);
+    }
+
     function directorySelfCreateOk(wid, memberPrincipal) {
       return principal() == memberPrincipal
-        && request.resource.data.get('viaProjectId', '') != ''
-        && isProjectMember(wid, request.resource.data.get('viaProjectId', ''));
+        && (
+          (request.resource.data.get('viaProjectId', '') != ''
+            && isProjectMember(wid, request.resource.data.get('viaProjectId', '')))
+          // Přišel firemní pozvánkou — do žádné stavby patřit nemusí.
+          || redeemedCompanyInvite(wid, request.resource.data.get('viaInviteId', ''))
+        );
     }
 
     match /workspaces/{wid}/members/{memberPrincipal} {
@@ -935,13 +969,26 @@ service cloud.firestore {
         && request.resource.data.expiresAt > request.time
         && request.resource.data.expiresAt < request.time + duration.value(15, 'd')
         && request.resource.data.createdBy == principal()
+        // 🔴 TERNÁRNÍ, ne `||`. Firemní pozvánka nese `projectId == ''` a
+        // `canManage(wid, '')` by sáhlo `get()` na neexistující cestu
+        // `/projects/` — tedy CHYBA vyhodnocení, ne `false`. Rozskok podle tvaru
+        // pozvánky zaručí, že se projektová větev na firemní pozvánku vůbec
+        // nespustí. (Týž důvod u `update` i `delete` níž.)
         && (
-            // Direct: project admin / workspace admin issues a live invite.
-            (canManage(wid, request.resource.data.projectId)
-              && request.resource.data.get('approvalStatus', 'approved') == 'approved')
-            // Manager/company lead proposes an invite needing admin approval.
-            || (canProposeInvite(wid, request.resource.data.projectId)
-              && request.resource.data.approvalStatus == 'pending_approval')
+          request.resource.data.get('projectId', '') == ''
+            // FIREMNÍ pozvánka: do adresáře firmy, bez stavby. Zve jen
+            // vlastník/správce firmy — návrh ke schválení tu nedává smysl,
+            // protože schvalovat by ho měl týž člověk.
+            ? (isWsAdmin(wid)
+                && request.resource.data.get('approvalStatus', 'approved') == 'approved')
+            : (
+                // Direct: project admin / workspace admin issues a live invite.
+                (canManage(wid, request.resource.data.projectId)
+                  && request.resource.data.get('approvalStatus', 'approved') == 'approved')
+                // Manager/company lead proposes an invite needing admin approval.
+                || (canProposeInvite(wid, request.resource.data.projectId)
+                  && request.resource.data.approvalStatus == 'pending_approval')
+            )
         );
       allow update: if (
           // Redeem: only claiming an unused, unexpired, APPROVED invite for yourself.
@@ -973,11 +1020,18 @@ service cloud.firestore {
         // Je to JEN strop, ne okno — zkrácení expirace do minulosti pozvánku
         // zneplatňuje, a to musí zůstat průchozí (klient dnes ruší mazáním,
         // ale zavírat cestu, která bezpečnost jen zvyšuje, nedává smysl).
-        || (canManage(wid, resource.data.projectId)
-            && request.resource.data.projectId == resource.data.projectId
+        || ((resource.data.get('projectId', '') == ''
+              // Firemní pozvánka nemá stavbu, o kterou by se `canManage` opřelo
+              // — a kdyby se o ni pokusilo, celé `update` by skončilo CHYBOU
+              // a neuplatnila by se ani větev redeemu výš.
+              ? isWsAdmin(wid)
+              : canManage(wid, resource.data.projectId))
+            && request.resource.data.get('projectId', '') == resource.data.get('projectId', '')
             && request.resource.data.expiresAt is timestamp
             && request.resource.data.expiresAt < request.time + duration.value(15, 'd'));
-      allow delete: if canManage(wid, resource.data.projectId);
+      allow delete: if resource.data.get('projectId', '') == ''
+        ? isWsAdmin(wid)
+        : canManage(wid, resource.data.projectId);
     }
 
     // ---------------------------------------------------------------------

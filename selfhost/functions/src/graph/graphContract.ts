@@ -392,6 +392,16 @@ export function normalizeChunkText(text: string): string {
 export type CaptureChannelKind = "email" | "telegram" | "whatsapp" | "discord";
 
 /**
+ * K čemu ta konverzace na stavbě je. Řídí, co se z ní navrhuje — a hlavně
+ * **jak je vidět**: jednání o penězích mezi investory nemá číst subdodavatel.
+ *
+ * 🔴 `commercial` a `internal` se zatím NESMÍ nabízet. Adaptér dnes zapisuje
+ * napevno `vis.visibility: ""` (obsah celé stavby), takže dokud viditelnost
+ * nepochází z účelu, byl by firemní kanál slib, který backend nedrží.
+ */
+export type CaptureChannelPurpose = "site" | "design" | "commercial" | "internal";
+
+/**
  * `workspaces/{wid}/projects/{pid}/captureChannels/{channelId}` — vazba
  * konverzace na stavbu. **Bez vazby se nezapíše nic**: kdo zná adresu bota,
  * ještě nesmí psát do cizí stavby.
@@ -399,6 +409,7 @@ export type CaptureChannelKind = "email" | "telegram" | "whatsapp" | "discord";
 export interface CaptureChannel {
   schemaVersion: 1;
   kind: CaptureChannelKind;
+  purpose: CaptureChannelPurpose;
   /** Identita konverzace v jejím vlastním světě: chat id, adresa, group id. */
   externalId: string;
   /** Jak si ji pojmenoval člověk — pro UI, ne pro párování. */
@@ -472,6 +483,46 @@ export function capturedMessageId(
 /** Deterministické ID vazby — táž konverzace nejde připojit dvakrát. */
 export function captureChannelId(kind: CaptureChannelKind, externalId: string): string {
   return stableId([kind, externalId]);
+}
+
+/**
+ * `workspaces/{wid}/projects/{pid}/captureConnectCodes/{codeId}` — jednorázový
+ * kód, který člověk napíše DO konverzace (`/connect K7F-2M9`).
+ *
+ * Proč kódem a ne výběrem v appce: appka id chatu nezná a znát ho nemůže.
+ * Kód napsaný do skupiny navíc **dokazuje, že ten, kdo připojuje, do
+ * konverzace patří** — a to je celá obrana proti připojení cizí stavby.
+ *
+ * Krátká platnost a jedno použití jsou podstatné: uniklý kód by jinak znamenal
+ * trvalý přístup do stavby.
+ */
+export interface CaptureConnectCode {
+  schemaVersion: 1;
+  /** Co člověk napíše. Bez pomlčky a bez zaměnitelných znaků (0/O, 1/I). */
+  code: string;
+  kind: CaptureChannelKind;
+  purpose: CaptureChannelPurpose;
+  createdBy: string;
+  createdAt: TimestampLike;
+  expiresAt: TimestampLike;
+  vis: SecurityEnvelope;
+}
+
+/** Abeceda bez znaků, které si člověk splete při přepisu z obrazovky do telefonu. */
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/** Normalizace kódu z konverzace: velká písmena, bez mezer a pomlček. */
+export function normalizeConnectCode(raw: string): string {
+  return raw.toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+/** Kód o šesti znacích; zobrazuje se s pomlčkou uprostřed, ukládá bez ní. */
+export function generateConnectCode(random: () => number = Math.random): string {
+  let out = "";
+  for (let i = 0; i < 6; i += 1) {
+    out += CODE_ALPHABET[Math.floor(random() * CODE_ALPHABET.length)];
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

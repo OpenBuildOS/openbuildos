@@ -1817,9 +1817,30 @@ service cloud.firestore {
         && request.resource.data.createdBy == principal()
         && request.resource.data.schemaVersion == 1
         && request.resource.data.kind in ['email', 'telegram', 'whatsapp', 'discord']
+        // Firemní rozsah se zatím nenabízí: adaptér zapisuje projektovou
+        // viditelnost, takže `commercial`/`internal` by byl slib bez krytí.
+        && request.resource.data.purpose in ['site', 'design']
         && request.resource.data.externalId is string
         && graphEventVisible(pid, request.resource.data.vis)
         && !projectFrozen(pid);
+      allow delete: if canModifyContent(wid, pid);
+    }
+
+    // Jednorázové kódy pro připojení konverzace (#896). Platnost hlídá server
+    // při použití; pravidla drží jen to, že kód založí člověk s právem na obsah
+    // a nepodvrhne autora. Číst je smí členové stavby — kód se ukazuje v UI
+    // tomu, kdo ho má opsat do konverzace.
+    match /workspaces/{wid}/projects/{pid}/captureConnectCodes/{codeId} {
+      allow read: if isProjectMember(wid, pid) && graphEventVisible(pid, resource.data.vis);
+      allow create: if canModifyContent(wid, pid)
+        && request.resource.data.createdBy == principal()
+        && request.resource.data.schemaVersion == 1
+        && request.resource.data.code is string
+        && request.resource.data.kind in ['email', 'telegram', 'whatsapp', 'discord']
+        && graphEventVisible(pid, request.resource.data.vis)
+        && !projectFrozen(pid);
+      // Přepis se nepovoluje: kód je jednorázový, měnit se nemá. Smazat ano —
+      // ať jde vzít zpět dřív, než ho někdo použije.
       allow delete: if canModifyContent(wid, pid);
     }
 

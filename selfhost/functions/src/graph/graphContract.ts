@@ -380,6 +380,101 @@ export function normalizeChunkText(text: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// §5 Kontextové capture — zprávy z kanálů stavby (Fáze 5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Odkud zpráva přišla. **Kanál je údaj o zdroji, ne větev v kódu** — všechno za
+ * adaptérem pracuje s jedním tvarem zprávy. Jinak se první kanál zapeče do
+ * logiky a druhý se pak dolamuje (a druhý přijde, protože WhatsApp má strop
+ * osmi účastníků a firmy z něj budou odcházet).
+ */
+export type CaptureChannelKind = "email" | "telegram" | "whatsapp" | "discord";
+
+/**
+ * `workspaces/{wid}/projects/{pid}/captureChannels/{channelId}` — vazba
+ * konverzace na stavbu. **Bez vazby se nezapíše nic**: kdo zná adresu bota,
+ * ještě nesmí psát do cizí stavby.
+ */
+export interface CaptureChannel {
+  schemaVersion: 1;
+  kind: CaptureChannelKind;
+  /** Identita konverzace v jejím vlastním světě: chat id, adresa, group id. */
+  externalId: string;
+  /** Jak si ji pojmenoval člověk — pro UI, ne pro párování. */
+  label?: string;
+  /** Vypnutá vazba zprávy zahazuje, ale nemizí — kdo ji zavedl, zůstává vidět. */
+  active: boolean;
+  createdBy: string;
+  createdAt: TimestampLike;
+  vis: SecurityEnvelope;
+}
+
+/**
+ * Příloha zprávy. Chybějící soubor se PŘIZNÁVÁ důvodem, nikdy se nezamlčí —
+ * u Telegramu se přes veřejný Bot API nestáhne nic nad 20 MB a fotka bez
+ * vysvětlení by vypadala jako chyba appky (vzor `ExtractionFailureReason`).
+ */
+export interface CapturedAttachment {
+  kind: "photo" | "video" | "document" | "audio" | "other";
+  /** Cesta ve Storage. Chybí právě tehdy, když je vyplněný `failureReason`. */
+  objectPath?: string;
+  fileName?: string;
+  mimeType?: string;
+  sizeBytes?: number;
+  failureReason?: "too_large" | "download_failed" | "unsupported";
+}
+
+/**
+ * `workspaces/{wid}/projects/{pid}/capturedMessages/{messageId}` — jedna zpráva
+ * tak, jak přišla. Syrový záznam: nic se z něj samo nestává úkolem ani zápisem
+ * do deníku, to jde přes `ReviewItem` (P10 — stroj navrhne, člověk potvrdí).
+ *
+ * 🔴 Zapisuje JEN server. Obsah je nedůvěryhodný vstup (§9): píše ho kdokoli
+ * v cizí konverzaci, tedy i někdo, kdo v OBOS vůbec není.
+ */
+export interface CapturedMessage {
+  schemaVersion: 1;
+  channelId: string;
+  channelKind: CaptureChannelKind;
+  /** Id zprávy v jejím kanálu — jediný zdroj idempotence, viz `capturedMessageId`. */
+  externalMessageId: string;
+  /**
+   * Jméno, jak ho podal kanál. **Není to principal OBOS** a nesmí se za něj
+   * vydávat: v konverzaci sedí i lidé bez účtu. Párování na člověka je
+   * odvozený údaj a patří do `ReviewItem`, ne sem.
+   */
+  authorLabel: string;
+  authorExternalId?: string;
+  /** Kdy to napsal ON. `receivedAt` je, kdy to dorazilo nám — webhooky se opakují. */
+  sentAt: TimestampLike;
+  receivedAt: TimestampLike;
+  text: string;
+  attachments: CapturedAttachment[];
+  /** Odpověď na jinou zprávu — drží vlákno, bez něj se rozhodnutí utrhne od otázky. */
+  replyToExternalId?: string;
+  vis: SecurityEnvelope;
+}
+
+/**
+ * Deterministické ID zprávy. Webhooky se **opakují** (Telegram i Meta doručují
+ * znovu, když neodpovíme včas), takže bez toho by z jedné zprávy vzniklo pět.
+ * Kanál je součástí klíče: id zpráv si mezi platformami kolidují.
+ */
+export function capturedMessageId(
+  kind: CaptureChannelKind,
+  channelId: string,
+  externalMessageId: string
+): string {
+  return stableId([kind, channelId, externalMessageId]);
+}
+
+/** Deterministické ID vazby — táž konverzace nejde připojit dvakrát. */
+export function captureChannelId(kind: CaptureChannelKind, externalId: string): string {
+  return stableId([kind, externalId]);
+}
+
+// ---------------------------------------------------------------------------
 // 3.7 Serializovatelný dotaz
 // ---------------------------------------------------------------------------
 

@@ -1808,6 +1808,30 @@ service cloud.firestore {
     // vyhledávání a pozdějšího retrievalu text, který v žádném dokumentu není.
     // Samotné `officialCreateOk` se sem použít NEDÁ — ověřuje `ownerCompanyId`
     // a `createdBy`, pole, která odvozený chunk nenese.
+    // Vazba konverzace na stavbu (#896). Připojit chat je administrativní akt —
+    // od té chvíle do stavby teče obsah, který píšou i lidé bez účtu v OBOS.
+    // Proto `canModifyContent`, ne „umí zakládat obsah", a autor se nepodvrhne.
+    match /workspaces/{wid}/projects/{pid}/captureChannels/{channelId} {
+      allow read: if isProjectMember(wid, pid) && graphEventVisible(pid, resource.data.vis);
+      allow create, update: if canModifyContent(wid, pid)
+        && request.resource.data.createdBy == principal()
+        && request.resource.data.schemaVersion == 1
+        && request.resource.data.kind in ['email', 'telegram', 'whatsapp', 'discord']
+        && request.resource.data.externalId is string
+        && graphEventVisible(pid, request.resource.data.vis)
+        && !projectFrozen(pid);
+      allow delete: if canModifyContent(wid, pid);
+    }
+
+    // Zprávy z kanálů (#896). 🔴 ŽÁDNÝ klientský zápis: obsah píše kdokoli v cizí
+    // konverzaci, tedy i člověk, který v OBOS vůbec není. Zapisuje výhradně
+    // server (Admin SDK pravidla obchází), aby se vazba na stavbu a autorství
+    // ověřily na jednom místě a nedaly se podvrhnout z prohlížeče.
+    match /workspaces/{wid}/projects/{pid}/capturedMessages/{messageId} {
+      allow read: if isProjectMember(wid, pid) && graphEventVisible(pid, resource.data.vis);
+      allow write: if false;
+    }
+
     match /workspaces/{wid}/projects/{pid}/extractedChunks/{chunkId} {
       allow read: if isProjectMember(wid, pid) && graphEventVisible(pid, resource.data.vis);
       allow create, update: if permsOf(wid, pid).hasAny(['publish'])

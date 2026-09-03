@@ -836,6 +836,45 @@ service cloud.firestore {
       allow delete: if isWsAdmin(wid);
     }
 
+
+    // ---------------------------------------------------------------------
+    // Uživatelské předvolby (co si člověk odklikal a nemá se ho to ptát znovu)
+    // ---------------------------------------------------------------------
+    //
+    // Do 3. 9. 2026 to žilo jen v localStorage, takže vymazaná cache, jiný
+    // prohlížeč nebo jiné zařízení znamenaly, že appka témuž člověku znovu
+    // nabídla návod a nápovědu, kterou dávno zavřel.
+    //
+    // Dokument patří výhradně svému majiteli: nikdo jiný ho nečte ani nemění,
+    // ani správce prostoru. Není to obsah stavby — je to jeho pohodlí, a
+    // seznam „co kdo odklikal" nemá důvod být pro kohokoli dalšího viditelný.
+    match /workspaces/{wid}/userPrefs/{prefsPrincipal} {
+      // Kdo smí: JEN majitel dokumentu. Nikdo další — ani správce prostoru.
+      // Není to obsah stavby, je to jeho pohodlí, a seznam „co kdo odklikal"
+      // nemá důvod být pro kohokoli viditelný.
+      //
+      // 🔴 Členství se ZÁMĚRNĚ neověřuje, stejně jako u sousedního
+      // `accessSignals`. Obě dostupné podmínky selhávají tam, kde na nich
+      // nejvíc záleží: `isFirmParticipant` chce záznam v adresáři firmy, který
+      // se běžnému členovi nemusí vůbec založit (klient ho od #535 neposílal),
+      // a `workspaces/{wid}/members` se neplní spolehlivě — členství se drží
+      // per stavba. Podmínka by tedy tiše vypnula nápovědu právě lidem na
+      // stavbě, a to je horší než riziko, které kryje.
+      //
+      // Proti nasypání dat do cizího prostoru drží tvar a STROP: jen známá
+      // pole, jen mapy, a dohromady nejvýš pár set klíčů. Víc než stovky
+      // staveb a modulů člověk stejně neodklikne.
+      allow read: if isRealUser() && principal() == prefsPrincipal;
+      allow write: if isRealUser()
+        && principal() == prefsPrincipal
+        && request.resource.data.schemaVersion == 1
+        && request.resource.data.keys().hasOnly(
+             ['schemaVersion', 'seenProjects', 'dismissedModuleHelp', 'expandedModuleHelp'])
+        && request.resource.data.get('seenProjects', {}).keys().size() <= 500
+        && request.resource.data.get('dismissedModuleHelp', {}).keys().size() <= 100
+        && request.resource.data.get('expandedModuleHelp', {}).keys().size() <= 100;
+    }
+
     // ---------------------------------------------------------------------
     // Signál invalidace custom claims (docs/SECURITY_CLAIMS_DESIGN.md kap. 3)
     //

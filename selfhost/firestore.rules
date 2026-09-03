@@ -2027,9 +2027,34 @@ service cloud.firestore {
       allow list: if isProjectMember(wid, pid)
         && (resource.data.isPrivate == false
             || resource.data.ownerPrincipal == principal());
-      allow create, update, delete: if (
-          canEdit(wid, pid)
+      // 🔑 ZÁVAZNÝ POŽADAVEK SMÍ ZAPSAT I SCHVALOVATEL (#903 bod 7).
+      //
+      // Připomínku „tuhle část přeškrtnout, projektant předělá" píše TDI nebo
+      // projektant — a ti mají `certify` BEZ `edit`, protože měnit cizí obsah
+      // nesmějí (#506 fáze 2). Kdyby rozhodoval jen `edit`, funkci by nemohl
+      // použít nikdo, pro koho vznikla; tatáž past jako nález F1, kde schválení
+      // výkresu selhalo na zápisu do `plans`.
+      //
+      // Rozsah je proto úzký: `certify` smí sáhnout JEN na zákres, který je
+      // závazný (`binding == true`) a JE JEHO (`ownerPrincipal`). Na cizí ani
+      // na obyčejný markup nedosáhne — tím zůstává v platnosti, že `certify`
+      // není `edit`.
+      function bindingWriteOk() {
+        return canCertify(wid, pid)
+          && request.resource.data.get('binding', false) == true
+          && request.resource.data.get('ownerPrincipal', '') == principal();
+      }
+      allow create: if (
+          canEdit(wid, pid) || bindingWriteOk()
         ) && !projectFrozen(pid);
+      allow update: if (
+          canEdit(wid, pid)
+          || (bindingWriteOk() && resource.data.get('ownerPrincipal', '') == principal())
+        ) && !projectFrozen(pid);
+      // Mazat smí dál jen `edit`. Vzít požadavek zpět jde jeho úpravou
+      // (odznačením závaznosti), což je zápis, ne smazání — a hlavně tím
+      // nezmizí stopa po tom, že tu požadavek byl.
+      allow delete: if canEdit(wid, pid) && !projectFrozen(pid);
     }
 
     // Tvary místností nad výkresem (#385). Geometrie NEZAKLÁDÁ místnost — jen

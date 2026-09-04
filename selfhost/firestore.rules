@@ -228,7 +228,33 @@ service cloud.firestore {
     // přerazila hned u prvního složeného pravidla — a selhala jako
     // permission-denied, tedy k nerozeznání od chybějícího práva.
     // ---------------------------------------------------------------------
-    // ZMRAZENÍ STAVBY PO DOBU PŘEDÁNÍ (`projects/{pid}.handover.state`)
+    // STAVBA JEN KE ČTENÍ — dva důvody, jedno čtení dokumentu
+    //
+    // 1) ARCHIV (`projects/{pid}.archived`)
+    // 2) PŘEDÁNÍ NOVÉMU VLASTNÍKOVI (`projects/{pid}.handover.state`)
+    //
+    // ── 1) ARCHIV ────────────────────────────────────────────────────────────
+    // 🔴 NÁLEZ Z PRODUKCE (4. 9. 2026). Uživatel se přes přepínač projektů
+    // dostal do ARCHIVOVANÉ stavby a nahrával do ní dokumenty. Zjistilo se
+    // přitom, že archivace nebyla vynucená VŮBEC NIKDE: `archived` figurovalo
+    // v pravidlech jen v denylistu „kdo ho smí přepnout" (je to ovladač
+    // faktury), zápisy do archivované stavby nikdo neomezoval. Zábrana
+    // v aplikaci (`setCurrentProject`) je nutná, ale sama o sobě to je jen
+    // dveřní zarážka — kdo si sestaví vlastní klienta, píše dál.
+    //
+    // Archivovaná stavba je přitom stavba, která se NEFAKTURUJE (VOP čl. 4.3)
+    // a jejíž obsah nikdo nesleduje. Práce, která do ní přistane, se ztratí
+    // z dohledu — ne technicky, ale provozně, což je horší.
+    //
+    // ⚠️ ČTENÍ ZŮSTÁVÁ. Archiv není trezor: obsah musí jít prohlédnout
+    // (a stavbu vrátit do provozu). Zakázané je jen PSANÍ.
+    // ⚠️ ARCHIVOVAT A VRÁTIT Z ARCHIVU JDE DÁL. Obojí je zápis do samotného
+    // `projects/{pid}`, a tam se tahle funkce nepoužívá (viz jeho `allow
+    // update` níž) — jinak by se stavba do archivu dostala a už nikdy ven.
+    // ⚠️ SERVER TÍM OMEZENÝ NENÍ (Admin SDK stojí mimo pravidla), takže
+    // úklidové funkce, fakturační sweep i mazání běží dál.
+    //
+    // ── 2) ZMRAZENÍ PO DOBU PŘEDÁNÍ ─────────────────────────────────────────
     //
     // Předání stavby novému vlastníkovi kopíruje obsah do jiného prostoru
     // a teprve pak překlopí `workspaceId`. Zápis, který mezitím přistane
@@ -277,13 +303,20 @@ service cloud.firestore {
     // zakládá v TÉŽE DÁVCE jako sama stavba (bootstrap, viz `canManageAfter`),
     // takže v tu chvíli `projects/{pid}` ještě neexistuje a zakládání stavby by
     // přestalo jít úplně. Stavba, která ještě není, zmrazená být nemůže.
-    function projectFrozen(pid) {
+    // ⚠️ OBA DŮVODY V JEDNÉ FUNKCI, A TO JE ÚČEL. Samostatná `projectArchived()`
+    // by znamenala druhý `get()` na týž dokument a hlavně další výrazy na
+    // KAŽDÉM z šedesáti míst, kde se na to ptáme — a rozpočet 1000 výrazů je
+    // společný pro celou dávku (viz `redeemOk` a `memberFlagPermissions` výš).
+    // Takhle archiv nestojí ani jedno čtení navíc.
+    function projectReadOnly(pid) {
       let project = get(projectPath(pid));
-      let handover = project == null ? {} : project.data.get('handover', {});
-      return handover is map
-        && handover.get('state', '') == 'moving'
-        && handover.get('frozenUntil', null) is timestamp
-        && request.time < handover.frozenUntil;
+      let data = project == null ? {} : project.data;
+      let handover = data.get('handover', {});
+      return data.get('archived', false) == true
+        || (handover is map
+            && handover.get('state', '') == 'moving'
+            && handover.get('frozenUntil', null) is timestamp
+            && request.time < handover.frozenUntil);
     }
 
     function permsOf(wid, pid) {
@@ -583,9 +616,9 @@ service cloud.firestore {
     }
 
     function canModifyContent(wid, pid) {
-      // Pořadí je úmyslné: `projectFrozen` stojí jedno čtení navíc, a to se
+      // Pořadí je úmyslné: `projectReadOnly` stojí jedno čtení navíc, a to se
       // vyhodnotí jen u zápisu, který by jinak prošel.
-      return canModifyWith(permsOf(wid, pid)) && !projectFrozen(pid);
+      return canModifyWith(permsOf(wid, pid)) && !projectReadOnly(pid);
     }
 
     // Založení obsahu = `contribute`. Author (createdBy) musí být buď
@@ -600,7 +633,7 @@ service cloud.firestore {
     }
 
     function canCreateContent(wid, pid) {
-      return canCreateWith(permsOf(wid, pid)) && !projectFrozen(pid);
+      return canCreateWith(permsOf(wid, pid)) && !projectReadOnly(pid);
     }
 
     // Zápis do STAVEBNÍHO DENÍKU. `diary` je vstupenka do deníku vůbec
@@ -1147,7 +1180,7 @@ service cloud.firestore {
           canManageAfter(wid, pid)
           && roleAssignable(request.resource.data.get('role', ''))
         )
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
       // Vlastník/admin FIRMY má zrcadlo celé (včetně `admin` a sebe sama);
       // projektový správce jen tolik, kolik mu dává `roleChangeOk` na
       // `projects/{pid}.roles` — jinak by obě cesty říkaly každá něco jiného.
@@ -1155,10 +1188,10 @@ service cloud.firestore {
           canManageAfter(wid, pid)
         && roleWriteOk()
         && (isWsAdmin(wid) || mirrorRoleChangeOk(memberUid))
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
       allow delete: if (
           canManage(wid, pid)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
     }
 
     // REGISTR FIREM NA STAVBĚ — jen jméno a kontaktní osoba.
@@ -1173,7 +1206,7 @@ service cloud.firestore {
     // tabulka lidí a tenhle registr neříkaly každý něco jiného.
     match /workspaces/{wid}/projects/{pid}/companies/{companyId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if isWsAdmin(wid) && !projectFrozen(pid);
+      allow create, update, delete: if isWsAdmin(wid) && !projectReadOnly(pid);
     }
 
     // Firemní interní pracovní prostory jsou oddělené od oficiálních kolekcí,
@@ -1188,14 +1221,14 @@ service cloud.firestore {
         && request.resource.data.get('workspaceId', '') == wid
         && request.resource.data.get('scope', '') == 'company_internal'
         && request.resource.data.get('createdBy', '') == principal()
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
       allow update: if (
           isCompanySpaceLead(wid, pid, companyId)
         && request.resource.data.companyId == resource.data.companyId
         && request.resource.data.projectId == resource.data.projectId
         && request.resource.data.workspaceId == resource.data.workspaceId
         && request.resource.data.scope == resource.data.scope
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
       allow delete: if false;
 
       match /folders/{folderId} {
@@ -1206,7 +1239,7 @@ service cloud.firestore {
           && request.resource.data.get('folderId', '') == folderId
           && request.resource.data.get('parentId', '') != folderId
           && validChildCompanyAccess(wid, pid, companyId, request.resource.data.get('parentId', ''), request.resource.data)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
         allow update: if (
           isCompanySpaceLead(wid, pid, companyId)
           && request.resource.data.get('scope', '') == resource.data.get('scope', '')
@@ -1215,10 +1248,10 @@ service cloud.firestore {
           && request.resource.data.get('folderId', '') == resource.data.get('folderId', '')
           && request.resource.data.get('parentId', '') != folderId
           && validChildCompanyAccess(wid, pid, companyId, request.resource.data.get('parentId', ''), request.resource.data)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
         allow delete: if (
           isCompanySpaceLead(wid, pid, companyId)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
       }
 
       match /documents/{documentId} {
@@ -1229,7 +1262,7 @@ service cloud.firestore {
           && request.resource.data.get('documentId', '') == documentId
           && request.resource.data.get('approvalMode', '') == 'none'
           && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
         allow update: if (
           canWriteCompanyResourceInto(
             wid, pid, companyId,
@@ -1241,10 +1274,10 @@ service cloud.firestore {
           && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
           && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
           && request.resource.data.get('approvalMode', '') == 'none'
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
         allow delete: if (
           canModifyCompanyResource(wid, pid, companyId, resource.data)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
       }
 
       match /documentVersions/{versionId} {
@@ -1256,7 +1289,7 @@ service cloud.firestore {
           && request.resource.data.get('status', '') == 'working'
           && request.resource.data.get('workflowMode', '') == 'none'
           && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
         allow update: if (
           canWriteCompanyResourceInto(
             wid, pid, companyId,
@@ -1267,10 +1300,10 @@ service cloud.firestore {
           && request.resource.data.get('scope', '') == resource.data.get('scope', '')
           && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
           && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
         allow delete: if (
           canModifyCompanyResource(wid, pid, companyId, resource.data)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
       }
 
       match /plans/{planId} {
@@ -1280,7 +1313,7 @@ service cloud.firestore {
           && isSameProjectCompany(wid, pid, companyId)
           && request.resource.data.get('planId', '') == planId
           && canUseCompanyFolder(wid, pid, companyId, request.resource.data.get('folderId', ''), request.resource.data)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
         allow update: if (
           canWriteCompanyResourceInto(
             wid, pid, companyId,
@@ -1291,10 +1324,10 @@ service cloud.firestore {
           && request.resource.data.get('scope', '') == resource.data.get('scope', '')
           && request.resource.data.get('ownerCompanyId', '') == resource.data.get('ownerCompanyId', '')
           && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
         allow delete: if (
           canModifyCompanyResource(wid, pid, companyId, resource.data)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
       }
 
       // Sdílené firemní markupy jednoho planVersion. Task piny sem nepatří a
@@ -1313,7 +1346,7 @@ service cloud.firestore {
           && request.resource.data.get('items', []) is list
           && request.resource.data.get('items', []).size() <= 2000
           && canUseCompanyPlan(wid, pid, companyId, request.resource.data.get('planId', ''), request.resource.data)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
         allow update: if (
           canWriteCompanyAnnotationsInto(
             wid, pid, companyId,
@@ -1328,7 +1361,7 @@ service cloud.firestore {
           && request.resource.data.get('planVersionId', '') == resource.data.get('planVersionId', '')
           && request.resource.data.get('items', []) is list
           && request.resource.data.get('items', []).size() <= 2000
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
         allow delete: if false;
       }
     }
@@ -1343,7 +1376,7 @@ service cloud.firestore {
         && request.resource.data.workspaceId == wid
         && request.resource.data.projectId == pid
         && request.resource.data.recipientIds is list
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
       // Provable for queries shaped
       // where('recipientIds', 'array-contains', currentPrincipal).
       //
@@ -1361,10 +1394,10 @@ service cloud.firestore {
             .hasOnly(['readBy'])
         && request.resource.data.readBy.hasAll(resource.data.get('readBy', []))
         && principal() in request.resource.data.readBy
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
       allow delete: if (
           canManage(wid, pid)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
     }
 
     // ---------------------------------------------------------------------
@@ -1736,7 +1769,7 @@ service cloud.firestore {
       // Nový úkol nesmí rovnou vzniknout jako completed/verified bez příslušné role
       // (jinak by šel guard na update obejít vytvořením už-hotového úkolu).
       // Interní úkol: člen zakládá do své firmy a nesmí vzniknout rovnou jako 'verified'.
-      allow create: if taskCreateOk(permsOf(wid, pid), pid) && !projectFrozen(pid);
+      allow create: if taskCreateOk(permsOf(wid, pid), pid) && !projectReadOnly(pid);
       // createdBy, scope i ownerCompanyId immutable. Interní úkol upraví člen
       // vlastnící firmy (na 'verified' jen vedoucí); projektový dle stávajících pravidel.
       allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
@@ -1749,13 +1782,13 @@ service cloud.firestore {
             : taskProjectUpdateOk(permsOf(wid, pid))
         )
         // Zmrazení předáním platí i pro interní úkoly firmy — kopie je kopie.
-        && !projectFrozen(pid);
+        && !projectReadOnly(pid);
       // Interní úkol smaže vedoucí firmy nebo autor (z vlastní firmy); projektový dle stávajících.
       allow delete: if (taskIsInternal(resource.data)
         ? (taskCompanyMember(pid, resource.data)
            && (isCompanySpaceLead(wid, pid, resource.data.get('ownerCompanyId', '')) || authoredBySelf()))
         : canModifyContent(wid, pid))
-        && !projectFrozen(pid);
+        && !projectReadOnly(pid);
     }
 
     // Append-only události projektového grafu (Fáze 0c,
@@ -1832,7 +1865,7 @@ service cloud.firestore {
         && request.resource.data.by == principal()
         && request.resource.data.schemaVersion == 1
         && graphEventVisible(pid, request.resource.data.vis);
-      allow delete: if canContribute(wid, pid) && !projectFrozen(pid);
+      allow delete: if canContribute(wid, pid) && !projectReadOnly(pid);
     }
 
     // Vytěžený text dokumentů (`docs/specs/projektovy-graf.md` §4.3, Fáze 3) —
@@ -1861,7 +1894,7 @@ service cloud.firestore {
         && request.resource.data.purpose in ['site', 'design']
         && request.resource.data.externalId is string
         && graphEventVisible(pid, request.resource.data.vis)
-        && !projectFrozen(pid);
+        && !projectReadOnly(pid);
       allow delete: if canModifyContent(wid, pid);
     }
 
@@ -1877,7 +1910,7 @@ service cloud.firestore {
         && request.resource.data.code is string
         && request.resource.data.kind in ['email', 'telegram', 'whatsapp', 'discord']
         && graphEventVisible(pid, request.resource.data.vis)
-        && !projectFrozen(pid);
+        && !projectReadOnly(pid);
       // Přepis se nepovoluje: kód je jednorázový, měnit se nemá. Smazat ano —
       // ať jde vzít zpět dřív, než ho někdo použije.
       allow delete: if canModifyContent(wid, pid);
@@ -1899,7 +1932,7 @@ service cloud.firestore {
         && request.resource.data.documentId is string
         && request.resource.data.extractorVersion is string
         && graphEventVisible(pid, request.resource.data.vis)
-        && !projectFrozen(pid);
+        && !projectReadOnly(pid);
       // Projekce žije a umírá se zdrojem (§7 Retence): kdo smí zahodit
       // dokument, smí zahodit i jeho vytěžený text.
       allow delete: if canModifyContent(wid, pid);
@@ -1978,12 +2011,12 @@ service cloud.firestore {
       allow create: if diaryWriteOk(permsOf(wid, pid), true)
         && (request.resource.data.get('createdBy', '') == ''
             || request.resource.data.get('createdBy', '') == principal())
-        && !projectFrozen(pid);
+        && !projectReadOnly(pid);
       allow update: if diaryWriteOk(permsOf(wid, pid), resource.data.get('createdBy', '') == principal())
         && request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')  // author immutable
-        && !projectFrozen(pid);
+        && !projectReadOnly(pid);
       allow delete: if diaryWriteOk(permsOf(wid, pid), resource.data.get('createdBy', '') == principal())
-        && !projectFrozen(pid);
+        && !projectReadOnly(pid);
     }
 
     // ---------------------------------------------------------------------
@@ -2026,7 +2059,7 @@ service cloud.firestore {
       allow create: if (
           permsOf(wid, pid).hasAny(['diary'])
         && request.resource.data.get('ownerPrincipal', '') == principal()
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
       // Okno na opravu (§9) — do konce dne smí autor svůj zápis upravit nebo
       // smazat. Autorství je přitom neměnné: kdo hlasovku pořídil, ten u ní
       // zůstane, jinak by šlo cizí slova podepsat sebou (nebo svá někým jiným).
@@ -2034,11 +2067,11 @@ service cloud.firestore {
           isProjectMember(wid, pid)
         && resource.data.get('ownerPrincipal', '') == principal()
         && request.resource.data.get('ownerPrincipal', '') == resource.data.get('ownerPrincipal', '')
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
       allow delete: if (
           isProjectMember(wid, pid)
         && resource.data.get('ownerPrincipal', '') == principal()
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
     }
 
     // Plány: číst smí každý člen (`read`), měnit jen `edit`. Do #506 fáze 2
@@ -2050,7 +2083,7 @@ service cloud.firestore {
       allow read: if isProjectMember(wid, pid);
       allow create, update, delete: if (
           canEdit(wid, pid)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/planAnnotations/{docId} {
@@ -2085,15 +2118,15 @@ service cloud.firestore {
       }
       allow create: if (
           canEdit(wid, pid) || bindingWriteOk()
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
       allow update: if (
           canEdit(wid, pid)
           || (bindingWriteOk() && resource.data.get('ownerPrincipal', '') == principal())
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
       // Mazat smí dál jen `edit`. Vzít požadavek zpět jde jeho úpravou
       // (odznačením závaznosti), což je zápis, ne smazání — a hlavně tím
       // nezmizí stopa po tom, že tu požadavek byl.
-      allow delete: if canEdit(wid, pid) && !projectFrozen(pid);
+      allow delete: if canEdit(wid, pid) && !projectReadOnly(pid);
     }
 
     // Tvary místností nad výkresem (#385). Geometrie NEZAKLÁDÁ místnost — jen
@@ -2145,7 +2178,7 @@ service cloud.firestore {
       allow create: if canEdit(wid, pid)
         && request.resource.data.get('status', '') == 'draft'
         && request.resource.data.get('confirmedBy', null) == null
-        && !projectFrozen(pid);
+        && !projectReadOnly(pid);
       allow update: if canEdit(wid, pid)
         && overlayGroupStatusChangeOk(wid, pid, resource.data.get('status', ''), request.resource.data.get('status', ''))
         && overlayGroupConfirmedIsFrozen(resource.data.get('status', ''), request.resource.data.get('status', ''))
@@ -2153,37 +2186,37 @@ service cloud.firestore {
         && (request.resource.data.get('confirmedBy', null) == null
             || request.resource.data.get('confirmedBy', '') == principal()
             || request.resource.data.get('confirmedBy', '') == resource.data.get('confirmedBy', ''))
-        && !projectFrozen(pid);
+        && !projectReadOnly(pid);
       // Smazat skupinu je totéž co zahodit potvrzení — patří správci.
-      allow delete: if canManage(wid, pid) && !projectFrozen(pid);
+      allow delete: if canManage(wid, pid) && !projectReadOnly(pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/roomGeometries/{docId} {
       allow read: if isProjectMember(wid, pid);
       allow create, update, delete: if (
           canEdit(wid, pid)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documents/{docId} {
       allow read: if isProjectMember(wid, pid);
       // Do OFICIÁLNÍ dokumentace smí zakládat jen `publish`, ne každý člen.
       // Atribuce firmě jen na vlastní firmu (anti-spoof) a autor nesmí být podvržený.
-      allow create: if officialCreateOk(permsOf(wid, pid), pid) && !projectFrozen(pid);
+      allow create: if officialCreateOk(permsOf(wid, pid), pid) && !projectReadOnly(pid);
       // Author immutable. Editovat smí běžná práva k obsahu; `certify` nebo
       // `publish` navíc smí jako vedlejší efekt upload/approve transakce
       // přepnout jen platnou revizi (currentVersionId/updatedAt) — i když nemá
       // `edit` ani autorství (schválení revize / nová revize od publikujícího).
       allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')
         && documentUpdateOk(permsOf(wid, pid))
-        && !projectFrozen(pid);
+        && !projectReadOnly(pid);
       allow delete: if canModifyContent(wid, pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documentVersions/{docId} {
       allow read: if isProjectMember(wid, pid);
       // Nahrát verzi do oficiální dokumentace smí jen `publish` (viz documents).
-      allow create: if officialCreateOk(permsOf(wid, pid), pid) && !projectFrozen(pid);
+      allow create: if officialCreateOk(permsOf(wid, pid), pid) && !projectReadOnly(pid);
       // `certify` (schvalovatel) smí zapsat SVÉ ROZHODNUTÍ: `approvals` mapu,
       // odvozený status (i supersede předchozí verze) a razítko recenzenta.
       //
@@ -2199,7 +2232,7 @@ service cloud.firestore {
       // rozhodnutí (zákaz self-approve). Audit se v rules nevynucuje.
       allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')  // author immutable
         && versionUpdateOk(permsOf(wid, pid))
-        && !projectFrozen(pid);
+        && !projectReadOnly(pid);
       allow delete: if canModifyContent(wid, pid);
     }
 
@@ -2223,7 +2256,7 @@ service cloud.firestore {
       allow read: if isProjectMember(wid, pid);
       allow create, update, delete: if (
           canEdit(wid, pid)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
     }
 
     // Zapečený stav dokumentace na hranici fáze — immutable otisk sady verzí.
@@ -2234,14 +2267,14 @@ service cloud.firestore {
       allow read: if isProjectMember(wid, pid);
       allow create, delete: if (
           canEdit(wid, pid)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documentEvents/{docId} {
       allow read: if isProjectMember(wid, pid);
       allow create, update, delete: if (
           canEdit(wid, pid)
-        ) && !projectFrozen(pid);
+        ) && !projectReadOnly(pid);
     }
 
     // ---------------------------------------------------------------------
@@ -2416,7 +2449,7 @@ service cloud.firestore {
           || (isProjectMember(wid, pid) && ownReportShare(wid, pid, request.resource.data))
         ) && noServerOnlyShareFields(request.resource.data)
         && shareExpiryInWindow(request.resource.data)
-        && !projectFrozen(pid);
+        && !projectReadOnly(pid);
       allow update: if (
           canEdit(wid, pid)
           || (
@@ -2427,8 +2460,8 @@ service cloud.firestore {
         ) && noServerOnlyShareFields(request.resource.data)
         && shareExpiryNotExtended(resource.data, request.resource.data)
         && shareImmutablesKept(resource.data, request.resource.data)
-        && !projectFrozen(pid);
-      allow delete: if canEdit(wid, pid) && !projectFrozen(pid);
+        && !projectReadOnly(pid);
+      allow delete: if canEdit(wid, pid) && !projectReadOnly(pid);
     }
 
     // ---------------------------------------------------------------------
@@ -2490,7 +2523,7 @@ service cloud.firestore {
       allow list: if isProjectMember(wid, pid);
       allow create, update: if documentStatusWriteOk(wid, pid, documentId)
         && validDocumentStatus(request.resource.data)
-        && !projectFrozen(pid);
+        && !projectReadOnly(pid);
       // 🔴 MAZÁNÍ JE PLNOHODNOTNÝ STAV UKAZATELE, ne úklid. `validDocumentStatus`
       // vyžaduje neprázdné `currentVersionId`, takže „dokument nemá žádnou
       // platnou revizi" (smazaná, archivovaná nebo přesunutá poslední schválená)
@@ -2498,7 +2531,7 @@ service cloud.firestore {
       // zápis, `reconcileDocumentStatusPointer` by u publishera a schvalovatele
       // uměl ukazatel jen posouvat, nikdy zrušit, a veřejná stránka by dál
       // tvrdila, že platí revize, která zmizela.
-      allow delete: if documentStatusWriteOk(wid, pid, documentId) && !projectFrozen(pid);
+      allow delete: if documentStatusWriteOk(wid, pid, documentId) && !projectReadOnly(pid);
     }
 
     // ---------------------------------------------------------------------
@@ -3004,7 +3037,7 @@ service cloud.firestore {
     // drží `reportsCollectionPath()` a `functions/src/reportSweep.ts`.
     match /workspaces/{wid}/projects/{pid}/reports/{reportId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update: if isProjectMember(wid, pid) && !projectFrozen(pid);
+      allow create, update: if isProjectMember(wid, pid) && !projectReadOnly(pid);
       allow delete: if false;
     }
 
@@ -3021,7 +3054,7 @@ service cloud.firestore {
     // vedla přes podporu.
     match /workspaces/{wid}/projects/{pid}/reportTemplates/{templateId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if isProjectMember(wid, pid) && !projectFrozen(pid);
+      allow create, update, delete: if isProjectMember(wid, pid) && !projectReadOnly(pid);
     }
 
     // Legacy annotation blobs -- superseded by
@@ -3329,6 +3362,23 @@ service cloud.firestore {
     // nepotřebuje (dělá se to Admin SDK, když se ptá auditor podle DPA čl. 14).
     // ---------------------------------------------------------------------
     match /operatorAccessLog/{entryId} {
+      allow read, write: if false;
+    }
+
+    // Nápady od uživatelů („co bych chtěl mít vždycky pod palcem"). Píše jen
+    // Cloud Function `submitProductSuggestion` pod Admin SDK, čte jen
+    // `operatorProductSuggestions` pro provozní přehled.
+    //
+    // 🔴 KLIENT SEM NESMÍ ANI ZAPSAT. Kolekce leží v centrálním projektu, mimo
+    // jakoukoli firmu — otevřít ji klientskému zápisu by znamenalo kolekci,
+    // do které smí psát každý přihlášený člověk v celé platformě, bez stropu
+    // a bez toho, aby pravidla uměla ověřit cokoli kromě přihlášení.
+    //
+    // ⚠️ A NESMÍ ANI ČÍST. Jsou to volné texty vázané na e-mail autora; jeden
+    // zákazník nemá co číst, co si o produktu napsal jiný.
+    //
+    // Drženo identicky ve `firestore.rules`.
+    match /productSuggestions/{suggestionId} {
       allow read, write: if false;
     }
 

@@ -713,6 +713,16 @@ service cloud.firestore {
       // ověřeno 26. 8. 2026 proti emulátoru, kde to spadlo i PROJEKTOVÉMU
       // SPRÁVCI. Kdo smí stav změnit, se tím NEMĚNÍ — pořád jen `certify`,
       // takže zákaz self-approve u editora bez schvalovacího práva drží dál.
+      //
+      // 🔴 `archived` V ZAKÁZANÉM SEZNAMU ZÁMĚRNĚ NENÍ (a druhá větev nemá
+      // `hasOnly`, takže jí projde i stopa `statusChanged*`, kterou
+      // `setVersionStatusManually` k novému stavu píše). Od F1 je archivace
+      // NÁHRADA ZA KOŠ: kdo revizi smí měnit — editor u cizí, autor s pouhým
+      // `contribute` u vlastní — ji musí umět odsunout z cesty i tehdy, když ji
+      // smazat nesmí. Kdyby archivace zůstala jen na `certify`, byl by zákaz
+      // mazání slepá ulička a omylem vydaná revize by v seznamu zůstala navždy.
+      // Archivace není rozhodnutí o kvalitě (na rozdíl od `approved`
+      // a spol.) — revize zůstává i se souborem a razítky, jen přestane platit.
       return (perms.hasAny(['certify'])
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
                'status', 'supersededFromStatus', 'approvals', 'reviewedBy', 'reviewedByName',
@@ -722,6 +732,59 @@ service cloud.firestore {
         || (canModifyWith(perms)
             && !(request.resource.data.status != resource.data.status
                  && request.resource.data.status in ['approved', 'approved_with_comments', 'rejected', 'superseded', 'for_construction']));
+    }
+
+    // Smazání revize dokumentu NATVRDO (i se souborem ve Storage).
+    //
+    // 🔴 SOULAD S ISO 19650 (fáze F1, návrh B4 z gap analýzy
+    // `docs/ai/smerovani-2026-09/02-iso-19650-soulad.md`). Do 5. 9. 2026 tady
+    // stálo pouhé `canModifyContent`, takže SCHVÁLENOU revizi směl smazat
+    // kdokoli s `edit` — a její autor dokonce s pouhým `contribute`. To je
+    // v přímém rozporu s principem archivu CDE (ISO 19650-1): co jednou prošlo
+    // do vydaného/archivního stavu, je doklad o rozhodnutí a musí zůstat
+    // dohledatelné. Revize, na kterou vede vytištěný QR kód v razítku výkresu,
+    // nesmí zmizet proto, že se někomu pletla v seznamu.
+    //
+    // Rozhodnutí zakladatele 5. 9. 2026: vydanou/archivní revizi smaže NATVRDO
+    // jen držitel `manage` (správce stavby / vlastník firmy). Ostatní ji smí
+    // jen ARCHIVOVAT (`status: 'archived'`) — to je běžný update přes
+    // `versionUpdateOk`, historie i soubor zůstávají.
+    //
+    // Mazatelné bez `manage` zůstávají stavy PŘED vydáním (`draft`,
+    // `under_review`, `rejected`, `working`) i revize bez pole `status`
+    // (stará data) — právě tam vzniká omylem nahraná duplicita, kterou musí jít
+    // uklidit hned a bez správce.
+    //
+    // 🔴 A STEJNĚ TAK REVIZE S `approvalWaived`. Na stavbě s vypnutým
+    // schvalováním (`documentApproval: 'off'`, a totéž u vlastníkova „nahrát
+    // jako schválené") zakládá `uploadVersionStatusFor` KAŽDOU nahranou revizi
+    // rovnou jako `approved` + `approvalWaived: true`. Ten stav tam neznamená
+    // rozhodnutí — schvalovatele ta revize nikdy neměla, je to prostý upload
+    // a appka ho i pojmenovává **Platná**, ne „Schváleno". Kdyby ho ochrana
+    // brala jako doklad, dopadla by F1 nejtvrději na tu nejjednodušší stavbu:
+    // živnostník s rolí editora by omylem nahranou duplicitu neuklidil vůbec
+    // (koš pryč, archivace v UI za `certify`) a čekal by na správce kvůli
+    // souboru, o kterém nikdo nikdy nerozhodoval. `approvalWaived` proto
+    // ochranu VYPÍNÁ — chráněná je jen revize, kterou někdo skutečně schválil.
+    //
+    // Značka je na VERZI a po nahrání ji nikdo nepřepisuje: supersede zapisuje
+    // jen `status` + `supersededFromStatus` + `updatedAt`, ruční oprava stavu
+    // navíc `statusChanged*`. Přežívá tedy i archivaci, takže odsunutá revize
+    // z bezschvalovací stavby zůstává uklizitelná.
+    //
+    // ⚠️ `get('status', '')` / `get('approvalWaived', false)`, ne přímý přístup:
+    // rovnost na CHYBĚJÍCÍ pole v pravidlech neplatí a celý výraz by se stal
+    // chybovým (= deny).
+    // ⚠️ Bere hotový seznam oprávnění, ne `wid`/`pid` — `permsOf` se počítá
+    // JEDNOU (strop 1000 výrazů na požadavek, viz komentář u `permsOf`).
+    // Náhrada `canModifyContent`, takže `!projectReadOnly(pid)` si musí doplnit
+    // volající (hlídá `firestore.freezecoverage.test.ts`).
+    function versionDeleteOk(perms) {
+      return canModifyWith(perms)
+        && (!(resource.data.get('status', '') in
+                ['approved', 'approved_with_comments', 'for_construction', 'superseded', 'archived'])
+            || resource.data.get('approvalWaived', false) == true
+            || perms.hasAny(['manage']));
     }
 
     // Autor obsahu na create nesmí být podvržený: `createdBy` je prázdný nebo přímo
@@ -2233,7 +2296,12 @@ service cloud.firestore {
       allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')  // author immutable
         && versionUpdateOk(permsOf(wid, pid))
         && !projectReadOnly(pid);
-      allow delete: if canModifyContent(wid, pid);
+      // Vydanou/archivní revizi smaže NATVRDO jen `manage`; ostatním zbývá
+      // archivace (update stavu výš, `versionUpdateOk` ji pouští každému, kdo
+      // revizi smí měnit). Revize s `approvalWaived` (stavba bez schvalování)
+      // chráněná NENÍ — nikdo o ní nerozhodoval. Viz `versionDeleteOk` —
+      // ISO 19650, fáze F1.
+      allow delete: if versionDeleteOk(permsOf(wid, pid)) && !projectReadOnly(pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documentComments/{docId} {

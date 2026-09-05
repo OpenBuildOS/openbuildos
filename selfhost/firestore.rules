@@ -724,6 +724,40 @@ service cloud.firestore {
                  && request.resource.data.status in ['approved', 'approved_with_comments', 'rejected', 'superseded', 'for_construction']));
     }
 
+    // Smazání revize dokumentu NATVRDO (i se souborem ve Storage).
+    //
+    // 🔴 SOULAD S ISO 19650 (fáze F1, návrh B4 z gap analýzy
+    // `docs/ai/smerovani-2026-09/02-iso-19650-soulad.md`). Do 5. 9. 2026 tady
+    // stálo pouhé `canModifyContent`, takže SCHVÁLENOU revizi směl smazat
+    // kdokoli s `edit` — a její autor dokonce s pouhým `contribute`. To je
+    // v přímém rozporu s principem archivu CDE (ISO 19650-1): co jednou prošlo
+    // do vydaného/archivního stavu, je doklad o rozhodnutí a musí zůstat
+    // dohledatelné. Revize, na kterou vede vytištěný QR kód v razítku výkresu,
+    // nesmí zmizet proto, že se někomu pletla v seznamu.
+    //
+    // Rozhodnutí zakladatele 5. 9. 2026: vydanou/archivní revizi smaže NATVRDO
+    // jen držitel `manage` (správce stavby / vlastník firmy). Ostatní ji smí
+    // jen ARCHIVOVAT (`status: 'archived'`) — to je běžný update přes
+    // `versionUpdateOk`, historie i soubor zůstávají.
+    //
+    // Mazatelné bez `manage` zůstávají stavy PŘED vydáním (`draft`,
+    // `under_review`, `rejected`, `working`) i revize bez pole `status`
+    // (stará data) — právě tam vzniká omylem nahraná duplicita, kterou musí jít
+    // uklidit hned a bez správce.
+    //
+    // ⚠️ `get('status', '')`, ne `resource.data.status`: rovnost na CHYBĚJÍCÍ
+    // pole v pravidlech neplatí a celý výraz by se stal chybovým (= deny).
+    // ⚠️ Bere hotový seznam oprávnění, ne `wid`/`pid` — `permsOf` se počítá
+    // JEDNOU (strop 1000 výrazů na požadavek, viz komentář u `permsOf`).
+    // Náhrada `canModifyContent`, takže `!projectReadOnly(pid)` si musí doplnit
+    // volající (hlídá `firestore.freezecoverage.test.ts`).
+    function versionDeleteOk(perms) {
+      return canModifyWith(perms)
+        && (!(resource.data.get('status', '') in
+                ['approved', 'approved_with_comments', 'for_construction', 'superseded', 'archived'])
+            || perms.hasAny(['manage']));
+    }
+
     // Autor obsahu na create nesmí být podvržený: `createdBy` je prázdný nebo přímo
     // volající (principal), nikdy někdo jiný. Zrcadlí invariant `canCreateContent`,
     // který jsme u oficiálních dokumentů/verzí nahradili gate `canPublishOfficial`
@@ -2233,7 +2267,9 @@ service cloud.firestore {
       allow update: if request.resource.data.get('createdBy', '') == resource.data.get('createdBy', '')  // author immutable
         && versionUpdateOk(permsOf(wid, pid))
         && !projectReadOnly(pid);
-      allow delete: if canModifyContent(wid, pid);
+      // Vydanou/archivní revizi smaže NATVRDO jen `manage`; ostatním zbývá
+      // archivace (update stavu). Viz `versionDeleteOk` — ISO 19650, fáze F1.
+      allow delete: if versionDeleteOk(permsOf(wid, pid)) && !projectReadOnly(pid);
     }
 
     match /workspaces/{wid}/projects/{pid}/documentComments/{docId} {

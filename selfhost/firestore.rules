@@ -664,6 +664,23 @@ service cloud.firestore {
         && authorNotSpoofedOnCreate();
     }
 
+    // Založení REVIZE = `officialCreateOk` + kód vhodnosti (ISO 19650, F3).
+    //
+    // Upload zakládá vždy `info` (`DocumentBatchUploadModal`,
+    // `promoteCompanyDocumentToOfficial`), takže dnešnímu UI tahle podmínka
+    // nepřekáží. Je proti DÍŘE: bez ní by publisher bez `certify` nahrál revizi
+    // rovnou „pro provedení" a obešel tím jediné místo, kde se to rozhoduje
+    // (`versionUpdateOk`). Vydat pro provedení je úkon schvalovatele, ať vzniká
+    // updatem nebo uploadem.
+    //
+    // Jedna funkce (a ne dvě volání v `allow`), aby se `permsOf` — a s ním
+    // čtení členství — vyhodnotilo JEDNOU.
+    function officialVersionCreateOk(perms, pid) {
+      return officialCreateOk(perms, pid)
+        && (request.resource.data.get('suitability', 'info') == 'info'
+            || (request.resource.data.get('suitability', '') == 'construction' && perms.hasAny(['certify'])));
+    }
+
     // Update dokumentu: běžná práva k obsahu, NEBO — u `certify`/`publish` bez
     // `edit` — jen přepnutí platné revize jako vedlejší efekt schválení/uploadu.
     //
@@ -713,15 +730,39 @@ service cloud.firestore {
       // ověřeno 26. 8. 2026 proti emulátoru, kde to spadlo i PROJEKTOVÉMU
       // SPRÁVCI. Kdo smí stav změnit, se tím NEMĚNÍ — pořád jen `certify`,
       // takže zákaz self-approve u editora bez schvalovacího práva drží dál.
+      //
+      // 🔴 `suitability` = kód vhodnosti (ISO 19650, fáze F3): „smí se podle
+      // téhle revize stavět?". MUSÍ být v `hasOnly` ze stejného důvodu jako
+      // `statusChanged*` — `setVersionSuitability` píše hodnotu i stopu jedním
+      // updatem, takže bez čtyř polí v seznamu by celý zápis spadl. A hlavně:
+      // vydat pro provedení smí JEN `certify`. Editor (i autor vlastní revize)
+      // ho v druhé větvi změnit nesmí, jinak by si původce sám odhlasoval, že
+      // se podle jeho podkladu smí stavět — obejití zákazu self-approve jinou
+      // cestou. Stopa má vlastní pole, ne `statusChanged*`: ruční oprava stavu
+      // (#734) a vydání pro provedení se vysvětlují každé jinak a nesmí si
+      // historii přepisovat.
       return (perms.hasAny(['certify'])
           && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
                'status', 'supersededFromStatus', 'approvals', 'reviewedBy', 'reviewedByName',
                'reviewedAt', 'reviewerComment', 'updatedAt',
-               'statusChangedAt', 'statusChangedBy', 'statusChangedByName'
-             ]))
+               'statusChangedAt', 'statusChangedBy', 'statusChangedByName',
+               'suitability', 'suitabilityChangedAt', 'suitabilityChangedBy', 'suitabilityChangedByName'
+             ])
+          && validSuitability())
         || (canModifyWith(perms)
+            && validSuitability()
+            && request.resource.data.get('suitability', '') == resource.data.get('suitability', '')
             && !(request.resource.data.status != resource.data.status
                  && request.resource.data.status in ['approved', 'approved_with_comments', 'rejected', 'superseded', 'for_construction']));
+    }
+
+    // Kód vhodnosti smí nabývat JEN dvou hodnot. Třetí (`void`) se odvozuje ze
+    // stavu a nikdy se neukládá — kdyby ležel v datech, musel by ho někdo
+    // dorovnávat při každém nahrazení revize a rozešel by se se stavem.
+    // Chybějící pole je v pořádku (revize před F3, interní WIP): klient ho čte
+    // jako `info`, tedy „nestavět podle toho".
+    function validSuitability() {
+      return request.resource.data.get('suitability', 'info') in ['info', 'construction'];
     }
 
     // Autor obsahu na create nesmí být podvržený: `createdBy` je prázdný nebo přímo
@@ -2215,8 +2256,9 @@ service cloud.firestore {
 
     match /workspaces/{wid}/projects/{pid}/documentVersions/{docId} {
       allow read: if isProjectMember(wid, pid);
-      // Nahrát verzi do oficiální dokumentace smí jen `publish` (viz documents).
-      allow create: if officialCreateOk(permsOf(wid, pid), pid) && !projectReadOnly(pid);
+      // Nahrát verzi do oficiální dokumentace smí jen `publish` (viz documents);
+      // „pro provedení" na create navíc chce `certify` (`officialVersionCreateOk`).
+      allow create: if officialVersionCreateOk(permsOf(wid, pid), pid) && !projectReadOnly(pid);
       // `certify` (schvalovatel) smí zapsat SVÉ ROZHODNUTÍ: `approvals` mapu,
       // odvozený status (i supersede předchozí verze) a razítko recenzenta.
       //

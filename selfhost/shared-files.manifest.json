@@ -24,7 +24,7 @@
     {
       "main": "firestore.rules",
       "companion": "selfhost/firestore.rules",
-      "mainSha256": "80d28c521a80a2258f9695e946fbdab0164a49f68814c081fb1826010bde432b"
+      "mainSha256": "883b858cd04089d3fbefba996c6dc945908e6c0d522c190b146ba934715cbb5d"
     },
     {
       "main": "storage.rules",
@@ -109,7 +109,7 @@
     {
       "main": "functions/src/graph/graphContract.ts",
       "companion": "selfhost/functions/src/graph/graphContract.ts",
-      "mainSha256": "3e14afd2d62ea87565dd2ded616e34ab03ef571df4ac77ffe93207d928e5ca3a"
+      "mainSha256": "8e815e53aab0a6dc044ebef24f4b21e6c4f9bd1b3916e409ac8a77b007bed775"
     },
     {
       "main": "functions/src/graph/taskGraphEvents.ts",
@@ -120,6 +120,16 @@
       "main": "functions/src/graph/taskGraphEvents.test.ts",
       "companion": "selfhost/functions/src/graph/taskGraphEvents.test.ts",
       "mainSha256": "aba1a9615a6958a30d3fcf3371bb47e112fcb1f1ab92e05f3c5ae3ec4043d04c"
+    },
+    {
+      "main": "functions/src/graph/documentGraphEvents.ts",
+      "companion": "selfhost/functions/src/graph/documentGraphEvents.ts",
+      "mainSha256": "b2a5acf3e09b32659d52bc0f3531477e0b96a29e58970043f1be9a6b37563346"
+    },
+    {
+      "main": "functions/src/graph/documentGraphEvents.test.ts",
+      "companion": "selfhost/functions/src/graph/documentGraphEvents.test.ts",
+      "mainSha256": "af73df7776d399c9d8ce5626b6c181a0fc6966e6c2b226d13d559a6fb59d715f"
     },
     {
       "main": "functions/src/graph/resolveReviewItem.ts",

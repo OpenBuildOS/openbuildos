@@ -2270,11 +2270,25 @@ service cloud.firestore {
         ) && !projectReadOnly(pid);
     }
 
+    // 🔴 MRTVÁ DÍRA, ZAVŘENÁ 5. 9. 2026 (F4 souladu CDE s ISO 19650).
+    //
+    // Do téhle kolekce NIKDY nikdo nezapsal — `emitDocumentEvent`
+    // (`src/modules/documents/events/documentEvents.ts`) je paměťová sběrnice
+    // pro upozornění a do Firestore nesahá. Pravidlo přesto komukoli s `edit`
+    // dovolovalo zakládat, MĚNIT i MAZAT „události dokumentu": kdyby se sem
+    // někdy začalo psát, byla by to auditní stopa, kterou si její vlastní
+    // předmět může přepsat. To je přesný opak toho, co norma po záznamu chce.
+    //
+    // Trvalý záznam událostí dokumentu žije od F4 v `graphEvents`
+    // (`docs/specs/projektovy-graf.md` §3.4, blok výš): zapisuje ho VÝHRADNĚ
+    // Admin SDK trigger z diffu (`documentVersionGraphEvents`,
+    // `documentGraphEvents` ve `functions/src/index.ts`), který pravidla
+    // obchází — klient tam má jen `read`. Tady se proto zavírá zápis úplně
+    // (`if false`, ne default-deny: ať je vidět, že je to ROZHODNUTÍ).
+    // Čtení zůstává členovi kvůli případným historickým datům.
     match /workspaces/{wid}/projects/{pid}/documentEvents/{docId} {
       allow read: if isProjectMember(wid, pid);
-      allow create, update, delete: if (
-          canEdit(wid, pid)
-        ) && !projectReadOnly(pid);
+      allow create, update, delete: if false;
     }
 
     // ---------------------------------------------------------------------

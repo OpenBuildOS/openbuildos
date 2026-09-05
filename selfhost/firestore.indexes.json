@@ -93,6 +93,24 @@
       ]
     },
     {
+      "collectionGroup": "graphEvents",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "vis.visibility",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "entity.documentId",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "occurredAt",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
       "collectionGroup": "plans",
       "queryScope": "COLLECTION",
       "fields": [

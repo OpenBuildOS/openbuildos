@@ -109,7 +109,7 @@
     {
       "main": "functions/src/graph/graphContract.ts",
       "companion": "selfhost/functions/src/graph/graphContract.ts",
-      "mainSha256": "8e815e53aab0a6dc044ebef24f4b21e6c4f9bd1b3916e409ac8a77b007bed775"
+      "mainSha256": "17f60eede9b10182a945da9977a6b0423f80b726920e98ced96bc251dce27591"
     },
     {
       "main": "functions/src/graph/taskGraphEvents.ts",
@@ -124,12 +124,12 @@
     {
       "main": "functions/src/graph/documentGraphEvents.ts",
       "companion": "selfhost/functions/src/graph/documentGraphEvents.ts",
-      "mainSha256": "b2a5acf3e09b32659d52bc0f3531477e0b96a29e58970043f1be9a6b37563346"
+      "mainSha256": "4615869fdc106ca223ca2bbe00901af6ccb6b499b51868e95095517e20e81db9"
     },
     {
       "main": "functions/src/graph/documentGraphEvents.test.ts",
       "companion": "selfhost/functions/src/graph/documentGraphEvents.test.ts",
-      "mainSha256": "af73df7776d399c9d8ce5626b6c181a0fc6966e6c2b226d13d559a6fb59d715f"
+      "mainSha256": "f9c9eebf403ecec39f30c86096d76cd25376d2033e8ddd1778ea48dbfad16bfa"
     },
     {
       "main": "functions/src/graph/resolveReviewItem.ts",

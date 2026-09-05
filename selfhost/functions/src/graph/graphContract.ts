@@ -231,6 +231,25 @@ export type GraphEvent = GraphEventBase &
      */
     | { action: "decision_recorded"; decision: string; byPrincipal: string; comment?: string }
     /**
+     * Změna KÓDU VHODNOSTI revize (`documentVersions.suitability`, F3 souladu
+     * s ISO 19650): „k čemu ten obsah SMÍ sloužit".
+     *
+     * Proč vlastní varianta, a ne `status_changed`: vhodnost je DRUHÁ OSA vedle
+     * stavu. Norma odděluje „kde v procesu ten kontejner je" (stav CDE) od
+     * „k čemu smí sloužit" (kód vhodnosti) právě proto, že se obojí hýbe
+     * nezávisle — revize může být schválená a přitom jen pro informaci, a
+     * vydání pro provedení nesmí zmizet jen proto, že se stav revize opraví
+     * (#734). Slít to do `status_changed` by znamenalo dát čtenáři do
+     * `fromStatusId`/`toStatusId` hodnotu z jiné množiny, než jakou tam nesou
+     * všechny ostatní události — a přehled „co se dělo se stavy" by lhal.
+     *
+     * `from`/`to` jsou ULOŽENÉ hodnoty (`info` | `construction`), ne odvozené:
+     * `void` v datech nikdy nestojí, počítá se ze stavu při čtení. Chybějící
+     * pole se čte jako `info`, takže doběh, který ho jen dopíše, událost
+     * nevydá — nic se nestalo.
+     */
+    | { action: "suitability_changed"; from: string; to: string }
+    /**
      * Změna PLATNÉ revize dokumentu (`documents.currentVersionId`).
      *
      * Proč vlastní varianta a ne něco stávajícího: `status_changed` nese ID

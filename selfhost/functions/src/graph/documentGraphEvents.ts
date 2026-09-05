@@ -58,6 +58,9 @@ export interface DocumentVersionDocLike {
   reviewedAt?: unknown;
   reviewedBy?: unknown;
   approvals?: unknown; // Record<principal, ApprovalDecision>
+  suitability?: unknown; // kód vhodnosti (F3): info | construction; chybí = info
+  suitabilityChangedAt?: unknown;
+  suitabilityChangedBy?: unknown;
 }
 
 /** `workspaces/{wid}/projects/{pid}/documents/{documentId}`. */
@@ -120,6 +123,25 @@ const FALLBACK_LABEL = "(bez názvu)";
  * a stejný důvod jako u legacy interních úkolů v `taskGraphEvents.ts`.
  */
 const UNREADABLE_INTERNAL = "__internal_unreadable__";
+
+/**
+ * Kód vhodnosti (F3), jak leží v datech. Do Firestore jdou POUZE `info`
+ * a `construction` — `void` se odvozuje ze stavu při čtení a nikdy se neukládá
+ * (`src/modules/documents/utils/suitability.ts`). Diff proto porovnává jen
+ * ULOŽENÉ hodnoty; kdyby dopočítával `void`, vydával by událost „změna
+ * vhodnosti" pokaždé, když se revize odsune do `superseded` — a to je změna
+ * STAVU, o které už je vlastní událost.
+ *
+ * 🔴 CHYBĚJÍCÍ POLE SE ČTE JAKO `info`. Bez toho by doběh
+ * `scripts/backfill-suitability.mjs`, který existujícím revizím jen dopisuje
+ * `info`, vyrobil událost na KAŽDÉ revizi v celé stavbě — tisíce řádků
+ * v historii o tom, že se nic nestalo.
+ */
+const DEFAULT_SUITABILITY = "info";
+
+function storedSuitability(value: unknown): string {
+  return stringOrUndefined(value) ?? DEFAULT_SUITABILITY;
+}
 
 function stringOrUndefined(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
@@ -307,8 +329,14 @@ export function computeDocumentVersionGraphEvents(
   // Rozhoduje proto pohyb doprovodného razítka, ne hodnota jména.
   const statusStampMoved = !sameTimestampField(before.statusChangedAt, after.statusChangedAt);
   const reviewStampMoved = !sameTimestampField(before.reviewedAt, after.reviewedAt);
+  const suitabilityStampMoved = !sameTimestampField(before.suitabilityChangedAt, after.suitabilityChangedAt);
   const newDecisions = newDecisionPrincipals(before.approvals, after.approvals);
+  // `suitabilityChangedBy` je PRVNÍ: `setVersionSuitability` píše jen vhodnost
+  // a její stopu, kdežto `statusChangedBy`/`reviewedBy` v datech zůstávají po
+  // starším rozhodování. Bez přednosti by se „vydáno pro provedení" — nejsilnější
+  // tvrzení v modulu — připsalo tomu, kdo naposledy schvaloval.
   const actor =
+    (suitabilityStampMoved ? stringOrUndefined(after.suitabilityChangedBy) : undefined) ??
     (statusStampMoved ? stringOrUndefined(after.statusChangedBy) : undefined) ??
     (reviewStampMoved ? stringOrUndefined(after.reviewedBy) : undefined) ??
     newDecisions[0] ??
@@ -328,6 +356,29 @@ export function computeDocumentVersionGraphEvents(
       action: "status_changed",
       fromStatusId: beforeStatus,
       toStatusId: afterStatus,
+    });
+  }
+
+  // Kód vhodnosti — DRUHÁ OSA vedle stavu (F3). „Vydat pro provedení" je
+  // nejsilnější tvrzení, které v modulu jde udělat („podle téhle revize se smí
+  // stavět"), takže bez vlastní události by v Historii chyběla právě ta věc,
+  // kvůli které auditní stopa existuje.
+  //
+  // Porovnávají se ODVOZENÉ hodnoty, ne surová pole: chybějící = `info`, takže
+  // `undefined → "info"` (doběh) je no-op a událost nevydá.
+  const beforeSuitability = storedSuitability(before.suitability);
+  const afterSuitability = storedSuitability(after.suitability);
+  if (beforeSuitability !== afterSuitability) {
+    events.push({
+      ...base,
+      // Vlastní razítko: `updatedAt` nese poslední zápis jakéhokoli druhu,
+      // kdežto `suitabilityChangedAt` je čas TOHOHLE tvrzení. Když stopa chybí
+      // (starší data, ruční zásah), padá se na společné `occurredAt` výš.
+      occurredAt: firstTimestamp([after.suitabilityChangedAt], occurredAt),
+      eventId: withId("suitability_changed"),
+      action: "suitability_changed",
+      from: beforeSuitability,
+      to: afterSuitability,
     });
   }
 

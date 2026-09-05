@@ -275,6 +275,136 @@ test("rozhodnutí bez komentáře komentář NEZAPISUJE (Firestore odmítá unde
   assert.equal(Object.prototype.hasOwnProperty.call(events[0], "comment"), false);
 });
 
+// ── kód vhodnosti (F3): druhá osa vedle stavu ──────────────────────────────
+
+test("vydání pro provedení → suitability_changed info → construction", () => {
+  const events = computeDocumentVersionGraphEvents(
+    versionInput(
+      { documentId: "d1", versionLabel: "R02", status: "approved", suitability: "info" },
+      {
+        documentId: "d1",
+        versionLabel: "R02",
+        status: "approved",
+        suitability: "construction",
+        updatedAt: ts(100),
+        suitabilityChangedAt: ts(100),
+        suitabilityChangedBy: "user-tdi",
+      }
+    )
+  );
+  assert.equal(events.length, 1);
+  assert.equal(events[0].action, "suitability_changed");
+  assert.equal(events[0].eventId, "evt-1-suitability_changed");
+  assert.equal(events[0].label, "R02");
+  if (events[0].action === "suitability_changed") {
+    assert.equal(events[0].from, "info");
+    assert.equal(events[0].to, "construction");
+  }
+});
+
+/**
+ * Zrušení vydání musí být v záznamu stejně vidět jako vydání samo: „podle téhle
+ * revize se už stavět nesmí" je tvrzení, které někdo na stavbě potřebuje doložit.
+ */
+test("zrušení vydání → suitability_changed construction → info", () => {
+  const events = computeDocumentVersionGraphEvents(
+    versionInput(
+      { documentId: "d1", versionLabel: "R02", suitability: "construction" },
+      { documentId: "d1", versionLabel: "R02", suitability: "info", updatedAt: ts(120) }
+    )
+  );
+  assert.equal(events.length, 1);
+  assert.equal(events[0].action, "suitability_changed");
+  if (events[0].action === "suitability_changed") {
+    assert.equal(events[0].from, "construction");
+    assert.equal(events[0].to, "info");
+  }
+});
+
+/**
+ * 🔴 `scripts/backfill-suitability.mjs` dopisuje chybějícím revizím `info`.
+ * Chybějící pole SE ČTE jako `info`, takže je to no-op — kdyby událost vydal,
+ * měla by každá revize ve stavbě v Historii řádek o tom, že se nic nestalo.
+ */
+test("doběh dopisující `info` chybějícímu poli žádnou událost nevydá", () => {
+  const events = computeDocumentVersionGraphEvents(
+    versionInput(
+      { documentId: "d1", versionLabel: "R02", status: "approved" },
+      {
+        documentId: "d1",
+        versionLabel: "R02",
+        status: "approved",
+        suitability: "info",
+        updatedAt: ts(140),
+        suitabilityChangedAt: ts(140),
+        suitabilityChangedBy: "backfill",
+      }
+    )
+  );
+  assert.deepEqual(events, []);
+});
+
+/**
+ * Stopa vhodnosti má přednost před `statusChangedBy`/`reviewedBy`, které
+ * v datech ZŮSTÁVAJÍ po starším rozhodování. Bez přednosti by se nejsilnější
+ * tvrzení v modulu připsalo tomu, kdo naposledy schvaloval.
+ */
+test("actor i occurredAt bere vydání ze své vlastní stopy, ne ze starého schválení", () => {
+  const events = computeDocumentVersionGraphEvents(
+    versionInput(
+      {
+        documentId: "d1",
+        versionLabel: "R02",
+        status: "approved",
+        statusChangedAt: ts(5),
+        statusChangedBy: "user-approver",
+        reviewedAt: ts(5),
+        reviewedBy: "user-reviewer",
+      },
+      {
+        documentId: "d1",
+        versionLabel: "R02",
+        status: "approved",
+        statusChangedAt: ts(5),
+        statusChangedBy: "user-approver",
+        reviewedAt: ts(5),
+        reviewedBy: "user-reviewer",
+        suitability: "construction",
+        updatedAt: ts(900),
+        suitabilityChangedAt: ts(777),
+        suitabilityChangedBy: "user-tdi",
+      }
+    )
+  );
+  assert.equal(events.length, 1);
+  assert.equal(events[0].actor, "user-tdi");
+  assert.deepEqual(events[0].occurredAt, ts(777));
+});
+
+/** Bez stopy (starší data, ruční zásah) se událost nevymýšlí — padá na fallback. */
+test("vydání bez stopy → actor unknown a čas ze společného razítka", () => {
+  const events = computeDocumentVersionGraphEvents(
+    versionInput(
+      { documentId: "d1", versionLabel: "R02" },
+      { documentId: "d1", versionLabel: "R02", suitability: "construction", updatedAt: ts(300) }
+    )
+  );
+  assert.equal(events.length, 1);
+  assert.equal(events[0].actor, "unknown");
+  assert.deepEqual(events[0].occurredAt, ts(300));
+});
+
+test("vydání bez jakéhokoli razítka padá na čas doručení", () => {
+  const events = computeDocumentVersionGraphEvents(
+    versionInput(
+      { documentId: "d1", versionLabel: "R02" },
+      { documentId: "d1", versionLabel: "R02", suitability: "construction" }
+    )
+  );
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0].occurredAt, FALLBACK);
+});
+
 test("přejmenování revize → renamed", () => {
   const events = computeDocumentVersionGraphEvents(
     versionInput(

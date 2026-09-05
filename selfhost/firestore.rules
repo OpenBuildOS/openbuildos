@@ -2956,6 +2956,46 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // Serverové měření uložených bajtů stavby za kalendářní měsíc.
+    // Píše ho JEN naplánovaná funkce (`functions/src/billing/storageUsage.ts`),
+    // která jednou denně vypíše prefix `workspaces/{wid}/projects/{pid}/` ve
+    // Storage a sečte velikosti — tedy měří SKUTEČNOST, ne přírůstky.
+    //
+    // 🔴 TOHLE JE SERVEROVÝ PROTĚJŠEK KLIENTSKÉHO `projects/{pid}/usage/current`
+    // NÍŽ, NE JEHO NÁHRADA. Klientské počítadlo zůstává tomu, čemu dnes slouží
+    // (proužek „80 % zaplněno" a návrh archivace) a je dál FALŠOVATELNÉ; z něj
+    // se částka odvodit nesmí. Odvodit ji jde JEN odsud, protože sem klient
+    // nezapíše. Kdo ty dva dokumenty sloučí, ruší přesně tenhle rozdíl.
+    //
+    // ⚠️ MĚŘÍ SE STAVBA, NE ČLOVĚK. Dokument nenese a nesmí nést identitu
+    // (`uploadedBy`, `uid`, rozpad po autorech) — `docs/CONSENT_FRAMEWORK.md`
+    // odmítá měřit cokoli, z čeho by šlo posuzovat práci konkrétních lidí, a
+    // spotřeba ZDROJŮ je vlastnost stavby, ne osoby. Totéž platí u `aiUsage`.
+    //
+    // Čtení pouští členům stavby ze stejného důvodu jako u `activity`: je to
+    // podklad toho, co jim přijde na faktuře.
+    match /workspaces/{wid}/projects/{pid}/storageUsage/{month} {
+      allow read: if isProjectMember(wid, pid);
+      allow write: if false;
+    }
+
+    // Serverové měření spotřeby AI (počet volání, sekundy diktování) za měsíc.
+    // Píše ho JEN callable `recordAiUsage` (`functions/src/billing/aiUsage.ts`),
+    // která hlášení klienta orazítkuje časem, ověří členství a ořízne hodnoty.
+    //
+    // ⚠️ Model volá KLIENT, takže je to POTVRZOVACÍ zápis, ne proxy: spotřebu
+    // jde podhlásit (neodeslat potvrzení), ne ale nafouknout ani zapsat cizí
+    // stavbě. Na otázku „kolik nás stojí stavba" to stačí, na fakturu ne —
+    // než se z minut začne účtovat, musí volání modelu jít přes funkci.
+    //
+    // ⚠️ ŽÁDNÁ IDENTITA V DOKUMENTU. „Kdo kolik namluvil" je přímý ukazatel
+    // pracovní aktivity konkrétní osoby a přesně to se sbírat nesmí; agregát
+    // je proto jen za stavbu a měsíc, s rozpadem po ČINNOSTI, ne po lidech.
+    match /workspaces/{wid}/projects/{pid}/aiUsage/{month} {
+      allow read: if isProjectMember(wid, pid);
+      allow write: if false;
+    }
+
     // Stav předplatného firmy. Jeden dokument (`current`).
     //
     // Čte jen VLASTNÍK A SPRÁVCI firmy — obrazovka Předplatné je podle

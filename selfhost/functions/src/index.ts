@@ -64,6 +64,10 @@ import {
 // Projektový graf, Fáze 0c (docs/specs/projektovy-graf.md §3.4, §4.2) — jen companion,
 // viz hlavička taskGraphEvents.ts. `graphContract.ts` je BYTE IDENTICKÝ s hlavním repem.
 import { computeTaskGraphEvents, isoToTimestampLike, timestampToMicros } from "./graph/taskGraphEvents";
+import {
+  computeDocumentGraphEvents,
+  computeDocumentVersionGraphEvents,
+} from "./graph/documentGraphEvents";
 import type { GraphEvent, ReviewItem } from "./graph/graphContract";
 // `resolveReviewItem` — Fáze 2b projektového grafu (§3.5), SDÍLENÝ modul
 // s hlavním repem (viz docs/REPO_BOUNDARIES.md).
@@ -1375,6 +1379,96 @@ export const taskGraphEvents = onDocumentWritten(
     await batch.commit();
   }
 );
+
+/**
+ * `documentVersionGraphEvents` / `documentGraphEvents` — F4 souladu CDE s ISO
+ * 19650: **připisovací záznam událostí dokumentu**. Tytéž `graphEvents`, tentýž
+ * vzor a týž důvod jako `taskGraphEvents` výš; diffovací logika je čistá funkce
+ * v `graph/documentGraphEvents.ts` (BYTE IDENTICKÁ s hlavním repem, testovaná
+ * bez emulátoru).
+ *
+ * 🔴 PROČ SERVER. Norma chce stopu „kdo, kdy, jaký přechod" trvale
+ * a nezpochybnitelně. Klientský zápis by byl podvrhnutelný tím, koho
+ * zaznamenává, a u člověka bez práva zápisu by spadl na `permission-denied`
+ * právě tam, kde je stopa nejpotřebnější. Pravidla mají u `graphEvents` jen
+ * `allow read`; zapisuje výhradně tenhle trigger přes Admin SDK.
+ *
+ * ⚠️ Bez `retry`, bez regionu a `set()` místo `create()` — všechno ze stejných
+ * důvodů, jaké jsou rozepsané u `taskGraphEvents`.
+ */
+export const documentVersionGraphEvents = onDocumentWritten(
+  { document: "workspaces/{wid}/projects/{pid}/documentVersions/{versionId}" },
+  async (event) => {
+    const before = event.data?.before.exists ? (event.data.before.data() as Record<string, unknown>) : undefined;
+    const after = event.data?.after.exists ? (event.data.after.data() as Record<string, unknown>) : undefined;
+    if (!before && !after) {
+      return;
+    }
+
+    const { wid, pid, versionId } = event.params;
+    const drafts = computeDocumentVersionGraphEvents({
+      before,
+      after,
+      ref: { wid, pid, versionId },
+      eventBaseId: event.id,
+      // U tvrdého smazání není `before.updateTime` nová revize (byla by shodná
+      // s posledním updatem a lifecycle by nešel seřadit) — bere se čas commitu.
+      entityRevMicros: event.data?.after.exists
+        ? timestampToMicros(event.data.after.updateTime)
+        : Date.parse(event.time) * 1000,
+      fallbackOccurredAt: isoToTimestampLike(event.time, { seconds: 0, nanoseconds: 0 }),
+    });
+    await writeGraphEvents(wid, pid, drafts);
+  }
+);
+
+export const documentGraphEvents = onDocumentWritten(
+  { document: "workspaces/{wid}/projects/{pid}/documents/{documentId}" },
+  async (event) => {
+    const before = event.data?.before.exists ? (event.data.before.data() as Record<string, unknown>) : undefined;
+    const after = event.data?.after.exists ? (event.data.after.data() as Record<string, unknown>) : undefined;
+    if (!before && !after) {
+      return;
+    }
+
+    const { wid, pid, documentId } = event.params;
+    const drafts = computeDocumentGraphEvents({
+      before,
+      after,
+      ref: { wid, pid, documentId },
+      eventBaseId: event.id,
+      entityRevMicros: event.data?.after.exists
+        ? timestampToMicros(event.data.after.updateTime)
+        : Date.parse(event.time) * 1000,
+      fallbackOccurredAt: isoToTimestampLike(event.time, { seconds: 0, nanoseconds: 0 }),
+    });
+    await writeGraphEvents(wid, pid, drafts);
+  }
+);
+
+/**
+ * Zápis drafts do `graphEvents` v JEDNOM batchi — buď vzniknou všechny, nebo
+ * žádný (nikdy neúplná skupina po částečném pádu). `set()` místo `create()`:
+ * obsah je deterministický (eventId z CloudEvent id + payload z diffu), takže
+ * opakované doručení zapíše totéž; s `create()` by jeden `ALREADY_EXISTS`
+ * shodil celý batch a chybějící eventy by už nikdy nevznikly.
+ */
+async function writeGraphEvents(
+  wid: string,
+  pid: string,
+  drafts: readonly { eventId: string }[]
+): Promise<void> {
+  if (drafts.length === 0) {
+    return;
+  }
+  const firestore = getFirestore(getLocalApp());
+  const batch = firestore.batch();
+  for (const draft of drafts) {
+    const eventDoc = { ...draft, committedAt: FieldValue.serverTimestamp() } as unknown as GraphEvent;
+    batch.set(firestore.doc(`workspaces/${wid}/projects/${pid}/graphEvents/${draft.eventId}`), eventDoc);
+  }
+  await batch.commit();
+}
 
 /**
  * `resolveReviewItem` — Fáze 2b projektového grafu (`docs/specs/projektovy-graf.md`

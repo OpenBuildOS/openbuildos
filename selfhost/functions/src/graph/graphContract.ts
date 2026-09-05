@@ -186,6 +186,28 @@ export interface GraphEventBase {
   occurredAt: TimestampLike; // updatedAt z dat (offline zápis)
   committedAt: TimestampLike; // serverový čas zápisu eventu
   vis: SecurityEnvelope;
+  /**
+   * Popisek pro vykreslení TÉTO události bez druhého čtení — u entitních akcí
+   * popisek entity (název dokumentu, titulek úkolu), u `version_added`
+   * označení přidané revize („R02").
+   *
+   * 🔑 PROČ NENÍ V `GraphNodeRef`: reference na uzel je IDENTITA (skládá se
+   * z ní `dedupeKey` u `ReviewItem`, `needMuteId`, otisk hrany). Kdyby v ní
+   * seděl popisek, přejmenování by z téhož uzlu udělalo jiný klíč a idempotence
+   * by se rozpadla. Popisek proto sedí na UDÁLOSTI, kde je to snímek okamžiku,
+   * ne součást identity.
+   *
+   * 🔑 PROČ VŮBEC: proud událostí musí být čitelný BEZ druhého čtení — jak pro
+   * dashboard („co je nového od včera"), tak pro fakturační přehled za měsíc
+   * (doc 12 §3). Dohledávat k tisíci událostem názvy entit by znamenalo tisíc
+   * dotazů na věci, které mezitím mohly zmizet (a u smazaných by popisek nešel
+   * dohledat vůbec — proto ho nese i `deleted` tombstone).
+   *
+   * Volitelný: starší události (Fáze 0c, úkoly) ho nemají a čtenář musí umět
+   * fallback na `entity`. Vynechává se i tam, kde by ho šlo zjistit jen druhým
+   * čtením (popisek dokumentu u události nad revizí).
+   */
+  label?: string;
 }
 
 export type GraphEvent = GraphEventBase &
@@ -197,6 +219,49 @@ export type GraphEvent = GraphEventBase &
     | { action: "linked" | "unlinked"; edge: GraphEdge }
     | { action: "version_added"; versionRef: GraphNodeRef }
     | { action: "confirmed" | "rejected"; reviewItemId: string }
+    /**
+     * Rozhodnutí jednoho schvalovatele nad revizí dokumentu (F4 souladu s ISO
+     * 19650). NENÍ to `status_changed`: stav revize se mění až tehdy, když
+     * rozhodnou VŠICHNI podle politiky — jednotlivé rozhodnutí je vlastní,
+     * samostatně auditovatelný akt („kdo, kdy, s jakou výhradou"), a norma
+     * chce právě jeho, ne jen výsledek.
+     *
+     * `decision` je ID (`ApprovalDecisionKind`: approved | approved_with_comments
+     * | rejected), nikdy přeložená věta (P5: labely jsou render).
+     */
+    | { action: "decision_recorded"; decision: string; byPrincipal: string; comment?: string }
+    /**
+     * Změna KÓDU VHODNOSTI revize (`documentVersions.suitability`, F3 souladu
+     * s ISO 19650): „k čemu ten obsah SMÍ sloužit".
+     *
+     * Proč vlastní varianta, a ne `status_changed`: vhodnost je DRUHÁ OSA vedle
+     * stavu. Norma odděluje „kde v procesu ten kontejner je" (stav CDE) od
+     * „k čemu smí sloužit" (kód vhodnosti) právě proto, že se obojí hýbe
+     * nezávisle — revize může být schválená a přitom jen pro informaci, a
+     * vydání pro provedení nesmí zmizet jen proto, že se stav revize opraví
+     * (#734). Slít to do `status_changed` by znamenalo dát čtenáři do
+     * `fromStatusId`/`toStatusId` hodnotu z jiné množiny, než jakou tam nesou
+     * všechny ostatní události — a přehled „co se dělo se stavy" by lhal.
+     *
+     * `from`/`to` jsou ULOŽENÉ hodnoty (`info` | `construction`), ne odvozené:
+     * `void` v datech nikdy nestojí, počítá se ze stavu při čtení. Chybějící
+     * pole se čte jako `info`, takže doběh, který ho jen dopíše, událost
+     * nevydá — nic se nestalo.
+     */
+    | { action: "suitability_changed"; from: string; to: string }
+    /**
+     * Změna PLATNÉ revize dokumentu (`documents.currentVersionId`).
+     *
+     * Proč vlastní varianta a ne něco stávajícího: `status_changed` nese ID
+     * STAVŮ, ne id revizí (čtenář by dostal do `toStatusId` náhodné id
+     * dokumentu); `version_added` znamená „přibyla revize", což při přepnutí
+     * platnosti na starší revizi neplatí; `linked` chce celou `GraphEdge`
+     * s proveniencí, a hrana „platná revize" v `GraphEdgeType` není. Pro TDI
+     * je to přitom NEJDŮLEŽITĚJŠÍ změna na dokumentu — podle platné revize se
+     * staví. Obě strany volitelné: dokument bez platné revize je legitimní
+     * stav (samý koncept, nebo se platná revize smazala).
+     */
+    | { action: "current_version_changed"; fromVersionId?: string; toVersionId?: string }
     // lifecycle — bez nich zůstanou po smazání jen díry (§4.6)
     | { action: "deleted"; tombstone: { label: string } }
     | { action: "restored" }
